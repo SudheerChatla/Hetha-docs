@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+
+<html class="light" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@100..900&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<style>
+    .material-symbols-outlined {
+      font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+    }
+    .timeline-line {
+      width: 2px;
+      background: repeating-linear-gradient(to bottom, #bfc9c3 0%, #bfc9c3 50%, transparent 50%, transparent 100%);
+      background-size: 2px 8px;
+    }
+    .timeline-line-active {
+      background: #003527 !important;
+    }
+    body {
+      -webkit-tap-highlight-color: transparent;
+      scrollbar-width: none;
+    }
+    body::-webkit-scrollbar {
+      display: none;
+    }
+  </style>
+<script id="tailwind-config">
+    tailwind.config = {
+      darkMode: "class",
+      theme: {
+        extend: {
+          "colors": {
+            "inverse-primary": "#95d3ba",
+            "on-surface-variant": "#404944",
+            "surface-dim": "#d9dadb",
+            "on-error": "#ffffff",
+            "primary-fixed": "#b0f0d6",
+            "on-secondary": "#ffffff",
+            "inverse-surface": "#2e3132",
+            "background": "#f8f9fa",
+            "secondary-fixed-dim": "#c0c6db",
+            "primary-container": "#064e3b",
+            "on-primary": "#ffffff",
+            "primary-fixed-dim": "#95d3ba",
+            "on-tertiary-fixed-variant": "#6e372f",
+            "on-background": "#191c1d",
+            "surface-container-low": "#f3f4f5",
+            "on-primary-container": "#80bea6",
+            "error": "#ba1a1a",
+            "surface-container": "#edeeef",
+            "on-tertiary": "#ffffff",
+            "tertiary-fixed-dim": "#ffb4a9",
+            "tertiary-container": "#6b342d",
+            "surface-container-highest": "#e1e3e4",
+            "on-surface": "#191c1d",
+            "surface-container-lowest": "#ffffff",
+            "surface-container-high": "#e7e8e9",
+            "tertiary-fixed": "#ffdad5",
+            "tertiary": "#4f1f19",
+            "on-primary-fixed-variant": "#0b513d",
+            "primary": "#003527",
+            "on-tertiary-container": "#ea9e93",
+            "surface": "#f8f9fa",
+            "outline-variant": "#bfc9c3",
+            "on-primary-fixed": "#002117",
+            "inverse-on-surface": "#f0f1f2",
+            "on-secondary-container": "#5c6274",
+            "surface-tint": "#2b6954",
+            "secondary-container": "#d9dff5",
+            "on-tertiary-fixed": "#380d08",
+            "outline": "#707974",
+            "on-secondary-fixed-variant": "#404758",
+            "surface-variant": "#e1e3e4",
+            "secondary": "#575e70",
+            "on-error-container": "#93000a",
+            "secondary-fixed": "#dce2f7",
+            "error-container": "#ffdad6",
+            "surface-bright": "#f8f9fa",
+            "on-secondary-fixed": "#141b2b"
+          },
+          "borderRadius": {
+            "DEFAULT": "0.25rem",
+            "lg": "0.5rem",
+            "xl": "0.75rem",
+            "full": "9999px"
+          },
+          "spacing": {
+            "gutter": "12px",
+            "xl": "32px",
+            "xs": "4px",
+            "sm": "8px",
+            "md": "16px",
+            "base": "4px",
+            "lg": "24px",
+            "container-margin": "20px"
+          },
+          "fontFamily": {
+            "display-lg": ["Geist"],
+            "label-bold": ["Geist"],
+            "headline-md": ["Geist"],
+            "body-md": ["Geist"],
+            "label-sm": ["Geist"],
+            "headline-sm": ["Geist"],
+            "price-lg": ["Geist"],
+            "body-lg": ["Geist"]
+          },
+          "fontSize": {
+            "display-lg": ["32px", {"lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+            "label-bold": ["12px", {"lineHeight": "16px", "fontWeight": "600"}],
+            "headline-md": ["24px", {"lineHeight": "32px", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+            "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+            "label-sm": ["11px", {"lineHeight": "14px", "fontWeight": "500"}],
+            "headline-sm": ["20px", {"lineHeight": "28px", "fontWeight": "600"}],
+            "price-lg": ["18px", {"lineHeight": "24px", "fontWeight": "500"}],
+            "body-lg": ["16px", {"lineHeight": "24px", "fontWeight": "400"}]
+          }
+        },
+      },
+    }
+  </script>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background text-on-surface font-body-md">
+<!-- Top App Bar -->
+<header class="sticky top-0 w-full z-50 flex items-center justify-between px-container-margin h-14 bg-surface shadow-sm dark:bg-on-background dark:shadow-none">
+<div class="flex items-center gap-4">
+<button class="hover:opacity-80 transition-opacity active:scale-95 transition-transform duration-150 flex items-center">
+<span class="material-symbols-outlined text-primary dark:text-primary-fixed">arrow_back</span>
+</button>
+<h1 class="font-headline-sm text-headline-sm-mobile md:text-headline-sm text-primary dark:text-primary-fixed">Order Details</h1>
+</div>
+<div class="flex items-center">
+<button class="hover:opacity-80 transition-opacity active:scale-95 transition-transform duration-150">
+<span class="material-symbols-outlined text-primary dark:text-primary-fixed">shopping_bag</span>
+</button>
+</div>
+</header>
+<main class="max-w-2xl mx-auto px-container-margin py-lg pb-32">
+<!-- Section 1: Order Summary -->
+<div class="bg-surface-container-lowest border border-outline-variant/30 rounded-xl p-md shadow-[0_4px_12px_rgba(0,0,0,0.04)] mb-xl">
+<div class="flex justify-between items-start mb-sm">
+<div class="space-y-1">
+<p class="font-label-bold text-label-bold text-on-surface-variant uppercase tracking-wider">Order ID</p>
+<p class="font-headline-sm text-headline-sm text-primary">#ORD-88294-XC</p>
+</div>
+<div class="bg-primary/10 text-primary px-3 py-1 rounded-full flex items-center gap-1.5">
+<div class="w-1.5 h-1.5 rounded-full bg-primary animate-pulse"></div>
+<span class="font-label-bold text-label-bold">Shipped</span>
+</div>
+</div>
+<div class="flex items-center gap-2 text-on-surface-variant">
+<span class="material-symbols-outlined text-[18px]">calendar_today</span>
+<p class="font-body-md text-body-md">Placed on Oct 24, 2023</p>
+</div>
+</div>
+<!-- Section 2: Tracking Timeline -->
+<section class="mb-xl">
+<h2 class="font-headline-sm text-headline-sm text-primary mb-md">Tracking Timeline</h2>
+<div class="space-y-0 px-2">
+<!-- Step 1: Delivered (Inactive) -->
+<div class="relative flex gap-md pb-8">
+<div class="absolute left-[11px] top-6 bottom-0 timeline-line"></div>
+<div class="relative z-10 w-6 h-6 rounded-full border-2 border-outline-variant bg-surface flex items-center justify-center">
+<div class="w-2 h-2 rounded-full bg-outline-variant"></div>
+</div>
+<div class="opacity-40">
+<p class="font-label-bold text-label-bold text-on-surface">Delivered</p>
+<p class="font-body-md text-body-md text-on-surface-variant">Expected by Oct 28</p>
+</div>
+</div>
+<!-- Step 2: Out for Delivery (Inactive) -->
+<div class="relative flex gap-md pb-8">
+<div class="absolute left-[11px] top-6 bottom-0 timeline-line"></div>
+<div class="relative z-10 w-6 h-6 rounded-full border-2 border-outline-variant bg-surface flex items-center justify-center">
+<div class="w-2 h-2 rounded-full bg-outline-variant"></div>
+</div>
+<div class="opacity-40">
+<p class="font-label-bold text-label-bold text-on-surface">Out for Delivery</p>
+<p class="font-body-md text-body-md text-on-surface-variant">Arrival at local facility</p>
+</div>
+</div>
+<!-- Step 3: Shipped (Active) -->
+<div class="relative flex gap-md pb-8">
+<div class="absolute left-[11px] top-6 bottom-0 timeline-line timeline-line-active"></div>
+<div class="relative z-10 w-6 h-6 rounded-full bg-primary flex items-center justify-center shadow-lg shadow-primary/20">
+<span class="material-symbols-outlined text-[16px] text-on-primary">local_shipping</span>
+</div>
+<div>
+<p class="font-label-bold text-label-bold text-primary">Shipped</p>
+<p class="font-body-md text-body-md text-on-surface">In transit via FedEx Express</p>
+<p class="text-[12px] text-on-surface-variant mt-1">Oct 25, 2023 • 09:42 AM</p>
+</div>
+</div>
+<!-- Step 4: Order Placed (Completed) -->
+<div class="relative flex gap-md">
+<div class="relative z-10 w-6 h-6 rounded-full bg-primary flex items-center justify-center">
+<span class="material-symbols-outlined text-[16px] text-on-primary">check</span>
+</div>
+<div>
+<p class="font-label-bold text-label-bold text-on-surface">Order Placed</p>
+<p class="font-body-md text-body-md text-on-surface-variant">Payment successful</p>
+<p class="text-[12px] text-on-surface-variant mt-1">Oct 24, 2023 • 02:15 PM</p>
+</div>
+</div>
+</div>
+</section>
+<!-- Section 3: Items in Order -->
+<section class="mb-xl">
+<h2 class="font-headline-sm text-headline-sm text-primary mb-md">Items in Order</h2>
+<div class="space-y-md">
+<!-- Item 1 -->
+<div class="flex items-center gap-md bg-surface-container-lowest p-sm rounded-xl border border-outline-variant/20">
+<div class="w-20 h-20 bg-surface-container rounded-lg overflow-hidden flex-shrink-0">
+<img alt="Headphones" class="w-full h-full object-cover" data-alt="Close-up shot of professional studio headphones in matte black finish, resting on a sleek white marble surface. The lighting is soft and cinematic, highlighting the metallic textures and premium build quality. Minimalist light-mode commerce aesthetic with clean lines and high contrast." src="https://lh3.googleusercontent.com/aida-public/AB6AXuB5YNvJi8rI5ZdjGhOm9VugV8PCL61obIWQ9tYLXidNqyg1CsrAUStw98muAzV77jeMBqAougOjKbrg8rB0lckYopEtv_XxaPUrSJky58nxRaREz6DdRW7W3jHNOKjFvOQObZVwV8-JF8lP4sHKSwwE_Uha_qZhh4VgQAl7YPjOGbzQRN7eUw_M3lzbdOqAN3kdwP-lPKkJOgX9NzniGgcC-Rnb_rWuKCdUomFskaQJ3B4YOsidPooKRpUKMfRAyQ_fIqXBJYZBD8wP"/>
+</div>
+<div class="flex-grow">
+<div class="flex justify-between items-start">
+<p class="font-label-bold text-body-lg text-on-surface">Pro Series Wireless</p>
+<p class="font-price-lg text-price-lg text-primary">$299.00</p>
+</div>
+<p class="font-body-md text-on-surface-variant">Space Gray • Qty: 1</p>
+<div class="mt-2 inline-flex items-center gap-1 bg-on-primary-fixed-variant/5 px-2 py-0.5 rounded text-[10px] font-label-bold uppercase text-on-primary-fixed-variant">
+              High Demand
+            </div>
+</div>
+</div>
+<!-- Item 2 -->
+<div class="flex items-center gap-md bg-surface-container-lowest p-sm rounded-xl border border-outline-variant/20">
+<div class="w-20 h-20 bg-surface-container rounded-lg overflow-hidden flex-shrink-0">
+<img alt="Watch" class="w-full h-full object-cover" data-alt="Minimalist top-down view of a designer analog watch with a white face and tan leather strap. The background is a soft beige linen fabric creating a luxury, clean retail environment. Natural window lighting creates gentle shadows, emphasizing the sophisticated and timeless design of the product." src="https://lh3.googleusercontent.com/aida-public/AB6AXuAt_LwE8hKjODrGwuqDTQ4d9QXzzG_-ANHviSJp6Ui_etmYySMcdjpIOHtxcCFuKct371boJOq76YdHMzTr70IdHyyEqylX2_DOQgZJpDKABgehDzc50_z3SA3k9N-8aF3a3umXsURkbS5Zfxq1HdY8lngXpktfeSI7evj4lz0AYghSzR5xMNxxlGA-z2St6lP9e0x87vrszlvsQy2r4sk0lm8v4DizQyeMLsZh_HYWjpXpkg867Uw_9MKSPtbSYQd0KEK-WiLBytSD"/>
+</div>
+<div class="flex-grow">
+<div class="flex justify-between items-start">
+<p class="font-label-bold text-body-lg text-on-surface">Classic Chronograph</p>
+<p class="font-price-lg text-price-lg text-primary">$185.00</p>
+</div>
+<p class="font-body-md text-on-surface-variant">Tan Leather • Qty: 1</p>
+</div>
+</div>
+</div>
+</section>
+<!-- Section 4: Address & Payment -->
+<div class="grid grid-cols-1 md:grid-cols-2 gap-md mb-xl">
+<div class="bg-surface-container-low p-md rounded-xl space-y-sm">
+<div class="flex items-center gap-2 text-primary">
+<span class="material-symbols-outlined text-[20px]">location_on</span>
+<h3 class="font-label-bold text-label-bold uppercase tracking-tight">Shipping Address</h3>
+</div>
+<div class="text-on-surface-variant space-y-0.5">
+<p class="font-body-md font-bold text-on-surface">Jameson Sterling</p>
+<p class="font-body-md">1242 Highland Avenue</p>
+<p class="font-body-md">Suite 405</p>
+<p class="font-body-md">Seattle, WA 98101</p>
+</div>
+</div>
+<div class="bg-surface-container-low p-md rounded-xl space-y-sm">
+<div class="flex items-center gap-2 text-primary">
+<span class="material-symbols-outlined text-[20px]">credit_card</span>
+<h3 class="font-label-bold text-label-bold uppercase tracking-tight">Payment Method</h3>
+</div>
+<div class="flex items-center gap-md">
+<div class="w-10 h-6 bg-primary rounded flex items-center justify-center">
+<span class="text-[10px] text-on-primary font-bold">VISA</span>
+</div>
+<div>
+<p class="font-body-md font-bold text-on-surface">Visa ending in 4242</p>
+<p class="font-body-md text-on-surface-variant">Expires 12/26</p>
+</div>
+</div>
+</div>
+</div>
+<!-- Section 5: Order Total Breakdown -->
+<section class="bg-surface p-md rounded-xl border-t border-outline-variant/30">
+<div class="space-y-sm">
+<div class="flex justify-between text-on-surface-variant">
+<p class="font-body-md">Subtotal</p>
+<p class="font-body-md">$484.00</p>
+</div>
+<div class="flex justify-between text-on-surface-variant">
+<p class="font-body-md">Shipping (FedEx Express)</p>
+<p class="font-body-md">$15.00</p>
+</div>
+<div class="flex justify-between text-on-surface-variant">
+<p class="font-body-md">Tax</p>
+<p class="font-body-md">$38.72</p>
+</div>
+<div class="pt-sm mt-sm border-t border-outline-variant/20 flex justify-between items-center">
+<p class="font-headline-sm text-headline-sm text-on-surface">Total</p>
+<p class="font-display-lg text-display-lg text-primary">$537.72</p>
+</div>
+</div>
+</section>
+<!-- Support Actions -->
+<div class="mt-xl flex flex-col gap-sm">
+<button class="w-full h-12 bg-primary text-on-primary rounded-xl font-label-bold flex items-center justify-center gap-2 hover:opacity-90 transition-opacity">
+<span class="material-symbols-outlined text-[20px]">support_agent</span>
+        Need Help with this Order?
+      </button>
+<button class="w-full h-12 border border-primary text-primary rounded-xl font-label-bold flex items-center justify-center gap-2 hover:bg-primary/5 transition-colors">
+<span class="material-symbols-outlined text-[20px]">receipt_long</span>
+        Download Invoice (PDF)
+      </button>
+</div>
+</main>
+<!-- Bottom Nav Bar -->
+<nav class="fixed bottom-0 left-0 w-full z-50 flex justify-around items-center px-4 py-2 pb-safe bg-surface shadow-[0_-8px_20px_rgba(0,0,0,0.08)] rounded-t-xl dark:bg-inverse-surface border-t border-outline-variant/20">
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-surface-variant hover:bg-surface-container-low dark:hover:bg-on-surface-variant/10 p-2 rounded-lg transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="storefront">storefront</span>
+<span class="font-label-sm text-label-sm-mobile md:text-label-sm">Shop</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-surface-variant hover:bg-surface-container-low dark:hover:bg-on-surface-variant/10 p-2 rounded-lg transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="search">search</span>
+<span class="font-label-sm text-label-sm-mobile md:text-label-sm">Search</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-surface-variant hover:bg-surface-container-low dark:hover:bg-on-surface-variant/10 p-2 rounded-lg transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="favorite">favorite</span>
+<span class="font-label-sm text-label-sm-mobile md:text-label-sm">Wishlist</span>
+</a>
+<a class="flex flex-col items-center justify-center text-primary dark:text-inverse-primary font-bold scale-90 transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="person" style="font-variation-settings: 'FILL' 1;">person</span>
+<span class="font-label-sm text-label-sm-mobile md:text-label-sm">Account</span>
+</a>
+</nav>
+<script>
+    // Micro-interactions
+    document.querySelectorAll('button, a').forEach(elem => {
+      elem.addEventListener('touchstart', () => {
+        elem.classList.add('scale-95');
+      });
+      elem.addEventListener('touchend', () => {
+        elem.classList.remove('scale-95');
+      });
+    });
+
+    // Intersection observer for smooth reveals
+    const observerOptions = {
+      threshold: 0.1
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('opacity-100', 'translate-y-0');
+          entry.target.classList.remove('opacity-0', 'translate-y-4');
+        }
+      });
+    }, observerOptions);
+
+    document.querySelectorAll('section, .bg-surface-container-lowest').forEach(el => {
+      el.classList.add('transition-all', 'duration-700', 'opacity-0', 'translate-y-4');
+      observer.observe(el);
+    });
+  </script>
+</body></html>

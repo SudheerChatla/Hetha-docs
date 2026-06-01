@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0, viewport-fit=cover" name="viewport"/>
+<title>Order History - The Collection</title>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<script id="tailwind-config">
+      tailwind.config = {
+        darkMode: "class",
+        theme: {
+          extend: {
+            "colors": {
+                    "inverse-primary": "#95d3ba",
+                    "on-surface-variant": "#404944",
+                    "surface-dim": "#d9dadb",
+                    "on-error": "#ffffff",
+                    "primary-fixed": "#b0f0d6",
+                    "on-secondary": "#ffffff",
+                    "inverse-surface": "#2e3132",
+                    "background": "#f8f9fa",
+                    "secondary-fixed-dim": "#c0c6db",
+                    "primary-container": "#064e3b",
+                    "on-primary": "#ffffff",
+                    "primary-fixed-dim": "#95d3ba",
+                    "on-tertiary-fixed-variant": "#6e372f",
+                    "on-background": "#191c1d",
+                    "surface-container-low": "#f3f4f5",
+                    "on-primary-container": "#80bea6",
+                    "error": "#ba1a1a",
+                    "surface-container": "#edeeef",
+                    "on-tertiary": "#ffffff",
+                    "tertiary-fixed-dim": "#ffb4a9",
+                    "tertiary-container": "#6b342d",
+                    "surface-container-highest": "#e1e3e4",
+                    "on-surface": "#191c1d",
+                    "surface-container-lowest": "#ffffff",
+                    "surface-container-high": "#e7e8e9",
+                    "tertiary-fixed": "#ffdad5",
+                    "tertiary": "#4f1f19",
+                    "on-primary-fixed-variant": "#0b513d",
+                    "primary": "#003527",
+                    "on-tertiary-container": "#ea9e93",
+                    "surface": "#f8f9fa",
+                    "outline-variant": "#bfc9c3",
+                    "on-primary-fixed": "#002117",
+                    "inverse-on-surface": "#f0f1f2",
+                    "on-secondary-container": "#5c6274",
+                    "surface-tint": "#2b6954",
+                    "secondary-container": "#d9dff5",
+                    "on-tertiary-fixed": "#380d08",
+                    "outline": "#707974",
+                    "on-secondary-fixed-variant": "#404758",
+                    "surface-variant": "#e1e3e4",
+                    "secondary": "#575e70",
+                    "on-error-container": "#93000a",
+                    "secondary-fixed": "#dce2f7",
+                    "error-container": "#ffdad6",
+                    "surface-bright": "#f8f9fa",
+                    "on-secondary-fixed": "#141b2b"
+            },
+            "borderRadius": {
+                    "DEFAULT": "0.25rem",
+                    "lg": "0.5rem",
+                    "xl": "0.75rem",
+                    "full": "9999px"
+            },
+            "spacing": {
+                    "gutter": "12px",
+                    "xl": "32px",
+                    "xs": "4px",
+                    "sm": "8px",
+                    "md": "16px",
+                    "base": "4px",
+                    "lg": "24px",
+                    "container-margin": "20px"
+            },
+            "fontFamily": {
+                    "display-lg": ["Geist"],
+                    "label-bold": ["Geist"],
+                    "headline-md": ["Geist"],
+                    "body-md": ["Geist"],
+                    "label-sm": ["Geist"],
+                    "headline-sm": ["Geist"],
+                    "price-lg": ["Geist"],
+                    "body-lg": ["Geist"]
+            },
+            "fontSize": {
+                    "display-lg": ["32px", {"lineHeight": "40px", "letterSpacing": "-0.02em", "fontWeight": "700"}],
+                    "label-bold": ["12px", {"lineHeight": "16px", "fontWeight": "600"}],
+                    "headline-md": ["24px", {"lineHeight": "32px", "letterSpacing": "-0.01em", "fontWeight": "600"}],
+                    "body-md": ["14px", {"lineHeight": "20px", "fontWeight": "400"}],
+                    "label-sm": ["11px", {"lineHeight": "14px", "fontWeight": "500"}],
+                    "headline-sm": ["20px", {"lineHeight": "28px", "fontWeight": "600"}],
+                    "price-lg": ["18px", {"lineHeight": "24px", "fontWeight": "500"}],
+                    "body-lg": ["16px", {"lineHeight": "24px", "fontWeight": "400"}]
+            }
+          },
+        },
+      }
+    </script>
+<style>
+        @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&display=swap');
+        
+        body {
+            font-family: 'Geist', sans-serif;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+
+        .order-card-transition {
+            transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .order-card-transition:active {
+            transform: scale(0.98);
+        }
+    </style>
+<style>
+    body {
+      min-height: max(884px, 100dvh);
+    }
+  </style>
+  </head>
+<body class="bg-background text-on-background min-h-screen pb-24">
+<!-- TopAppBar -->
+<header class="sticky top-0 w-full z-50 flex items-center justify-between px-container-margin h-14 bg-surface dark:bg-on-background shadow-sm dark:shadow-none">
+<button class="flex items-center justify-center w-10 h-10 hover:opacity-80 transition-opacity active:scale-95 transition-transform duration-150">
+<span class="material-symbols-outlined text-primary dark:text-primary-fixed" data-icon="arrow_back">arrow_back</span>
+</button>
+<h1 class="font-headline-sm text-headline-sm tracking-tight text-primary dark:text-primary-fixed">My Orders</h1>
+<button class="flex items-center justify-center w-10 h-10 hover:opacity-80 transition-opacity active:scale-95 transition-transform duration-150">
+<span class="material-symbols-outlined text-primary dark:text-primary-fixed" data-icon="shopping_bag">shopping_bag</span>
+</button>
+</header>
+<main class="px-container-margin pt-lg">
+<!-- Order Stats / Filter Section (Bento Style Suggestion) -->
+<div class="grid grid-cols-2 gap-md mb-xl">
+<div class="bg-surface-container-lowest p-md rounded-xl border border-outline-variant/30 flex flex-col justify-between h-24 shadow-[0_4px_12px_rgba(0,0,0,0.04)]">
+<span class="font-label-bold text-label-bold text-on-surface-variant">Active Orders</span>
+<span class="font-display-lg text-display-lg text-primary-container">02</span>
+</div>
+<div class="bg-surface-container-lowest p-md rounded-xl border border-outline-variant/30 flex flex-col justify-between h-24 shadow-[0_4px_12px_rgba(0,0,0,0.04)]">
+<span class="font-label-bold text-label-bold text-on-surface-variant">Past 30 Days</span>
+<span class="font-display-lg text-display-lg text-primary-container">08</span>
+</div>
+</div>
+<div class="flex flex-col gap-md">
+<!-- Order Card 1: Processing -->
+<div class="order-card-transition bg-white p-md rounded-xl border border-outline-variant/20 shadow-[0_4px_12px_rgba(0,0,0,0.04)] hover:shadow-lg">
+<div class="flex justify-between items-start mb-md">
+<div class="flex flex-col">
+<span class="font-label-bold text-label-bold text-primary">#ORD-8829</span>
+<span class="font-body-md text-body-md text-on-surface-variant">Oct 24, 2023</span>
+</div>
+<div class="bg-primary/5 px-sm py-1 rounded-full">
+<span class="font-label-bold text-label-bold text-primary">Processing</span>
+</div>
+</div>
+<div class="flex items-center gap-sm mb-lg">
+<div class="flex -space-x-4">
+<img class="w-12 h-12 rounded-lg object-cover border-2 border-white" data-alt="A minimalist, high-end white analog wristwatch with a leather strap, photographed against a clean, soft-lit background. The style is modern retail photography with a sophisticated atmosphere, emphasizing the premium quality and sharp details of the materials." src="https://lh3.googleusercontent.com/aida-public/AB6AXuA35-WaDcYbCYvP1Qu_m3lNwqds8OGRnM4hTp73JycUY4bEwtusBH6FxnS0BM1CHVkwzIZx06Mpoucm-7F7yksKyhqQtLW0u8DSQr9aPJeVezI1shu83eaEVSUVreaCwc5ys-98zPSArOzZNbCVZfvXCmKiwKqfjKVTgTSNLtzeOMcddu4nXcdRXeDkzgLUKUXab-XHTp5YsYodEmsK2_5r7LYVnF1zvUb5qHAT3h73Bk621StHhFu_Xa8k7gYfAYao3on2O1couPmg"/>
+<img class="w-12 h-12 rounded-lg object-cover border-2 border-white" data-alt="A pair of sleek, matte black over-ear headphones sitting on a reflective white surface. The lighting is soft and cinematic, highlighting the ergonomic design and luxury finish of the professional audio equipment, creating an aura of high-tech elegance." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDNdMHHO3Q4Wno3bhG7Awekqhn6ZbWBxQK1bqD_HG3Gvtu_feyWg2VeTe2itDnOGKLOO1FrmnZc0Pxf7uYEdmrYhCmaNoe_w3MMpiyU3_Qt9gk-9mUnJlNQl0kaTvfvIIcsqtAbYOZUGZj9c0MnDMpqHkStDVZSphQYerpzenAyBh5h0nI8pkAnaesoOWwOe6lAqyJ-pQ179-etQkC5dtVRQjyUFl_rh1ODVlwDbIjk3mf16UywthV2CcwZVGysf5xbJq8Z-07lUgGj"/>
+<div class="w-12 h-12 rounded-lg bg-surface-container flex items-center justify-center border-2 border-white">
+<span class="font-label-bold text-label-bold text-on-surface-variant">+1</span>
+</div>
+</div>
+<div class="ml-auto flex flex-col items-end">
+<span class="font-label-bold text-label-bold text-on-surface-variant">Total</span>
+<span class="font-price-lg text-price-lg text-on-surface">$248.00</span>
+</div>
+</div>
+<div class="flex items-center justify-between pt-md border-t border-outline-variant/10">
+<button class="flex items-center gap-xs text-primary font-label-bold text-label-bold hover:opacity-70 transition-opacity">
+                        View Details
+                        <span class="material-symbols-outlined text-[18px]" data-icon="chevron_right">chevron_right</span>
+</button>
+<button class="bg-primary-container text-on-primary-container px-md py-2 rounded-lg font-label-bold text-label-bold active:scale-95 transition-transform">
+                        Track Order
+                    </button>
+</div>
+</div>
+<!-- Order Card 2: In Transit -->
+<div class="order-card-transition bg-white p-md rounded-xl border border-outline-variant/20 shadow-[0_4px_12px_rgba(0,0,0,0.04)] hover:shadow-lg">
+<div class="flex justify-between items-start mb-md">
+<div class="flex flex-col">
+<span class="font-label-bold text-label-bold text-primary">#ORD-8712</span>
+<span class="font-body-md text-body-md text-on-surface-variant">Oct 21, 2023</span>
+</div>
+<div class="bg-secondary-container/50 px-sm py-1 rounded-full">
+<span class="font-label-bold text-label-bold text-secondary">In Transit</span>
+</div>
+</div>
+<div class="flex items-center gap-sm mb-lg">
+<div class="flex">
+<img class="w-12 h-12 rounded-lg object-cover border-2 border-white" data-alt="A professional-grade matte black camera lens standing on a polished concrete surface. The lighting is dramatic and directional, casting subtle shadows and highlighting the complex glass elements and metallic rings of the lens. The mood is industrial and premium." src="https://lh3.googleusercontent.com/aida-public/AB6AXuDF-ZQAaMX5Hvzh8hEOGSH-hbtqZ9RfjAuJICj3A3Nq9aLfsvVMt3F3FQVzKbWzXK5A_JJyzyu_7NKYPxpAjdKm-VlDKn_1hgszxfkEHv-g5NDLUe8DnG-E6Xv1SlePE_rmb9IZTHjUBEtcD_4sdixMqRS3t6Vc2zPn5vVjjCtSv0jXMN8LXoHKJwLJcLlzEMBvI7NBvbYyr21SVqOiq_zcx3nw8MmAp8itBL2Wb5u_9oX1jv-0NeWa2Rc1reOVjn1z0VHEmbpsFhMz"/>
+</div>
+<div class="ml-auto flex flex-col items-end">
+<span class="font-label-bold text-label-bold text-on-surface-variant">Total</span>
+<span class="font-price-lg text-price-lg text-on-surface">$899.00</span>
+</div>
+</div>
+<div class="flex items-center justify-between pt-md border-t border-outline-variant/10">
+<button class="flex items-center gap-xs text-primary font-label-bold text-label-bold hover:opacity-70 transition-opacity">
+                        View Details
+                        <span class="material-symbols-outlined text-[18px]" data-icon="chevron_right">chevron_right</span>
+</button>
+<button class="bg-primary text-white px-md py-2 rounded-lg font-label-bold text-label-bold active:scale-95 transition-transform">
+                        Track Order
+                    </button>
+</div>
+</div>
+<!-- Order Card 3: Delivered -->
+<div class="order-card-transition bg-white p-md rounded-xl border border-outline-variant/20 shadow-[0_4px_12px_rgba(0,0,0,0.04)] hover:shadow-lg opacity-90">
+<div class="flex justify-between items-start mb-md">
+<div class="flex flex-col">
+<span class="font-label-bold text-label-bold text-primary">#ORD-8504</span>
+<span class="font-body-md text-body-md text-on-surface-variant">Oct 15, 2023</span>
+</div>
+<div class="bg-green-100 dark:bg-primary-fixed/20 px-sm py-1 rounded-full">
+<span class="font-label-bold text-label-bold text-primary">Delivered</span>
+</div>
+</div>
+<div class="flex items-center gap-sm mb-lg">
+<div class="flex -space-x-4">
+<img class="w-12 h-12 rounded-lg object-cover border-2 border-white shadow-sm" data-alt="A vibrant red sports sneaker presented against a neutral grey studio background. The image features high-contrast lighting that emphasizes the dynamic texture and form of the footwear. The overall look is clean, energetic, and sophisticated, reflecting a modern sportswear aesthetic." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBN6wnucpumx8Mh7A53DWsOY-fa_rnbMqUywPE3vMmTHRCYIS5O6WW6rkTcn5Xsamlh7671Hme44U2B9-JjiNsO_IFNkgmlwq6CSyeUeN36PcB3vKzqX50p_tKHB9X6sf-RVckudTDi9W8TfcvdnHa6aKWghAamDMACtvX7ROJvzUaYTJQLqw_nCDzYRE9_amPE2RXUVAt-xBsScs_see1uL40UHcdZEfUvsmQaeuqRo-FZYIlO9h4BJafeOIoS88j07PQxkbyG_YQk"/>
+<img class="w-12 h-12 rounded-lg object-cover border-2 border-white shadow-sm" data-alt="High-end designer sunglasses with dark lenses and a slim gold frame, placed on a white marble surface. The lighting is bright and airy, reflecting a luxury lifestyle aesthetic with a focus on minimalist elegance and high-quality materials." src="https://lh3.googleusercontent.com/aida-public/AB6AXuBNGJQjYv_XaGD6tL6061Ovqi3p9IG9bh3au7h9ng9iRE_CYc0luCGrXnyxLtoNKbGUIO8fY3tsbPGPoEHtlcAsGckaBTGh1eIrehKNEQ0KyBlAjKbRWEnlU70ILzCsLgBfjtSb5KpDdp0LiiECKT7W2uVUZIMZ3975ojLeS2BEfHt_O164LeJqIYItCBrQbGtB4WBiagG0WcC40f1XeB1h40mYI-ie4BFpOHdv4vYcRrg-Db6a2j6FwT2tBwuPrsIBY9h8lBADPA0m"/>
+</div>
+<div class="ml-auto flex flex-col items-end">
+<span class="font-label-bold text-label-bold text-on-surface-variant">Total</span>
+<span class="font-price-lg text-price-lg text-on-surface">$129.50</span>
+</div>
+</div>
+<div class="flex items-center justify-between pt-md border-t border-outline-variant/10">
+<button class="flex items-center gap-xs text-primary font-label-bold text-label-bold hover:opacity-70 transition-opacity">
+                        View Details
+                        <span class="material-symbols-outlined text-[18px]" data-icon="chevron_right">chevron_right</span>
+</button>
+<button class="border border-outline px-md py-2 rounded-lg font-label-bold text-label-bold hover:bg-surface-container-low transition-colors active:scale-95 transition-transform">
+                        Buy Again
+                    </button>
+</div>
+</div>
+</div>
+</main>
+<!-- BottomNavBar -->
+<nav class="fixed bottom-0 left-0 w-full z-50 flex justify-around items-center px-4 py-2 pb-safe bg-surface dark:bg-inverse-surface border-t border-outline-variant/20 shadow-[0_-8px_20px_rgba(0,0,0,0.08)] rounded-t-xl md:hidden">
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-surface-variant hover:bg-surface-container-low dark:hover:bg-on-surface-variant/10 px-3 py-1 rounded-lg transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="storefront">storefront</span>
+<span class="font-label-sm text-label-sm-mobile">Shop</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-surface-variant hover:bg-surface-container-low dark:hover:bg-on-surface-variant/10 px-3 py-1 rounded-lg transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="search">search</span>
+<span class="font-label-sm text-label-sm-mobile">Search</span>
+</a>
+<a class="flex flex-col items-center justify-center text-on-surface-variant dark:text-surface-variant hover:bg-surface-container-low dark:hover:bg-on-surface-variant/10 px-3 py-1 rounded-lg transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="favorite">favorite</span>
+<span class="font-label-sm text-label-sm-mobile">Wishlist</span>
+</a>
+<a class="flex flex-col items-center justify-center text-primary dark:text-inverse-primary font-bold scale-90 transition-all duration-200" href="#">
+<span class="material-symbols-outlined" data-icon="person" style="font-variation-settings: 'FILL' 1;">person</span>
+<span class="font-label-sm text-label-sm-mobile">Account</span>
+</a>
+</nav>
+<script>
+        // Micro-interactions: Ripple effect on cards
+        document.querySelectorAll('.order-card-transition').forEach(card => {
+            card.addEventListener('click', function(e) {
+                // Potential navigation logic
+                console.log('Navigating to order details...');
+            });
+        });
+    </script>
+</body></html>
