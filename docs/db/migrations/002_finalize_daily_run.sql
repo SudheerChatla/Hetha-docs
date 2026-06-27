@@ -63,7 +63,9 @@ BEGIN
         v_order.total_value,
         'debit',
         'Subscription delivery ' || p_delivery_date::text,
-        p_admin_id::text
+        p_admin_id::text,
+        'subscription',
+        v_order.id::text
       );
 
       UPDATE public.subscription_daily_orders

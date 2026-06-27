@@ -44,7 +44,7 @@ BEGIN
   INSERT INTO public.wallet_transactions (
     user_id, type, amount, balance_after, description, initiated_by, reference_type, reference_id
   ) VALUES (
-    p_user_id, p_type, p_amount, v_new_balance, p_description, p_initiated_by, p_reference_type, p_reference_id
+    p_user_id, p_type, p_amount, v_new_balance, p_description, p_initiated_by, p_reference_type, p_reference_id::uuid
   );
 
   RETURN v_new_balance;
