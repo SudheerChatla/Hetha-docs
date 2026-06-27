@@ -40,7 +40,7 @@ BEGIN
   UPDATE public.subscription_daily_orders
   SET is_finalized = true,
       finalized_at = now(),
-      finalized_by = p_admin_id::text
+      finalized_by = p_admin_id
   WHERE delivery_date = p_delivery_date
     AND status = 'pending'
     AND is_finalized = false;
