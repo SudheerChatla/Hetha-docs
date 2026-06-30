@@ -53,6 +53,8 @@ CREATE UNIQUE INDEX delivery_schedule_exceptions_pkey ON public.delivery_schedul
 CREATE INDEX idx_notif_status ON public.notifications USING btree (status) WHERE (status = 'pending'::text);
 CREATE INDEX idx_notif_user_id ON public.notifications USING btree (user_id);
 CREATE UNIQUE INDEX notifications_pkey ON public.notifications USING btree (id);
+CREATE INDEX idx_notifications_user_created ON public.notifications (user_id, created_at DESC);
+CREATE INDEX idx_notifications_user_unread ON public.notifications (user_id) WHERE (read_at IS NULL);
 
 -- order_items
 CREATE INDEX idx_order_items_order ON public.order_items USING btree (order_id);

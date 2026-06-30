@@ -142,13 +142,26 @@ CREATE TABLE public.notifications (
   template_key text,
   title text,
   body text,
+  data jsonb DEFAULT '{}'::jsonb,
   reference_type text,
   reference_id uuid,
   status text NOT NULL DEFAULT 'pending'::text CHECK (status = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text])),
+  read_at timestamp with time zone DEFAULT NULL,
   sent_at timestamp without time zone,
   created_at timestamp without time zone DEFAULT now(),
   CONSTRAINT notifications_pkey PRIMARY KEY (id),
   CONSTRAINT fk_notif_user FOREIGN KEY (user_id) REFERENCES public.users(id)
+);
+CREATE TABLE public.device_tokens (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  fcm_token text NOT NULL,
+  platform text NOT NULL CHECK (platform IN ('android', 'ios')),
+  created_at timestamp with time zone DEFAULT now(),
+  updated_at timestamp with time zone DEFAULT now(),
+  CONSTRAINT device_tokens_pkey PRIMARY KEY (id),
+  CONSTRAINT device_tokens_user_id_fcm_token_key UNIQUE (user_id, fcm_token),
+  CONSTRAINT fk_device_tokens_user FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE
 );
 CREATE TABLE public.order_items (
   id uuid NOT NULL DEFAULT gen_random_uuid(),

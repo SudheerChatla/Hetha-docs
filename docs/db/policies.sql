@@ -98,6 +98,7 @@ CREATE POLICY "delivery_schedule_exceptions_view_policy" ON public.delivery_sche
 
 -- notifications --------------------------------------------------------------
 CREATE POLICY "Users can read own notifications" ON public.notifications FOR SELECT TO public USING (auth.uid() = user_id);
+CREATE POLICY "Users can update own notifications" ON public.notifications FOR UPDATE TO public USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
 
 -- order_items ----------------------------------------------------------------
 CREATE POLICY "Users can read own order items" ON public.order_items FOR SELECT TO public USING (EXISTS (SELECT 1 FROM orders WHERE orders.id = order_items.order_id AND orders.user_id = auth.uid()));

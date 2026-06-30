@@ -268,8 +268,25 @@ Always written alongside an `update_wallet_balance` call.
 
 ### `notifications`
 `user_id` FK, `type` (`push`/`sms`/`whatsapp`), `template_key`, `title`, `body`,
+`data` (jsonb, optional route/payload for in-app navigation),
 `reference_type`, `reference_id`, `status` (`pending`/`sent`/`failed`),
+`read_at` (timestamptz, null = unread — used for in-app notification inbox),
 `sent_at`.
+
+The Flutter app displays these as an in-app notification inbox (bell icon on
+home page). `read_at` is bulk-set when the user opens the notifications screen.
+The `send-notification` Edge Function + admin `notificationService.ts` write to
+this table alongside sending the FCM push.
+
+### `device_tokens`
+
+`user_id` FK, `fcm_token` (text, the Firebase Cloud Messaging device token),
+`platform` (`android`/`ios`), `created_at`, `updated_at`.
+UNIQUE on `(user_id, fcm_token)` — one user can have multiple devices.
+
+The Flutter app registers the token on every app start (upsert). Token is
+deleted on sign-out. The `send-notification` Edge Function looks up tokens
+here and auto-cleans stale/unregistered ones when FCM returns errors.
 
 ---
 
