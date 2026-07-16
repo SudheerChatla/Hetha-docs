@@ -121,6 +121,7 @@ The sellable unit (a product has one or more variants).
 | `weight_grams` | numeric | drives weight-based delivery charge |
 | `is_preferred` | boolean | default-selected variant |
 | `is_active` | boolean | |
+| `free_delivery` | boolean NOT NULL | when true, variant is excluded from weight-based delivery charge calculation |
 
 ### `product_images`
 `id`, `product_id` FK, `image_url`, `display_order`. Images live here, **not** on
@@ -251,7 +252,9 @@ that perturb the normal cadence.
 
 ### `delivery_charge_tiers`
 Weight-based shipping price: `min_weight_grams`, `max_weight_grams`, `charge`
-(`CHECK >= 0`). Order weight (Σ variant `weight_grams`) selects a tier.
+(`CHECK >= 0`). Order weight (Σ variant `weight_grams` for non-`free_delivery`
+items) selects a tier. Variants with `free_delivery = true` are excluded from
+the weight sum; if all cart items are free-delivery, the charge is ₹0.
 
 ---
 

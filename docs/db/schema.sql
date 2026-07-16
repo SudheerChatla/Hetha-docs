@@ -266,6 +266,7 @@ CREATE TABLE public.product_variants (
   weight_grams numeric,
   is_preferred boolean DEFAULT false,
   is_active boolean DEFAULT true,
+  free_delivery boolean NOT NULL DEFAULT false,
   CONSTRAINT product_variants_pkey PRIMARY KEY (id),
   CONSTRAINT fk_variant_product FOREIGN KEY (product_id) REFERENCES public.products(id)
 );
