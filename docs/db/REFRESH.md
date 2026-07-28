@@ -10,7 +10,7 @@ per-repo copies (`Hetha_app/doc-schema/*.sql`, `Hetha_admin/docs/*.sql`) are
 mirrors that should match.
 
 > **Partially hand-edited (2026-07-28, money-integrity work).** `schema.sql`,
-> `policies.sql` and `indexes.sql` carry manual notes for migrations `007`–`012`
+> `policies.sql` and `indexes.sql` carry manual notes for migrations `007`–`015`
 > rather than a fresh export. Both function files WERE re-exported from the live
 > database on 2026-07-28 and are current: `functions.sql` (`public` schema) and
 > `functions_internal.sql` (`internal` schema — the privileged money primitives,
@@ -100,8 +100,8 @@ select has_column_privilege('authenticated','public.users','wallet_balance','UPD
 The pricing, wallet and payment logic has DB-level protections that are easy to
 undo by accident. After touching them:
 
-1. Run the regression suite — it applies migrations `007`–`012` to an in-process
-   Postgres and asserts 37 attack/happy-path cases:
+1. Run the regression suite — it applies migrations `007`–`013` + `015` to an
+   in-process Postgres and asserts 41 attack/happy-path cases:
    ```bash
    cd docs/db/tests && npm install && npm run verify
    ```
