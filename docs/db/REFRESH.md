@@ -9,12 +9,12 @@ Canonical generated artifacts live in this folder (`Hetha/docs/db/`). The
 per-repo copies (`Hetha_app/doc-schema/*.sql`, `Hetha_admin/docs/*.sql`) are
 mirrors that should match.
 
-> **Hand-edited since the last full export (2026-07-28, money-integrity work).**
-> `schema.sql`, `policies.sql`, `indexes.sql` and `functions.sql` carry manual
-> notes for migrations `007`–`012`; `functions.sql` still contains the
-> **pre-migration** bodies of the replaced functions, marked `[SUPERSEDED]`. Do a
-> full re-export (below) when you next get the chance — the migrations in
-> `docs/db/migrations/` are the authoritative source until then.
+> **Partially hand-edited (2026-07-28, money-integrity work).** `schema.sql`,
+> `policies.sql` and `indexes.sql` carry manual notes for migrations `007`–`012`
+> rather than a fresh export. `functions.sql` WAS re-exported from the live
+> database on 2026-07-28 and is current for the `public` schema — but the
+> `internal` schema (the privileged money primitives) is not in it; those live in
+> `docs/db/migrations/`.
 
 ---
 
@@ -23,10 +23,11 @@ mirrors that should match.
 | Artifact | File | Last synced | How |
 |----------|------|-------------|-----|
 | Tables / columns / constraints | `schema.sql` | 2026-06-01 (+ `payment_intents` by hand 2026-07-28) | Table Editor → Copy as SQL |
-| Functions / RPCs | `functions.sql` | 2026-06-01 — **stale**: 8 functions replaced + 6 new public and 15 new `internal` functions since | query (C) below |
+| Functions / RPCs (`public`) | `functions.sql` | **2026-07-28** — current | query (C) below |
+| Functions (`internal`) | — (see `docs/db/migrations/`) | 2026-07-28 | query (C) with `nspname = 'internal'` |
 | RLS enabled per table | (in `DATA_MODEL.md` §11) | 2026-07-28 | `pg_class.relrowsecurity` |
 | RLS policy definitions | `policies.sql` | 2026-06-01 (money-path policies by hand 2026-07-28) | query (D) — `pg_policies` |
-| Triggers | (in `DATA_MODEL.md` §12) | 2026-07-28 — **7 triggers now exist** (were 0) | query (E) |
+| Triggers | (in `DATA_MODEL.md` §12) | 2026-07-28 — **7+ triggers now exist** (were 0) | query (E) |
 | pg_cron jobs | (in `DATA_MODEL.md` §13) | 2026-06-01 | query (F) — 1 job |
 | Indexes | `indexes.sql` | 2026-06-01 (+ `payment_intents`, `uq_orders_razorpay_payment_id` by hand) | query (G) |
 | Grants (EXECUTE / column) | (in `DATA_MODEL.md` §11) | 2026-07-28 | query (H) below |

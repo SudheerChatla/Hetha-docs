@@ -166,25 +166,34 @@ await db.exec(`
 
 // ---------------------------------------------------------------------------
 // 4. Pre-migration exploit demonstration
+//    Only meaningful while functions.sql still holds the PRE-migration bodies.
+//    Once that snapshot is re-exported from the live (hardened) database, these
+//    calls either behave correctly or fail because the `internal` schema does
+//    not exist yet — so treat the whole block as best-effort.
 // ---------------------------------------------------------------------------
 console.log('\n--- BEFORE the migrations (documenting the vulnerabilities) ---');
 
-const before = await asQuery({ sub: CUSTOMER, role: 'authenticated' },
-  `SELECT public.place_order($1,$2,'wallet',0,$3::jsonb) AS id`,
-  [CUSTOMER, ADDR, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]);
-const beforeOrder = await db.query(
-  `SELECT subtotal, delivery_charge, total FROM public.orders WHERE id = $1`,
-  [before.rows[0].id]);
-console.log('  delivery_charge = 0 accepted by old place_order →', JSON.stringify(beforeOrder.rows[0]));
+try {
+  const before = await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+    `SELECT public.place_order($1,$2,'wallet',0,$3::jsonb) AS id`,
+    [CUSTOMER, ADDR, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]);
+  const beforeOrder = await db.query(
+    `SELECT subtotal, delivery_charge, total FROM public.orders WHERE id = $1`,
+    [before.rows[0].id]);
+  console.log('  delivery_charge = 0 accepted by old place_order →', JSON.stringify(beforeOrder.rows[0]));
 
-const beforeSub = await asQuery({ sub: CUSTOMER, role: 'authenticated' },
-  `SELECT public.create_subscription($1, now(), NULL, 'active', $2::jsonb, $3::jsonb, 'Home') AS id`,
-  [CUSTOMER, JSON.stringify({ pincode: '600001', name: 'Cust' }),
-   JSON.stringify([{ variantId: VAR, name: 'Cow Milk', variant: '1 L', price: 0.01, quantity: 1, startDate: '2026-07-28' }])]);
-const beforeItems = await db.query(
-  `SELECT unit_price FROM public.subscription_items WHERE subscription_id = $1`,
-  [beforeSub.rows[0].id]);
-console.log('  client price 0.01 accepted by old create_subscription →', JSON.stringify(beforeItems.rows[0]));
+  const beforeSub = await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+    `SELECT public.create_subscription($1, now(), NULL, 'active', $2::jsonb, $3::jsonb, 'Home') AS id`,
+    [CUSTOMER, JSON.stringify({ pincode: '600001', name: 'Cust' }),
+     JSON.stringify([{ variantId: VAR, name: 'Cow Milk', variant: '1 L', price: 0.01, quantity: 1, startDate: '2026-07-28' }])]);
+  const beforeItems = await db.query(
+    `SELECT unit_price FROM public.subscription_items WHERE subscription_id = $1`,
+    [beforeSub.rows[0].id]);
+  console.log('  client price 0.01 accepted by old create_subscription →', JSON.stringify(beforeItems.rows[0]));
+} catch (e) {
+  console.log('  (skipped: functions.sql is a POST-migration export — ' +
+              `${e.message.split('\n')[0]})`);
+}
 
 // Clean the demo rows so the post-migration assertions start from a known state.
 await db.exec(`

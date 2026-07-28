@@ -330,8 +330,11 @@ this is enforced.
 
 ## 9. Database functions (RPCs)
 
-Trusted business logic runs in Postgres, not the clients. **Verified against the
-live database 2026-06-01** — full source in [`docs/db/functions.sql`](./db/functions.sql).
+Trusted business logic runs in Postgres, not the clients. **`public` schema
+re-exported from the live database 2026-07-28** — full source in
+[`docs/db/functions.sql`](./db/functions.sql). The privileged `internal` schema
+(not exposed through PostgREST) is documented in
+[`docs/db/migrations/`](./db/migrations/).
 
 | RPC | Called by | What it does |
 |-----|-----------|--------------|
@@ -506,9 +509,13 @@ deliberate data repair: `SET LOCAL hetha.skip_money_checks = 'on'` (a session GU
 so it is unreachable through PostgREST).
 
 Order numbers (`ORD-<timestamp>-<nnnn>`) and `updated_at` are still set **inline
-by functions**, not by triggers. The `rls_auto_enable` **event trigger** exists at
-the database level (not a table trigger, so it doesn't appear in
-`information_schema.triggers`).
+by functions**, not by triggers — except `reviews`, where a
+`set_reviews_updated_at()` trigger function exists in the database (confirmed in
+the 2026-07-28 function export). The trigger list above was captured with a
+table filter that excluded `reviews`, so run query (E) in
+[`REFRESH.md`](./db/REFRESH.md) unfiltered to confirm which table it is attached
+to. The `rls_auto_enable` **event trigger** exists at the database level (not a
+table trigger, so it doesn't appear in `information_schema.triggers`).
 
 - **Indexes:** captured in [`docs/db/indexes.sql`](./db/indexes.sql) — FKs,
   status/date filter columns, and several partial indexes
