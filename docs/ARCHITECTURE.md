@@ -135,9 +135,13 @@ participate.
 ### Prepaid wallet
 
 - `users.wallet_balance` holds prepaid funds (DB `CHECK (>= 0)`).
-- All balance changes go through the `update_wallet_balance` RPC, which locks the
-  row (`SELECT … FOR UPDATE`) to prevent race conditions, and every change is
-  recorded in `wallet_transactions` with a `balance_after` snapshot.
+- All balance changes go through **`internal.apply_wallet_delta()`**, which locks
+  the row (`SELECT … FOR UPDATE`) and writes a matching `wallet_transactions` row
+  with a `balance_after` snapshot in the same transaction.
+- The public `update_wallet_balance` RPC is a thin authorization wrapper around it
+  (service role, super admin, or `customers:edit`). Customer JWTs are rejected.
+- `authenticated` has **no UPDATE grant on the `wallet_balance` column**, so the
+  balance cannot be written from a client even though RLS allows own-row updates.
 
 ### Subscriptions
 
@@ -145,19 +149,26 @@ participate.
   subscriptions** and accepts an optional `label`.
 - Each subscription has `subscription_items` (variant, quantity, unit price,
   per-item start/end dates) and copies `snapshot_*` customer/address fields.
+- `unit_price` is always read from `product_variants` — the `price` field in the
+  client payload is ignored — and is immutable once written. This is the column
+  the daily run sheet bills against.
 - A subscription's daily cost = Σ(`unit_price × quantity`) over active items.
   `get_user_daily_commitment(user_id)` returns the total daily cost across **all**
   of a user's active subscriptions.
 
 ### The 3-day buffer rule
 
-To stop a one-time purchase from starving upcoming daily deliveries, the app
-reserves three days of total daily commitment:
+To stop a one-time purchase from starving upcoming daily deliveries, three days
+of total daily commitment are reserved. **Enforced in the database** (and mirrored
+in the UI for a friendlier message):
 
 - **Creating a subscription:** require
   `wallet_balance ≥ (existing_daily_commitment + new_sub_daily_cost) × 3`.
-- **Paying for a one-time order from the wallet:** the wallet is only selectable
-  if `wallet_balance ≥ (daily_commitment × 3) + order_total`.
+- **Paying for a one-time order from the wallet:** require
+  `wallet_balance ≥ (daily_commitment × 3) + order_total`.
+
+Admin-placed orders skip the reserve deliberately, so ops can still fulfil edge
+cases.
 
 ### Daily order generation (run sheet)
 
@@ -181,34 +192,96 @@ The full business logic, route grouping, and PDF export are documented in
 
 ## 5. Payments (Razorpay) {#payments}
 
-Payments are **verified server-side** so a tampered client cannot fake success.
-The Razorpay secret (`key_secret`) lives only in the Supabase Edge Function
-environment — never in either client.
+Payments are **verified server-side**, and — since 2026-07-28 — the **server also
+decides the amount**. The Razorpay secret (`key_secret`) lives only in the
+Supabase Edge Function environment, never in either client.
 
-The single `razorpay` edge function exposes three actions:
+> **Why the amount matters.** The HMAC signature only proves that a given
+> `<order_id>|<payment_id>` pair really came from Razorpay. It says nothing about
+> how much was paid. The old flow trusted the client's `amount` field, so paying
+> ₹1 and posting `amount: 100000` credited ₹1,00,000 — and the same signed triple
+> could be replayed. See `CHANGES_2026-07-28.md`.
+
+The single `razorpay` edge function exposes four actions:
 
 | Action | Used by | Purpose |
 |--------|---------|---------|
-| `create-order` | App checkout & wallet recharge | Creates a Razorpay order for a given amount |
-| `verify-payment` | App wallet recharge | Verifies HMAC-SHA256 signature, then credits the wallet atomically via `update_wallet_balance` |
-| `verify-order-payment` | App checkout | Verifies the signature, then calls `place_order` **server-side** with `payment_method: 'razorpay'` |
+| `create-order` | App checkout & wallet recharge | Creates a **payment intent** with the server-computed amount, then a Razorpay order for exactly that amount. Requires `purpose` (`order` \| `wallet_topup`) |
+| `verify-payment` | App wallet recharge | Signature + Razorpay `payments.fetch` + intent ownership → `finalize_wallet_topup` |
+| `verify-order-payment` | App checkout | Same checks → `finalize_order_payment`, which places the order server-side |
+| `payment-failed` | App | Marks an abandoned intent `failed` (housekeeping) |
 
 **Checkout flow (Pay Online):**
 
 ```
-App → create-order → Razorpay order id
-App opens Razorpay sheet (UPI/card/netbanking)
-On success → App → verify-order-payment
-                    ├─ verify signature (HMAC-SHA256, secret from edge env)
-                    └─ if valid → place_order RPC (server-side) → order row
+App → create-order { purpose:'order', address_id, cart_items:[{variant_id,quantity}] }
+       └─ server prices the cart (quote_cart) → payment_intents row + Razorpay order
+App opens Razorpay sheet with the amount the SERVER returned
+On success → App → verify-order-payment { intent_id, order_id, payment_id, signature }
+                    ├─ HMAC-SHA256 signature check (length-safe compare)
+                    ├─ razorpay.payments.fetch → real captured amount + status
+                    ├─ intent belongs to the caller, matches this Razorpay order
+                    └─ finalize_order_payment (idempotent per payment id)
+                         ├─ refuses if captured < intent amount
+                         └─ place_order_core → order row, payment_status 'paid'
 ```
 
-Wallet recharge follows the same shape with `verify-payment`. Both credit/charge
-through row-locked RPCs, so the wallet stays consistent under concurrency.
+Wallet recharge is the same shape via `verify-payment` → `finalize_wallet_topup`,
+which credits **only what Razorpay says was captured**, capped at the intent
+amount, once per `razorpay_payment_id`.
+
+Nothing about pricing is taken from the request body: for orders the amount comes
+from the catalog, and for top-ups the requested amount is range-checked
+(₹1–₹50,000). `payment_intents` is service-role only (RLS on, no policies).
+
+**Not yet covered:** there is no Razorpay **webhook**. If the app dies between
+capture and verification, the money is captured with no order and the intent
+stays `created`. The `finalize_*` RPCs are idempotent, so a `payment.captured`
+webhook can call them directly — recommended before production.
 
 > The project is on the Razorpay **test key** (`rzp_test_…`). Switch the edge
 > function env to the live key before production. In test mode, use card
 > `4111 1111 1111 1111` or UPI `success@razorpay` / `failure@razorpay`.
+
+---
+
+## 5b. Money integrity (what is trusted, and where) {#money-integrity}
+
+Added 2026-07-28. The rule is: **clients send ids and quantities; the database
+decides money.**
+
+| Decision | Where it is made |
+|----------|------------------|
+| Item price | `product_variants.price`, re-read inside every RPC |
+| Delivery charge | `internal.compute_delivery_charge()` from `delivery_charge_tiers` + variant weights. The client's `p_delivery_charge` is honoured **only** for admin callers (fee waivers) |
+| Order total | `internal.place_order_core()`; enforced afterwards by deferred constraint triggers |
+| Amount payable online | `payment_intents.amount_paise`, set server-side |
+| Amount credited | Razorpay's `payments.fetch` response |
+| Wallet balance | `internal.apply_wallet_delta()` only; `authenticated` has no UPDATE grant on the column |
+| 3-day buffer | Enforced in `place_order` and `create_subscription` (was UI-only) |
+
+Enforcement layers, outermost first:
+
+1. **Privileged logic in a hidden schema.** `internal` is not in the project's
+   exposed schemas, so nothing in it is reachable over PostgREST.
+2. **In-function authorization.** Every money RPC checks `auth.uid()` against the
+   target user, or requires an admin permission / the service role.
+3. **Grants.** `anon` can execute only `quote_cart`, `has_permission`,
+   `is_super_admin`. Payment-intent functions are service-role only.
+4. **RLS.** Customers cannot write `orders`, `order_items` or
+   `subscription_items` at all — those go through `SECURITY DEFINER` RPCs.
+5. **Database invariants.** Deferred constraint triggers require
+   `orders.subtotal = Σ order_items.total_price`,
+   `orders.total = subtotal + delivery_charge`, and
+   `subscription_daily_orders.total_value = Σ` its items — so even staff with
+   `orders:edit` cannot hand-write a cheap order. `subscription_items.unit_price`
+   is snapped to the catalog on insert and immutable after.
+   Escape hatch for deliberate repair: `SET LOCAL hetha.skip_money_checks = 'on'`.
+
+Deployed by `docs/db/migrations/007`–`012`; regression-tested by
+[`docs/db/tests/verify_money_integrity.mjs`](./db/tests/verify_money_integrity.mjs),
+which applies those migrations to an in-process Postgres (PGlite) and asserts 37
+attack and happy-path cases. Run it after any change to a money path.
 
 ---
 
@@ -222,6 +295,10 @@ payment_pending → placed → processing → shipped → out_for_delivery → d
 
 - `payment_method`: `wallet` | `razorpay` | `wallet_razorpay` | `cod`.
 - `payment_status`: `pending` | `paid` | `failed` | `refunded`.
+- **Wallet / COD** orders are created `placed` (wallet also `paid`).
+- **Online (razorpay)** orders created by a customer start as `payment_pending`
+  and only become `placed` + `paid` once the edge function has verified the
+  payment — so an unverified order never reaches the run sheet or packing list.
 - The app drives placement (via RPC / edge function) and lets customers view
   orders, download PDF invoices, and review delivered items.
 - The admin panel drives fulfillment: status transitions, tracking info

@@ -2,7 +2,7 @@
 -- CANONICAL SCHEMA SNAPSHOT — public schema (tables only)
 -- =============================================================================
 -- Source : Supabase → Table Editor → "Copy as SQL" (live database)
--- Synced : 2026-06-01
+-- Synced : 2026-06-01 (payment_intents added by hand 2026-07-28, migration 008)
 -- Scope  : Tables, columns, constraints (PK/FK/UNIQUE/CHECK) ONLY.
 --          Does NOT include: functions/RPCs, RLS policies, triggers, indexes,
 --          pg_cron jobs, or edge functions. Pull those separately — see
@@ -190,6 +190,30 @@ CREATE TABLE public.order_tracking (
   CONSTRAINT order_tracking_pkey PRIMARY KEY (id),
   CONSTRAINT fk_tracking_order FOREIGN KEY (order_id) REFERENCES public.orders(id)
 );
+CREATE TABLE public.payment_intents (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL,
+  purpose text NOT NULL CHECK (purpose = ANY (ARRAY['wallet_topup'::text, 'order'::text])),
+  status text NOT NULL DEFAULT 'created'::text CHECK (status = ANY (ARRAY['created'::text, 'paid'::text, 'failed'::text, 'expired'::text])),
+  amount_paise bigint NOT NULL CHECK (amount_paise > 0),
+  razorpay_order_id text UNIQUE,
+  razorpay_payment_id text UNIQUE,
+  address_id uuid,
+  cart_items jsonb,
+  order_id uuid,
+  amount_paid_paise bigint,
+  created_at timestamp with time zone NOT NULL DEFAULT now(),
+  expires_at timestamp with time zone NOT NULL DEFAULT (now() + '00:30:00'::interval),
+  consumed_at timestamp with time zone,
+  CONSTRAINT payment_intents_pkey PRIMARY KEY (id),
+  CONSTRAINT payment_intents_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id),
+  CONSTRAINT payment_intents_address_id_fkey FOREIGN KEY (address_id) REFERENCES public.addresses(id),
+  CONSTRAINT payment_intents_order_id_fkey FOREIGN KEY (order_id) REFERENCES public.orders(id)
+);
+-- ^ Added 2026-07-28 (migration 008). `amount_paise` is decided by the SERVER
+--   (catalog price + tier delivery charge for orders; range-checked request for
+--   top-ups) and is what the payment is verified against. RLS is enabled with NO
+--   policies and all grants revoked from anon/authenticated — service role only.
 CREATE TABLE public.orders (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   order_number text NOT NULL UNIQUE,

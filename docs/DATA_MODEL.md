@@ -383,23 +383,30 @@ deployed `place_order` produces `ORD-…`.** Treat `ORD-` as authoritative; the
 
 ## 10. Edge functions
 
-`supabase/functions/razorpay` (Deno) — single function, three actions:
+`supabase/functions/razorpay` (Deno) — single function, four actions:
 
 | Action | Purpose |
 |--------|---------|
-| `create-order` | Create a Razorpay order for an amount |
-| `verify-payment` | Verify HMAC-SHA256 signature → credit wallet via `update_wallet_balance` |
-| `verify-order-payment` | Verify signature → call `place_order` server-side (`payment_method: 'razorpay'`) |
+| `create-order` | Requires `purpose` (`order` \| `wallet_topup`). Creates a `payment_intents` row with the **server-computed** amount (catalog price + tier delivery charge for orders; range-checked request for top-ups), then a Razorpay order for exactly that amount |
+| `verify-payment` | Signature + `razorpay.payments.fetch` (status must be `captured`) + intent ownership → `finalize_wallet_topup` |
+| `verify-order-payment` | Same checks → `finalize_order_payment` → `place_order_core` server-side |
+| `payment-failed` | Marks an abandoned intent `failed` |
 
-The secret `key_secret` is read from the edge environment only.
-*(Not yet re-verified against the deployed function — see `docs/db/REFRESH.md`.)*
+The amount is **never** read from the request body, and settlement is idempotent
+per `razorpay_payment_id`, so a replayed callback cannot double-credit a wallet or
+place a second order. The secret `key_secret` is read from the edge environment
+only. Rewritten 2026-07-28 — see [`ARCHITECTURE.md#payments`](./ARCHITECTURE.md#payments).
+
+No Razorpay **webhook** is deployed yet; a `payment.captured` webhook calling the
+same `finalize_*` RPCs would close the "captured but never verified" gap.
 
 ---
 
 ## 11. Row-Level Security
 
-**Verified 2026-06-01.** RLS is **enabled on all 29 public tables**; new tables
-get it automatically via the `rls_auto_enable` event trigger. Full policy DDL is
+**Verified 2026-06-01; updated 2026-07-28 (migrations 009–011).** RLS is
+**enabled on all public tables** (30 including `payment_intents`); new tables get
+it automatically via the `rls_auto_enable` event trigger. Full policy DDL is
 in [`docs/db/policies.sql`](./db/policies.sql).
 
 **Access model (the pattern almost every table follows):**
@@ -415,7 +422,52 @@ in [`docs/db/policies.sql`](./db/policies.sql).
   legacy `"Users can …"` owner policy and a newer `"<table>_*_policy"` RBAC
   policy.
 
+### Money tables are read-only for customers (2026-07-28)
+
+RLS alone was letting customers write rows that decide money, so these were
+tightened. Customers still **read** their own rows; all writes go through
+`SECURITY DEFINER` RPCs, which run as the table owner and therefore bypass RLS.
+
+| Table | Customer write | Notes |
+|-------|----------------|-------|
+| `orders` | ❌ removed | `orders_create_policy` is now admin-only (`orders:edit`) |
+| `order_items` | ❌ (already admin-only) | |
+| `subscription_items` | ❌ removed | previously the owner could INSERT/UPDATE — including `unit_price` |
+| `subscriptions` | ✅ own rows | needed for pause/cancel; `trg_guard_subscription_update` blocks `user_id` / `payment_method` changes |
+| `users` | ✅ own row, **minus `wallet_balance`** | table-level UPDATE revoked, re-granted per column |
+| `wallet_transactions` | ❌ (already admin-only) | written only by `internal.apply_wallet_delta` |
+| `payment_intents` | ❌ | RLS on with **no policies** and all grants revoked — service role only |
+
+**Grants matter as much as policies here.** Supabase's default privileges grant
+EXECUTE on every new `public` function to `anon`/`authenticated`, and functions
+created before that also carry an implicit PUBLIC grant, so `REVOKE … FROM PUBLIC`
+alone is not enough. After migrations 010–011, `anon` can execute exactly three
+functions: `quote_cart`, `has_permission`, `is_super_admin` (the last two are
+required because RLS policy expressions are evaluated as the calling role).
+
+Audit query — re-run it after adding any function:
+
+```sql
+select p.proname, r.rolname
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+cross join (values ('anon'),('authenticated')) as r(rolname)
+where n.nspname = 'public' and has_function_privilege(r.rolname, p.oid, 'EXECUTE')
+order by 1, 2;
+```
+
 ### ⚠ RLS findings (worth fixing)
+
+1. **Permission-key drift on `delivery_areas`.** Its write/extra-view policies
+   check `has_permission('pincode:edit'/'pincode:view')` — **singular** — while
+   `lib/constants.ts` and the `pincodes` table use **`pincodes:*`** (plural).
+   Non-super-admins are likely never granted the singular key, so in practice
+   **only `super_admin` can modify delivery areas**.
+2. **Orphan `audit_logs` permissions.** Policies reference
+   `audit_logs:create` / `audit_logs:view`, which aren't in the
+   `PAGE_PERMISSIONS` catalog — so only `super_admin` can read/write audit logs.
+3. **Redundant dual policies** (legacy owner + new RBAC) on many tables are
+   harmless but candidates for cleanup.
 
 1. **Permission-key drift on `delivery_areas`.** Its write/extra-view policies
    check `has_permission('pincode:edit'/'pincode:view')` — **singular** — while
@@ -434,18 +486,39 @@ in [`docs/db/policies.sql`](./db/policies.sql).
 
 ## 12. Triggers & indexes
 
-- **Triggers:** **none** on any `public` table (verified 2026-06-01). Order
-  numbers (`ORD-…`) and `updated_at` are set **inline by functions/inserts**, not
-  by triggers — so a table's `updated_at` only changes when a function explicitly
-  writes it (e.g. `update_wallet_balance` sets `users.updated_at`). The
-  `rls_auto_enable` **event trigger** exists at the database level (it isn't a
-  table trigger, so it doesn't appear in `information_schema.triggers`).
+**Triggers** (added 2026-07-28 by migrations 009 and 012 — before that there were
+none on any `public` table):
+
+| Table | Trigger | Timing | What it enforces |
+|-------|---------|--------|------------------|
+| `orders` | `trg_orders_totals` | AFTER INSERT / UPDATE OF money cols, **DEFERRED** | `subtotal = Σ order_items.total_price`, `total = subtotal + delivery_charge`, `delivery_charge >= 0`, ≥ 1 line item |
+| `order_items` | `trg_order_items_totals` | AFTER INSERT/UPDATE/DELETE, **DEFERRED** | same invariant, from the item side |
+| `order_items` | `trg_order_items_price` | BEFORE INSERT/UPDATE | `unit_price` snapped to the catalog on insert; `total_price` always derived |
+| `subscription_items` | `trg_subscription_items_price` | BEFORE INSERT/UPDATE | `unit_price` snapped to the catalog on insert, **immutable** after |
+| `subscription_daily_orders` | `trg_daily_order_total` | AFTER INSERT / UPDATE OF `total_value`, **DEFERRED** | `total_value = Σ` its items |
+| `subscription_daily_order_items` | `trg_daily_order_items_total` | AFTER INSERT/UPDATE/DELETE, **DEFERRED** | same, from the item side |
+| `subscriptions` | `trg_guard_subscription_update` | BEFORE UPDATE | non-admins cannot change `user_id` or `payment_method` |
+
+The deferred ones run at COMMIT, after a parent row and its items are both
+written, which makes them agnostic about who did the writing — RPC, edge function,
+admin panel or a hand-written `INSERT` all face the same rule. Bypass for
+deliberate data repair: `SET LOCAL hetha.skip_money_checks = 'on'` (a session GUC,
+so it is unreachable through PostgREST).
+
+Order numbers (`ORD-<timestamp>-<nnnn>`) and `updated_at` are still set **inline
+by functions**, not by triggers. The `rls_auto_enable` **event trigger** exists at
+the database level (not a table trigger, so it doesn't appear in
+`information_schema.triggers`).
+
 - **Indexes:** captured in [`docs/db/indexes.sql`](./db/indexes.sql) — FKs,
   status/date filter columns, and several partial indexes
   (`idx_orders_pending_expires`, `idx_products_in_stock`, `idx_users_is_adhoc`,
-  `idx_sub_items_active`, `idx_notif_status`). Unique business keys:
-  `uq_cart_user_variant`, `uq_sdo_subscription_date`,
-  `uq_review_user_order_product`, `uq_admin_permission`.
+  `idx_sub_items_active`, `idx_notif_status`,
+  `uq_orders_razorpay_payment_id` — partial unique, one order per Razorpay
+  payment). Unique business keys: `uq_cart_user_variant`,
+  `uq_sdo_subscription_date`, `uq_review_user_order_product`,
+  `uq_admin_permission`, and `payment_intents.razorpay_order_id` /
+  `razorpay_payment_id`.
 
 ---
 

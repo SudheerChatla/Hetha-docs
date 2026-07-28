@@ -111,8 +111,17 @@ await db.exec(`
 `);
 
 // RBAC helpers + the pre-existing functions the migrations replace.
+// `get_user_role` is stripped: it is LANGUAGE sql, so Postgres validates its body
+// at CREATE time and it references a column that does not exist
+// (admin_users.role / .auth_user_id). `\r?\n` because the working tree may have
+// CRLF endings on Windows.
 const functions = read(`${ROOT}/functions.sql`);
-await db.exec(functions.replace(/^-- get_user_role[\s\S]*?\$function\$;\n/m, ''));
+const functionsWithoutBroken = functions.replace(
+  /^-- get_user_role[\s\S]*?\$function\$;\r?\n/m, '');
+if (functionsWithoutBroken === functions) {
+  console.log('WARNING: get_user_role was not stripped — the CREATE will fail');
+}
+await db.exec(functionsWithoutBroken);
 console.log('functions.sql loaded (pre-migration baseline)');
 
 // Supabase's default table/function grants. Crucially this mirrors the real

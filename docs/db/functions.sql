@@ -5,27 +5,64 @@
 -- Synced : 2026-06-01
 -- Scope  : All public database functions / RPCs as deployed.
 --
--- ⚠ KNOWN ISSUES found at sync time (functions referencing columns that do NOT
---   exist in the current schema — these will error at runtime if that path
---   executes; decide whether to fix the function or the schema):
+-- #############################################################################
+-- ## ⚠ PARTIALLY SUPERSEDED — 2026-07-28 (money-integrity work)              ##
+-- #############################################################################
+-- The functions below marked [SUPERSEDED] were REPLACED by migrations 007–012.
+-- What is in this file for them is the PRE-migration version, kept as history.
+-- For the deployed source read the migration, or re-export this file with
+-- query (C) in REFRESH.md.
+--
+--   place_order               → 007 (server-computed delivery charge and prices,
+--                                    caller check, quantity validation, 3-day
+--                                    buffer, payment_pending for online orders)
+--   create_subscription (6+7) → 007 (unit_price read from product_variants)
+--   update_wallet_balance     → 007 (authorization wrapper around
+--                                    internal.apply_wallet_delta; the 5-arg
+--                                    overload was DROPPED because it made
+--                                    5-argument calls ambiguous)
+--   finalize_daily_run        → 009 (requires daily_ops:edit) [in 002/004]
+--   upsert_pauses             → 009 (subscription ownership check)
+--   remove_paused_dates       → 009 (subscription ownership check)
+--   claim_adhoc_user          → 009 (matches on the JWT's verified identity)
+--   update_address_as_default → 011 (ownership check + correct columns)
+--
+-- NEW functions, not in this file at all:
+--   public   : quote_cart, create_payment_intent, attach_razorpay_order,
+--              finalize_wallet_topup, finalize_order_payment,
+--              mark_payment_intent_failed
+--   internal : (schema NOT exposed to PostgREST) jwt_role, is_service_actor,
+--              is_admin_actor, apply_wallet_delta, normalize_cart,
+--              compute_delivery_charge, place_order_core,
+--              create_subscription_core, assert_subscription_access,
+--              guard_subscription_update, money_checks_disabled,
+--              assert_order_totals, assert_daily_order_total, snap_order_item,
+--              snap_subscription_item
+--
+-- ⚠ KNOWN ISSUES found at sync time (2026-06-01) — current status:
 --
 --   1. cancel_subscription (non-immediate / scheduled branch) writes
 --      `scheduled_end_date` and `cancellation_requested_at`, which are NOT
 --      columns on `subscriptions`. Scheduled cancellations will fail.
+--      → STILL OPEN.
 --   2. get_user_role selects `admin_users.auth_user_id`; the column is
 --      `user_id`. Function will error (appears unused — has_permission /
 --      is_super_admin are the live RBAC helpers and use `user_id` correctly).
+--      → STILL BROKEN, but EXECUTE was revoked from anon/authenticated in 011.
 --   3. update_address_as_default writes `addresses.phone` (column is
 --      `phone_number`) and `addresses.updated_at` (no such column). The Flutter
 --      app's non-atomic fallback may be masking this failure.
+--      → FIXED in migration 011, which also added the missing ownership check.
 --
 -- ⚠ create_subscription has TWO overloads (6-arg legacy + 7-arg current).
 --   The legacy 6-arg version still CANCELS existing active subscriptions and
 --   has no label / no 5-sub limit. The 7-arg version (p_label) enforces the
 --   max-5 rule and does not cancel. Prefer the 7-arg version everywhere.
+--   Since 007 both read prices from the catalog.
 --
--- ℹ place_order generates order numbers as 'ORD-<YYYYMMDDHH24MISS>' and RETURNS
---   the order UUID (text). (Not 'HET-' as some code comments/logs state.)
+-- ℹ Order numbers are 'ORD-<YYYYMMDDHH24MISS>-<nnnn>' since migration 007 (the
+--   random suffix prevents same-second collisions); place_order RETURNS the
+--   order UUID (as text). (Not 'HET-' as some older comments/logs state.)
 -- =============================================================================
 
 
@@ -58,7 +95,10 @@ END;
 $function$;
 
 
--- claim_adhoc_user ----------------------------------------------------------
+-- claim_adhoc_user  [SUPERSEDED → migration 009: matches on the JWT's verified
+--                    email/phone; the version below trusted the request body,
+--                    so a caller could claim another person's ad-hoc account]
+-- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.claim_adhoc_user(p_auth_uid uuid, p_email text DEFAULT NULL::text, p_phone text DEFAULT NULL::text, p_first_name text DEFAULT NULL::text, p_last_name text DEFAULT NULL::text)
  RETURNS users
  LANGUAGE plpgsql
@@ -142,6 +182,12 @@ BEGIN
 END;
 $function$;
 
+
+-- create_subscription — BOTH OVERLOADS BELOW ARE [SUPERSEDED → migration 007]:
+-- they take `unit_price` from the CLIENT payload, which the daily run sheet then
+-- bills against. The current versions read product_variants and enforce the
+-- 3-day wallet buffer.
+-- ---------------------------------------------------------------------------
 
 -- create_subscription (6-arg, LEGACY — cancels active subs, no label/limit) -
 CREATE OR REPLACE FUNCTION public.create_subscription(p_user_id uuid, p_start_date timestamp with time zone, p_end_date timestamp with time zone, p_status text, p_address jsonb, p_items jsonb)
@@ -328,7 +374,11 @@ AS $function$
 $function$;
 
 
--- place_order (5-arg; ORD- prefix; returns order UUID) ----------------------
+-- place_order  [SUPERSEDED → migration 007: the version below TRUSTS
+--               p_delivery_charge from the client (0 or negative accepted) and
+--               validates neither the caller, the quantities, nor variant
+--               availability]
+-- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.place_order(p_user_id uuid, p_address_id uuid, p_payment_method text, p_delivery_charge numeric, p_cart_items jsonb)
  RETURNS text
  LANGUAGE plpgsql
@@ -405,7 +455,9 @@ END;
 $function$;
 
 
--- remove_paused_dates -------------------------------------------------------
+-- remove_paused_dates  [SUPERSEDED → migration 009: ownership check added; the
+--                       version below accepts any subscription id]
+-- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.remove_paused_dates(p_subscription_id uuid, p_dates jsonb)
  RETURNS void
  LANGUAGE plpgsql
@@ -473,7 +525,11 @@ END;
 $function$;
 
 
--- update_address_as_default (⚠ writes addresses.phone & .updated_at) --------
+-- update_address_as_default  [SUPERSEDED → migration 011: correct columns
+--                             (phone_number, no updated_at) plus the missing
+--                             ownership check — it is SECURITY DEFINER and
+--                             trusted p_user_id]
+-- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.update_address_as_default(p_user_id uuid, p_address_id uuid, p_address_data jsonb)
  RETURNS void
  LANGUAGE plpgsql
@@ -501,7 +557,14 @@ END;
 $function$;
 
 
--- update_wallet_balance (row-locked, atomic) --------------------------------
+-- update_wallet_balance  [SUPERSEDED → migration 007: now an authorization
+--                         wrapper (service role / super admin / customers:edit)
+--                         around internal.apply_wallet_delta. THIS 5-ARG
+--                         OVERLOAD WAS DROPPED — with the 7-arg version present
+--                         it made 5-argument calls ambiguous. Before the fix,
+--                         EXECUTE was granted to PUBLIC, so any logged-in user
+--                         could credit their own wallet]
+-- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.update_wallet_balance(p_user_id uuid, p_amount numeric, p_type text, p_description text, p_initiated_by text)
  RETURNS numeric
  LANGUAGE plpgsql
@@ -544,7 +607,9 @@ END;
 $function$;
 
 
--- upsert_pauses -------------------------------------------------------------
+-- upsert_pauses  [SUPERSEDED → migration 009: ownership check added; the version
+--                 below accepts any subscription id]
+-- ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.upsert_pauses(p_subscription_id uuid, p_ranges jsonb)
  RETURNS void
  LANGUAGE plpgsql

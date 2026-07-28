@@ -1,6 +1,8 @@
 -- =============================================================================
 -- CANONICAL INDEXES SNAPSHOT — public schema
 -- Source : pg_indexes (live database)   Synced : 2026-06-01
+--          payment_intents + uq_orders_razorpay_payment_id added by hand
+--          2026-07-28 (migration 008); re-export with query (G) in REFRESH.md.
 -- =============================================================================
 
 -- addresses
@@ -73,6 +75,15 @@ CREATE INDEX idx_orders_status ON public.orders USING btree (status);
 CREATE INDEX idx_orders_user_id ON public.orders USING btree (user_id);
 CREATE UNIQUE INDEX orders_order_number_key ON public.orders USING btree (order_number);
 CREATE UNIQUE INDEX orders_pkey ON public.orders USING btree (id);
+-- One Razorpay payment can back at most one order (blocks payment replay).
+CREATE UNIQUE INDEX uq_orders_razorpay_payment_id ON public.orders USING btree (razorpay_payment_id) WHERE (razorpay_payment_id IS NOT NULL);
+
+-- payment_intents
+CREATE UNIQUE INDEX payment_intents_pkey ON public.payment_intents USING btree (id);
+CREATE UNIQUE INDEX payment_intents_razorpay_order_id_key ON public.payment_intents USING btree (razorpay_order_id);
+CREATE UNIQUE INDEX payment_intents_razorpay_payment_id_key ON public.payment_intents USING btree (razorpay_payment_id);
+CREATE INDEX idx_payment_intents_user ON public.payment_intents USING btree (user_id);
+CREATE INDEX idx_payment_intents_rzp_order ON public.payment_intents USING btree (razorpay_order_id);
 
 -- payment_attempts
 CREATE INDEX idx_payment_order_id ON public.payment_attempts USING btree (order_id);

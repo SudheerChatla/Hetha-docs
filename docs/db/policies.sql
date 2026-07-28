@@ -1,10 +1,12 @@
 -- =============================================================================
 -- CANONICAL RLS POLICIES SNAPSHOT — public schema
 -- Source : pg_policies (live database)   Synced : 2026-06-01
+--          Money-path policies updated by hand 2026-07-28 (migrations 009–011);
+--          re-export with query (D) in REFRESH.md to re-verify.
 -- =============================================================================
--- RLS is ENABLED on all 29 public tables (new tables get it via the
--- rls_auto_enable event trigger). Policies are PERMISSIVE, so multiple policies
--- on the same (table, cmd) combine with OR.
+-- RLS is ENABLED on all public tables — 30 including payment_intents (new tables
+-- get it via the rls_auto_enable event trigger). Policies are PERMISSIVE, so
+-- multiple policies on the same (table, cmd) combine with OR.
 --
 -- Standard pattern:
 --   • Customers: row-ownership check (auth.uid() = user_id, or via a join to a
@@ -13,6 +15,33 @@
 --   • Catalog tables (categories, products, product_variants, product_images,
 --     delivery_areas, delivery_charge_tiers, delivery_routes, pincodes, reviews)
 --     are world-readable via a SELECT USING (true) policy.
+--
+-- ############################################################################
+-- ## POLICIES ARE NOT THE WHOLE STORY — 2026-07-28                          ##
+-- ############################################################################
+-- RLS says WHICH ROWS a role may touch; it does not say which COLUMNS, and it
+-- does not apply to SECURITY DEFINER functions owned by the table owner. The
+-- money paths therefore rely on three more things, none of which appear in this
+-- file (see docs/db/migrations/009–012 and DATA_MODEL.md §11–12):
+--
+--   1. COLUMN GRANTS. `REVOKE UPDATE ON public.users FROM anon, authenticated`
+--      plus a per-column re-grant that EXCLUDES wallet_balance. A column-level
+--      REVOKE cannot carve a hole in a table-level grant, so the table grant has
+--      to go first.
+--   2. FUNCTION GRANTS. Supabase's ALTER DEFAULT PRIVILEGES grants EXECUTE on
+--      every new public function to anon/authenticated, and older functions also
+--      carry an implicit PUBLIC grant — so `REVOKE ... FROM PUBLIC` alone leaves
+--      holes. After 010–011, anon may execute only quote_cart, has_permission,
+--      is_super_admin.
+--   3. TRIGGERS. Deferred constraint triggers enforce
+--      orders.subtotal = Σ order_items and total = subtotal + delivery_charge,
+--      and subscription_daily_orders.total_value = Σ its items; BEFORE triggers
+--      snap order_items / subscription_items prices to the catalog. These bind
+--      even for staff with orders:edit / subscriptions:edit.
+--
+-- Customer WRITE access to money tables was removed in 009: `orders` INSERT and
+-- `subscription_items` INSERT/UPDATE/DELETE are admin-only below, and all
+-- customer writes go through the SECURITY DEFINER RPCs instead.
 --
 -- ⚠ FINDINGS at sync time:
 --   1. PERMISSION-KEY DRIFT: delivery_areas policies use has_permission('pincode:*')
@@ -114,13 +143,21 @@ CREATE POLICY "order_tracking_view_policy" ON public.order_tracking FOR SELECT T
 
 -- orders ---------------------------------------------------------------------
 CREATE POLICY "Users can read own orders" ON public.orders FOR SELECT TO public USING (auth.uid() = user_id);
-CREATE POLICY "orders_create_policy" ON public.orders FOR INSERT TO public WITH CHECK ((user_id = auth.uid()) OR is_super_admin() OR has_permission('orders:edit'));
+CREATE POLICY "orders_create_policy" ON public.orders FOR INSERT TO public WITH CHECK (is_super_admin() OR has_permission('orders:edit'));  -- 2026-07-28: customer branch (user_id = auth.uid()) REMOVED — app orders go through place_order()
 CREATE POLICY "orders_delete_policy" ON public.orders FOR DELETE TO public USING (is_super_admin() OR has_permission('orders:edit'));
 CREATE POLICY "orders_update_policy" ON public.orders FOR UPDATE TO public USING (is_super_admin() OR has_permission('orders:edit')) WITH CHECK (is_super_admin() OR has_permission('orders:edit'));
 CREATE POLICY "orders_view_user_policy" ON public.orders FOR SELECT TO public USING ((user_id = auth.uid()) OR is_super_admin() OR has_permission('orders:view') OR has_permission('orders:edit'));
 
--- payment_attempts -----------------------------------------------------------
-CREATE POLICY "Users can read own payment attempts" ON public.payment_attempts FOR SELECT TO public USING (EXISTS (SELECT 1 FROM orders WHERE orders.id = payment_attempts.order_id AND orders.user_id = auth.uid()));
+-- payment_intents (added 2026-07-28, migration 008) --------------------------
+-- INTENTIONALLY NO POLICIES. RLS is enabled and every grant is revoked from
+-- anon/authenticated, so only the service role (the razorpay edge function) can
+-- see or write it. Do not add a customer policy: the row holds the amount the
+-- customer is required to pay.
+--   ALTER TABLE public.payment_intents ENABLE ROW LEVEL SECURITY;
+--   REVOKE ALL ON public.payment_intents FROM anon, authenticated;
+--   GRANT ALL ON public.payment_intents TO service_role;
+
+-- payment_attempts -----------------------------------------------------------CREATE POLICY "Users can read own payment attempts" ON public.payment_attempts FOR SELECT TO public USING (EXISTS (SELECT 1 FROM orders WHERE orders.id = payment_attempts.order_id AND orders.user_id = auth.uid()));
 CREATE POLICY "payment_attempts_insert_policy" ON public.payment_attempts FOR INSERT TO public WITH CHECK (is_super_admin() OR has_permission('orders:edit') OR has_permission('payments:edit'));
 CREATE POLICY "payment_attempts_update_policy" ON public.payment_attempts FOR UPDATE TO public USING (is_super_admin() OR has_permission('orders:edit') OR has_permission('payments:edit')) WITH CHECK (is_super_admin() OR has_permission('orders:edit') OR has_permission('payments:edit'));
 CREATE POLICY "payment_attempts_view_policy" ON public.payment_attempts FOR SELECT TO public USING (EXISTS (SELECT 1 FROM orders o WHERE o.id = payment_attempts.order_id AND ((o.user_id = auth.uid()) OR is_super_admin() OR has_permission('orders:view') OR has_permission('orders:edit') OR has_permission('payments:view') OR has_permission('payments:edit'))));
@@ -182,9 +219,14 @@ CREATE POLICY "subscription_daily_orders_view_policy" ON public.subscription_dai
 
 -- subscription_items ---------------------------------------------------------
 CREATE POLICY "Users can read own subscription items" ON public.subscription_items FOR SELECT TO public USING (EXISTS (SELECT 1 FROM subscriptions WHERE subscriptions.id = subscription_items.subscription_id AND subscriptions.user_id = auth.uid()));
-CREATE POLICY "subscription_items_delete_policy" ON public.subscription_items FOR DELETE TO public USING (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_items.subscription_id AND (is_super_admin() OR has_permission('subscriptions:edit'))));
-CREATE POLICY "subscription_items_insert_policy" ON public.subscription_items FOR INSERT TO public WITH CHECK (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_items.subscription_id AND ((s.user_id = auth.uid()) OR is_super_admin() OR has_permission('subscriptions:edit'))));
-CREATE POLICY "subscription_items_update_policy" ON public.subscription_items FOR UPDATE TO public USING (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_items.subscription_id AND ((s.user_id = auth.uid()) OR is_super_admin() OR has_permission('subscriptions:edit')))) WITH CHECK (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_items.subscription_id AND ((s.user_id = auth.uid()) OR is_super_admin() OR has_permission('subscriptions:edit'))));
+CREATE POLICY "subscription_items_delete_policy" ON public.subscription_items FOR DELETE TO public USING (is_super_admin() OR has_permission('subscriptions:edit'));
+CREATE POLICY "subscription_items_insert_policy" ON public.subscription_items FOR INSERT TO public WITH CHECK (is_super_admin() OR has_permission('subscriptions:edit'));
+CREATE POLICY "subscription_items_update_policy" ON public.subscription_items FOR UPDATE TO public USING (is_super_admin() OR has_permission('subscriptions:edit')) WITH CHECK (is_super_admin() OR has_permission('subscriptions:edit'));
+-- ^ 2026-07-28 (migration 009): the customer branch (s.user_id = auth.uid()) was
+--   REMOVED from all three. It let a subscription owner write unit_price — the
+--   column the daily run sheet bills against. create_subscription() is SECURITY
+--   DEFINER so it still inserts items; it just no longer accepts a client price,
+--   and trg_subscription_items_price snaps/freezes the value regardless.
 CREATE POLICY "subscription_items_view_policy" ON public.subscription_items FOR SELECT TO public USING (EXISTS (SELECT 1 FROM subscriptions s WHERE s.id = subscription_items.subscription_id AND ((s.user_id = auth.uid()) OR is_super_admin() OR has_permission('subscriptions:view') OR has_permission('subscriptions:edit'))));
 
 -- subscription_pauses --------------------------------------------------------

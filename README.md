@@ -76,8 +76,14 @@ code obvious.
   address and frequency. A user may have up to **5 active subscriptions**, each
   with an optional `label` ("Home", "Parents", …).
 - **3-day buffer rule.** When creating a subscription or paying for a one-time
-  order from the wallet, the app reserves **3 days of total daily commitment** so
+  order from the wallet, **3 days of total daily commitment** are reserved so
   upcoming subscription deliveries can't be starved by a single purchase.
+  Enforced in the database (`place_order`, `create_subscription`) and mirrored in
+  both UIs for a friendlier message.
+- **Money is decided server-side.** Clients send variant ids and quantities;
+  prices come from `product_variants`, the delivery charge from
+  `delivery_charge_tiers`, and the payable amount from a server-created payment
+  intent. See [money integrity](./docs/ARCHITECTURE.md#money-integrity).
 - **Daily order / run sheet.** Each day, operations generates the list of
   deliveries by filtering active subscriptions through cutoff times, pauses,
   one-time modifications, and end dates, then snapshots each order. See
@@ -115,8 +121,12 @@ The Razorpay **secret** lives only in the Supabase Edge Function environment
 
 | Document | Scope |
 |----------|-------|
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | System-wide architecture, auth, payments, data flow |
-| [docs/DATA_MODEL.md](./docs/DATA_MODEL.md) | Shared Supabase schema, RPCs, edge functions |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | System-wide architecture, auth, payments, [money integrity](./docs/ARCHITECTURE.md#money-integrity), data flow |
+| [docs/DATA_MODEL.md](./docs/DATA_MODEL.md) | Shared Supabase schema, RPCs, RLS, triggers, edge functions |
+| [docs/db/](./docs/db/) | Canonical SQL snapshots (`schema`, `functions`, `policies`, `indexes`) |
+| [docs/db/migrations/](./docs/db/migrations/) | Numbered migrations — the authoritative source when a snapshot is behind |
+| [docs/db/tests/](./docs/db/tests/) | Money-path regression suite (in-process Postgres): `npm i && npm run verify` |
+| [docs/db/REFRESH.md](./docs/db/REFRESH.md) | Runbook for re-syncing the snapshots from the live database |
 | [Hetha_app/README.md](./Hetha_app/README.md) | Customer app: setup, run, build, structure |
 | [Hetha_app/docs/ARCHITECTURE.md](./Hetha_app/docs/ARCHITECTURE.md) | Flutter layers, Riverpod, services |
 | [Hetha_app/CONTRIBUTING.md](./Hetha_app/CONTRIBUTING.md) | App conventions & how to add features |
