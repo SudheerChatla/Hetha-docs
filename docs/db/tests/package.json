@@ -1,0 +1,12 @@
+{
+  "name": "hetha-db-tests",
+  "private": true,
+  "type": "module",
+  "description": "In-memory Postgres (PGlite) verification for the money-integrity migrations.",
+  "scripts": {
+    "verify": "node verify_money_integrity.mjs"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "0.3.16"
+  }
+}

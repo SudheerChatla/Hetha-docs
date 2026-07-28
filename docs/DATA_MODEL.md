@@ -263,7 +263,24 @@ the weight sum; if all cart items are free-delivery, the charge is ₹0.
 ### `wallet_transactions`
 Append-only ledger. `type` (`credit`/`debit`), `amount` (`CHECK > 0`),
 `balance_after`, `description`, `reference_type`, `reference_id`, `initiated_by`.
-Always written alongside an `update_wallet_balance` call.
+Always written alongside a wallet change — `users.wallet_balance` is only
+writable by `internal.apply_wallet_delta()`, which writes both in one
+transaction. `authenticated` has **no** UPDATE grant on that column.
+
+### `payment_intents`
+Server-side record of "this user must pay this much" — created before Razorpay
+checkout opens and consumed once, atomically, after the payment is verified.
+
+`user_id` FK, `purpose` (`wallet_topup`/`order`), `status`
+(`created`/`paid`/`failed`/`expired`), `amount_paise` (**computed by the
+server**), `razorpay_order_id` UNIQUE, `razorpay_payment_id` UNIQUE,
+`address_id`, `cart_items` jsonb, `order_id`, `amount_paid_paise`,
+`expires_at`, `consumed_at`.
+
+RLS is enabled with **no policies** and all grants are revoked from
+`anon`/`authenticated`: only the razorpay edge function (service role) touches
+it. `orders.razorpay_payment_id` also carries a partial UNIQUE index, so one
+Razorpay payment can back at most one order.
 
 ### `reviews`
 `user_id`, `product_id`, `variant_id`, `order_id` FKs; `rating`
@@ -318,12 +335,15 @@ live database 2026-06-01** — full source in [`docs/db/functions.sql`](./db/fun
 
 | RPC | Called by | What it does |
 |-----|-----------|--------------|
-| `place_order(p_user_id, p_address_id, p_payment_method, p_delivery_charge, p_cart_items)` | App (wallet/cod), admin (ad-hoc), edge fn (razorpay) | `SECURITY DEFINER`. Recomputes prices from `product_variants`, snapshots the address, inserts order + items + an `order_tracking` row, deducts the wallet **only** when `payment_method = 'wallet'`. Order status is always `'placed'`; `payment_status` is `paid` for wallet else `pending`. **Order number = `ORD-<YYYYMMDDHH24MISS>`** and the function **RETURNS the order UUID** (as text). |
-| `create_subscription(…, p_label)` **(7-arg, current)** | App, admin | Enforces **max 5 active/pending per user**, sets `label` (defaults to `Subscription N`), derives `delivary_area`/`delivary_frequency` from the address pincode. Does **not** cancel existing subs. |
-| `create_subscription(…)` **(6-arg, legacy)** | — (avoid) | Older overload still deployed: **cancels the user's active subscription** (`cancellation_type='replaced'`), no label, no limit. Prefer the 7-arg version everywhere. |
-| `get_user_daily_commitment(p_user_id)` | App | Σ daily cost across active/pending subs (drives the 3-day buffer rule). |
-| `update_wallet_balance(p_user_id, p_amount, p_type, p_description, p_initiated_by)` | Edge fns, admin | `SECURITY DEFINER`, row-locked (`FOR UPDATE`). The single canonical path to change `wallet_balance`; writes the ledger row. |
-| `update_address_as_default(p_user_id, p_address_id, p_address_data)` | App | Clears other defaults, updates + sets the target default. **⚠ see known issues.** |
+| `quote_cart(p_cart_items)` | App (display) | `SECURITY DEFINER STABLE`. Returns `{subtotal, delivery_charge, total}` computed from `product_variants` + `delivery_charge_tiers`. The client shows this; it never supplies pricing. |
+| `place_order(p_user_id, p_address_id, p_payment_method, p_delivery_charge, p_cart_items)` | App (wallet/cod), admin (ad-hoc), edge fn (razorpay) | `SECURITY DEFINER`. Only ids + quantities are trusted: prices come from `product_variants`, the **delivery charge is recomputed server-side** (`p_delivery_charge` is honoured only for admin callers, as a fee waiver), quantities must be whole numbers 1–99, and inactive/out-of-stock variants are rejected. Requires `p_user_id = auth.uid()` unless the caller is an admin with `orders:edit`/service role. Wallet payments additionally reserve **3 × daily subscription commitment**. Customer-initiated `razorpay` orders are created as `status='payment_pending'` until a verified payment arrives. **Order number = `ORD-<YYYYMMDDHH24MISS>-<nnnn>`**, **RETURNS the order UUID** (as text). |
+| `create_subscription(…, p_label)` **(7-arg, current)** | App, admin | Enforces **max 5 active/pending per user**, sets `label` (defaults to `Subscription N`), derives `delivary_area`/`delivary_frequency` from the address pincode, and takes `unit_price` from `product_variants` — the `price` field in the payload is ignored. Enforces the **3-day wallet buffer** for customer callers. Does **not** cancel existing subs. |
+| `create_subscription(…)` **(6-arg, legacy)** | Admin ad-hoc only | Older overload still deployed: **cancels the user's active subscription** (`cancellation_type='replaced'`), no label. Same server-side pricing as the 7-arg version. Prefer the 7-arg version in the app. |
+| `get_user_daily_commitment(p_user_id)` | App, `place_order`, `create_subscription` | Σ daily cost across active/pending subs (drives the 3-day buffer rule, now enforced in the DB as well as the UI). |
+| `update_wallet_balance(p_user_id, p_amount, p_type, p_description, p_initiated_by, [p_reference_type, p_reference_id])` | Admin, edge fns | `SECURITY DEFINER`. Thin authorization wrapper (`service_role`, `super_admin`, or `customers:edit`) around `internal.apply_wallet_delta`. Customer JWTs are rejected. The 5-arg overload was dropped — the defaults cover those callers. |
+| `create_payment_intent` / `attach_razorpay_order` / `finalize_wallet_topup` / `finalize_order_payment` / `mark_payment_intent_failed` | razorpay edge fn (service role only) | Payment lifecycle. The intent stores the amount the server decided; settlement compares it against the amount Razorpay says was captured and is idempotent per `razorpay_payment_id`. |
+| `finalize_daily_run(p_delivery_date, p_admin_id)` | Admin (daily ops) | `SECURITY DEFINER`. Locks the day's orders and debits wallets. Requires `daily_ops:edit` (or super admin / service role). |
+| `update_address_as_default(p_user_id, p_address_id, p_address_data)` | App | Clears other defaults, updates + sets the target default. Fixed in migration 011: writes `phone_number` (accepts `phone` or `phone_number` in the payload), no longer writes a non-existent `updated_at`, and raises unless the address belongs to the caller. |
 | `upsert_pauses(p_subscription_id, p_ranges)` / `remove_paused_dates(p_subscription_id, p_dates)` | App | Atomically merge/split subscription pause ranges. |
 | `claim_adhoc_user(p_auth_uid, …)` | App (sign-in), admin (convert) | `SECURITY DEFINER`. Merges an `is_adhoc` row onto a real auth account (returning/claim/collision/insert branches); child rows follow via `ON UPDATE CASCADE`. |
 | `cancel_subscription(p_subscription_id, p_user_id, p_end_date, p_is_immediate, p_cancellation_type, p_reason)` | App | Immediate → `status='cancelled'`; scheduled → `status='pending_cancellation'`. **⚠ see known issues.** |
