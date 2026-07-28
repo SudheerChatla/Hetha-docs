@@ -111,16 +111,14 @@ await db.exec(`
 `);
 
 // RBAC helpers + the pre-existing functions the migrations replace.
-// `get_user_role` is stripped: it is LANGUAGE sql, so Postgres validates its body
-// at CREATE time and it references a column that does not exist
-// (admin_users.role / .auth_user_id). `\r?\n` because the working tree may have
-// CRLF endings on Windows.
+// `get_user_role` was LANGUAGE sql referencing columns that don't exist, so
+// Postgres validates its body at CREATE time and it would fail to load. It has
+// been removed from functions.sql (dropped by migration 013), so normally there
+// is nothing to strip — but strip it defensively in case an older snapshot is
+// used. `\r?\n` because the working tree may have CRLF endings on Windows.
 const functions = read(`${ROOT}/functions.sql`);
 const functionsWithoutBroken = functions.replace(
-  /^-- get_user_role[\s\S]*?\$function\$;\r?\n/m, '');
-if (functionsWithoutBroken === functions) {
-  console.log('WARNING: get_user_role was not stripped — the CREATE will fail');
-}
+  /CREATE OR REPLACE FUNCTION public\.get_user_role[\s\S]*?\$function\$;\r?\n/m, '');
 await db.exec(functionsWithoutBroken);
 console.log('functions.sql loaded (pre-migration baseline)');
 
@@ -207,7 +205,8 @@ await db.exec(`
 // ---------------------------------------------------------------------------
 for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_privilege_lockdown.sql',
                  '010_grant_hardening.sql', '011_legacy_function_grants.sql',
-                 '012_money_invariants.sql']) {
+                 '012_money_invariants.sql',
+                 '013_fix_cancel_subscription_and_drop_get_user_role.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -611,6 +610,49 @@ await expectOk('daily order edit that re-sums the parent is accepted', async () 
     UPDATE public.subscription_daily_orders SET total_value = 200 WHERE id = '${dailyId}';
     COMMIT;`);
 });
+
+// 6u. Migration 013: scheduled cancellation writes end_date (not the phantom
+//     scheduled_end_date), and get_user_role is dropped.
+const cancelSub = (await db.query(
+  `INSERT INTO public.subscriptions (user_id, status, start_date)
+   VALUES ($1, 'active', CURRENT_DATE) RETURNING id`, [CUSTOMER])).rows[0].id;
+
+await expectOk('scheduled cancel_subscription no longer errors', () => asQuery(
+  { sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.cancel_subscription($1, $2, (now() + interval '7 days'), false, 'scheduled', 'test')`,
+  [cancelSub, CUSTOMER]));
+
+const cancelRow = (await db.query(
+  `SELECT status, end_date, cancelled_at FROM public.subscriptions WHERE id = $1`,
+  [cancelSub])).rows[0];
+if (cancelRow.status === 'pending_cancellation' && cancelRow.end_date !== null
+    && cancelRow.cancelled_at === null) {
+  ok(`scheduled cancel parked in pending_cancellation with end_date set, cancelled_at NULL`);
+} else {
+  bad('scheduled cancel result', JSON.stringify(cancelRow));
+}
+
+// Immediate cancel still fully cancels.
+const cancelSub2 = (await db.query(
+  `INSERT INTO public.subscriptions (user_id, status, start_date)
+   VALUES ($1, 'active', CURRENT_DATE) RETURNING id`, [CUSTOMER])).rows[0].id;
+await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.cancel_subscription($1, $2, now(), true, 'immediate', NULL)`, [cancelSub2, CUSTOMER]);
+const cancelRow2 = (await db.query(
+  `SELECT status, cancelled_at FROM public.subscriptions WHERE id = $1`, [cancelSub2])).rows[0];
+if (cancelRow2.status === 'cancelled' && cancelRow2.cancelled_at !== null) {
+  ok('immediate cancel still sets cancelled + cancelled_at');
+} else {
+  bad('immediate cancel result', JSON.stringify(cancelRow2));
+}
+
+const roleGone = (await db.query(
+  `SELECT to_regprocedure('public.get_user_role(uuid)') IS NULL AS dropped`)).rows[0].dropped;
+if (roleGone === true) {
+  ok('get_user_role dropped');
+} else {
+  bad('get_user_role', 'still present');
+}
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

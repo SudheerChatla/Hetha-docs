@@ -21,21 +21,15 @@
 --     internal.assert_order_totals / assert_daily_order_total     → 012
 --     internal.snap_order_item / snap_subscription_item           → 012
 --
--- ⚠ KNOWN ISSUES — verified still present in this export:
+-- ⚠ KNOWN ISSUES — status after migration 013:
 --
---   1. cancel_subscription (non-immediate / scheduled branch) writes
---      `scheduled_end_date` and `cancellation_requested_at`, which are NOT
---      columns on `subscriptions`. Scheduled cancellations still fail at
---      runtime. OPEN.
---   2. get_user_role selects `admin_users.role` via `auth_user_id`; neither
---      exists (the columns are `role_id` and `user_id`). The function errors if
---      called. It is unused — has_permission() / is_super_admin() are the live
---      RBAC helpers — and EXECUTE was revoked from anon/authenticated in
---      migration 011. Safe to DROP once you have confirmed nothing calls it.
---
---   (The previous third issue — update_address_as_default writing
---   `addresses.phone` / `.updated_at` — was FIXED in migration 011, together
---   with the missing ownership check. See its definition below.)
+--   1. cancel_subscription scheduled branch (wrote non-existent
+--      `scheduled_end_date` / `cancellation_requested_at`)
+--      → FIXED in migration 013: the scheduled branch now writes `end_date`,
+--        matching the rest of the system. The definition below is updated.
+--   2. get_user_role (selected non-existent columns; unused)
+--      → DROPPED in migration 013. No longer in the database; the stub below is
+--        retained only as a historical note and is NOT recreated.
 --
 -- ℹ Money-path summary (see ../ARCHITECTURE.md#money-integrity):
 --   • Clients send variant ids and quantities. Prices come from
@@ -81,7 +75,10 @@ $function$;
 
 
 -- cancel_subscription --------------------------------------------------------
--- ⚠ The ELSE branch references columns that do not exist (see known issue 1).
+-- Immediate → status='cancelled' + cancelled_at. Scheduled → 'pending_cancellation'
+-- with the cutoff in end_date (fixed in migration 013 — it previously wrote a
+-- non-existent scheduled_end_date column). SubscriptionStatusManager flips the
+-- pending row to 'cancelled' once end_date passes.
 CREATE OR REPLACE FUNCTION public.cancel_subscription(p_subscription_id uuid, p_user_id uuid, p_end_date timestamp with time zone, p_is_immediate boolean, p_cancellation_type text, p_reason text DEFAULT NULL::text)
  RETURNS void
  LANGUAGE plpgsql
@@ -99,12 +96,15 @@ BEGIN
   ELSE
     UPDATE public.subscriptions
     SET status = 'pending_cancellation',
-        scheduled_end_date = p_end_date,                 -- ⚠ column does not exist
-        cancellation_requested_at = NOW(),               -- ⚠ column does not exist
+        end_date = p_end_date,
         cancellation_type = p_cancellation_type,
         cancellation_reason = p_reason,
         is_custom_cancel_date = (p_cancellation_type = 'custom')
     WHERE id = p_subscription_id AND user_id = p_user_id;
+  END IF;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Subscription not found or does not belong to user';
   END IF;
 END;
 $function$;
@@ -636,19 +636,8 @@ AS $function$
 $function$;
 
 
--- get_user_role (⚠ BROKEN + UNUSED — see known issue 2) ----------------------
--- `admin_users` has no `role` column and no `auth_user_id` column. EXECUTE was
--- revoked from anon/authenticated in migration 011. Candidate for DROP.
-CREATE OR REPLACE FUNCTION public.get_user_role(uid uuid)
- RETURNS text
- LANGUAGE sql
- STABLE
-AS $function$
-  SELECT role
-  FROM admin_users
-  WHERE auth_user_id = uid
-  LIMIT 1;
-$function$;
+-- get_user_role — DROPPED in migration 013 (was broken + unused).
+-- Not recreated. has_permission() / is_super_admin() are the live RBAC helpers.
 
 
 -- has_permission (RBAC helper used by RLS policies) --------------------------

@@ -349,10 +349,9 @@ schema (not exposed through PostgREST) in
 | `update_address_as_default(p_user_id, p_address_id, p_address_data)` | App | Clears other defaults, updates + sets the target default. Fixed in migration 011: writes `phone_number` (accepts `phone` or `phone_number` in the payload), no longer writes a non-existent `updated_at`, and raises unless the address belongs to the caller. |
 | `upsert_pauses(p_subscription_id, p_ranges)` / `remove_paused_dates(p_subscription_id, p_dates)` | App | Atomically merge/split subscription pause ranges. |
 | `claim_adhoc_user(p_auth_uid, …)` | App (sign-in), admin (convert) | `SECURITY DEFINER`. Merges an `is_adhoc` row onto a real auth account (returning/claim/collision/insert branches); child rows follow via `ON UPDATE CASCADE`. |
-| `cancel_subscription(p_subscription_id, p_user_id, p_end_date, p_is_immediate, p_cancellation_type, p_reason)` | App | Immediate → `status='cancelled'`; scheduled → `status='pending_cancellation'`. **⚠ see known issues.** |
+| `cancel_subscription(p_subscription_id, p_user_id, p_end_date, p_is_immediate, p_cancellation_type, p_reason)` | App | Immediate → `status='cancelled'` + `cancelled_at`; scheduled → `status='pending_cancellation'` with the cutoff in `end_date` (fixed in migration 013). |
 | `has_permission(p text)` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current `auth.uid()` admin has permission `p` (via `admin_role_permissions`). |
 | `is_super_admin()` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current admin's role is `super_admin`. |
-| `get_user_role(uid)` | — (appears unused) | Returns an admin's role. **⚠ see known issues.** |
 | `rls_auto_enable()` | event trigger | Auto-runs `ENABLE ROW LEVEL SECURITY` on every new `public` table created (why all tables have RLS on). |
 
 > Historical note: an older 4-param `place_order` and a
@@ -360,21 +359,19 @@ schema (not exposed through PostgREST) in
 > **dropped** — confirmed absent from the live DB. All payment verification
 > happens in the edge function. Don't reintroduce secrets into the database.
 
-### ⚠ Known latent issues (functions vs current schema, found 2026-06-01)
+### Known latent issues — all resolved (2026-07-28)
 
-These deployed functions reference columns that **do not exist** in the current
-schema, so the affected path errors at runtime. Decide whether to fix the
-function or add the column:
+The three column-mismatch bugs found at the 2026-06-01 sync are now fixed:
 
-1. **`cancel_subscription`** (scheduled / non-immediate branch) writes
-   `scheduled_end_date` and `cancellation_requested_at` — not columns on
-   `subscriptions`. Immediate cancellation works; scheduled cancellation fails.
-2. **`update_address_as_default`** writes `addresses.phone` (the column is
-   `phone_number`) and `addresses.updated_at` (no such column). The Flutter
-   app's non-atomic fallback may be hiding this failure.
-3. **`get_user_role`** selects `admin_users.auth_user_id` (the column is
-   `user_id`); the function errors. It appears unused — `has_permission` /
-   `is_super_admin` are the live RBAC helpers and use `user_id` correctly.
+1. **`cancel_subscription`** scheduled branch wrote `scheduled_end_date` /
+   `cancellation_requested_at` (non-existent) → **fixed in migration 013**: it
+   now writes `end_date`, which is what `processScheduledCancellations` and the
+   run-sheet generator already read. Scheduled cancellation works.
+2. **`update_address_as_default`** wrote `addresses.phone` / `.updated_at` →
+   **fixed in migration 011** (correct `phone_number` column, no `updated_at`,
+   plus the missing ownership check).
+3. **`get_user_role`** referenced non-existent columns and was unused →
+   **dropped in migration 013**.
 
 ### A note on order numbers
 
