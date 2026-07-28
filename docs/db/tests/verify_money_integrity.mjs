@@ -206,7 +206,8 @@ await db.exec(`
 for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_privilege_lockdown.sql',
                  '010_grant_hardening.sql', '011_legacy_function_grants.sql',
                  '012_money_invariants.sql',
-                 '013_fix_cancel_subscription_and_drop_get_user_role.sql']) {
+                 '013_fix_cancel_subscription_and_drop_get_user_role.sql',
+                 '015_pin_search_path.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -462,10 +463,10 @@ const grants = await db.query(`
     has_function_privilege('authenticated','public.place_order(uuid,uuid,text,numeric,jsonb)','EXECUTE')           AS cust_place_order,
     has_function_privilege('anon','public.quote_cart(jsonb)','EXECUTE')                                           AS anon_quote`);
 const g = grants.rows[0];
-const mustBeFalse = ['anon_place_order','anon_wallet','cust_intent','cust_settle','cust_internal','cust_intents_table'];
+const mustBeFalse = ['anon_place_order','anon_wallet','cust_intent','cust_settle','cust_internal','cust_intents_table','anon_quote'];
 const leaks = mustBeFalse.filter((k) => g[k] !== false);
-if (leaks.length === 0 && g.cust_place_order === true && g.anon_quote === true) {
-  ok('privilege surface is tight (no anon money RPCs, no customer payment-intent access, internal sealed)');
+if (leaks.length === 0 && g.cust_place_order === true) {
+  ok('privilege surface is tight (no anon money RPCs incl. quote_cart, no customer payment-intent access, internal sealed)');
 } else {
   bad('privilege surface', `unexpected: ${JSON.stringify(g)}`);
 }
@@ -481,7 +482,7 @@ const legacyGrants = await db.query(`
     AND has_function_privilege(r.rolname, p.oid, 'EXECUTE')
   ORDER BY 1`);
 const anonAllowed = legacyGrants.rows.map((r) => r.proname).sort();
-const anonExpected = ['has_permission', 'is_super_admin', 'quote_cart'];
+const anonExpected = ['has_permission', 'is_super_admin'];  // quote_cart revoked from anon in migration 015
 if (JSON.stringify(anonAllowed) === JSON.stringify(anonExpected)) {
   ok(`anon can only execute ${anonExpected.join(', ')}`);
 } else {
