@@ -330,11 +330,11 @@ this is enforced.
 
 ## 9. Database functions (RPCs)
 
-Trusted business logic runs in Postgres, not the clients. **`public` schema
-re-exported from the live database 2026-07-28** — full source in
-[`docs/db/functions.sql`](./db/functions.sql). The privileged `internal` schema
-(not exposed through PostgREST) is documented in
-[`docs/db/migrations/`](./db/migrations/).
+Trusted business logic runs in Postgres, not the clients. **Both schemas
+re-exported from the live database 2026-07-28** — `public` in
+[`docs/db/functions.sql`](./db/functions.sql), and the privileged `internal`
+schema (not exposed through PostgREST) in
+[`docs/db/functions_internal.sql`](./db/functions_internal.sql).
 
 | RPC | Called by | What it does |
 |-----|-----------|--------------|

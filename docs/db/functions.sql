@@ -8,7 +8,8 @@
 --
 -- ℹ The `internal` schema is NOT in this file. It holds the privileged money
 --   primitives and is deliberately NOT exposed through PostgREST, so nothing in
---   it is reachable over the API. Its definitions live in the migrations:
+--   it is reachable over the API. Its full source is in
+--   docs/db/functions_internal.sql (also a live export). Contents:
 --
 --     internal.jwt_role / is_service_actor / is_admin_actor      → 007
 --     internal.apply_wallet_delta                                → 007
@@ -19,8 +20,6 @@
 --     internal.money_checks_disabled                             → 012
 --     internal.assert_order_totals / assert_daily_order_total     → 012
 --     internal.snap_order_item / snap_subscription_item           → 012
---
---   To snapshot them too, re-run query (C) with n.nspname = 'internal'.
 --
 -- ⚠ KNOWN ISSUES — verified still present in this export:
 --

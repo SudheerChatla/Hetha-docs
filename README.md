@@ -123,7 +123,7 @@ The Razorpay **secret** lives only in the Supabase Edge Function environment
 |----------|-------|
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | System-wide architecture, auth, payments, [money integrity](./docs/ARCHITECTURE.md#money-integrity), data flow |
 | [docs/DATA_MODEL.md](./docs/DATA_MODEL.md) | Shared Supabase schema, RPCs, RLS, triggers, edge functions |
-| [docs/db/](./docs/db/) | Canonical SQL snapshots (`schema`, `functions`, `policies`, `indexes`) |
+| [docs/db/](./docs/db/) | Canonical SQL snapshots (`schema`, `functions`, `functions_internal`, `policies`, `indexes`) |
 | [docs/db/migrations/](./docs/db/migrations/) | Numbered migrations — the authoritative source when a snapshot is behind |
 | [docs/db/tests/](./docs/db/tests/) | Money-path regression suite (in-process Postgres): `npm i && npm run verify` |
 | [docs/db/REFRESH.md](./docs/db/REFRESH.md) | Runbook for re-syncing the snapshots from the live database |

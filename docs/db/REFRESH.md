@@ -11,10 +11,10 @@ mirrors that should match.
 
 > **Partially hand-edited (2026-07-28, money-integrity work).** `schema.sql`,
 > `policies.sql` and `indexes.sql` carry manual notes for migrations `007`–`012`
-> rather than a fresh export. `functions.sql` WAS re-exported from the live
-> database on 2026-07-28 and is current for the `public` schema — but the
-> `internal` schema (the privileged money primitives) is not in it; those live in
-> `docs/db/migrations/`.
+> rather than a fresh export. Both function files WERE re-exported from the live
+> database on 2026-07-28 and are current: `functions.sql` (`public` schema) and
+> `functions_internal.sql` (`internal` schema — the privileged money primitives,
+> not exposed through PostgREST).
 
 ---
 
@@ -24,7 +24,7 @@ mirrors that should match.
 |----------|------|-------------|-----|
 | Tables / columns / constraints | `schema.sql` | 2026-06-01 (+ `payment_intents` by hand 2026-07-28) | Table Editor → Copy as SQL |
 | Functions / RPCs (`public`) | `functions.sql` | **2026-07-28** — current | query (C) below |
-| Functions (`internal`) | — (see `docs/db/migrations/`) | 2026-07-28 | query (C) with `nspname = 'internal'` |
+| Functions (`internal`) | `functions_internal.sql` | **2026-07-28** — current | query (C) with `nspname = 'internal'` |
 | RLS enabled per table | (in `DATA_MODEL.md` §11) | 2026-07-28 | `pg_class.relrowsecurity` |
 | RLS policy definitions | `policies.sql` | 2026-06-01 (money-path policies by hand 2026-07-28) | query (D) — `pg_policies` |
 | Triggers | (in `DATA_MODEL.md` §12) | 2026-07-28 — **7+ triggers now exist** (were 0) | query (E) |
