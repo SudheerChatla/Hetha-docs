@@ -121,6 +121,7 @@ The Razorpay **secret** lives only in the Supabase Edge Function environment
 
 | Document | Scope |
 |----------|-------|
+| [REMAINING_FIXES.md](./REMAINING_FIXES.md) | Outstanding work before production, with reasoning per item |
 | [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | System-wide architecture, auth, payments, [money integrity](./docs/ARCHITECTURE.md#money-integrity), data flow |
 | [docs/DATA_MODEL.md](./docs/DATA_MODEL.md) | Shared Supabase schema, RPCs, RLS, triggers, edge functions |
 | [docs/db/](./docs/db/) | Canonical SQL snapshots (`schema`, `functions`, `functions_internal`, `policies`, `indexes`) |
