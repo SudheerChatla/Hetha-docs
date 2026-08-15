@@ -73,6 +73,15 @@ CREATE TABLE public.audit_logs (
   created_at timestamp without time zone DEFAULT now(),
   CONSTRAINT audit_logs_pkey PRIMARY KEY (id)
 );
+CREATE TABLE public.banners (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  image_url text NOT NULL,
+  link_url text,
+  display_order integer NOT NULL DEFAULT 0,
+  is_active boolean NOT NULL DEFAULT true,
+  created_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT banners_pkey PRIMARY KEY (id)
+);
 CREATE TABLE public.cart_items (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL,

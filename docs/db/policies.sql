@@ -85,6 +85,10 @@ CREATE POLICY "admin_users_view_policy" ON public.admin_users FOR SELECT TO publ
 CREATE POLICY "audit_logs_insert_policy" ON public.audit_logs FOR INSERT TO public WITH CHECK (is_super_admin() OR has_permission('audit_logs:create'));
 CREATE POLICY "audit_logs_view_policy" ON public.audit_logs FOR SELECT TO public USING (is_super_admin() OR has_permission('audit_logs:view'));
 
+-- banners --------------------------------------------------------------------
+CREATE POLICY "banners_select_active" ON public.banners FOR SELECT USING (is_active = true);
+CREATE POLICY "banners_admin_all" ON public.banners FOR ALL USING (has_permission('banners:edit') OR is_super_admin()) WITH CHECK (has_permission('banners:edit') OR is_super_admin());
+
 -- cart_items -----------------------------------------------------------------
 CREATE POLICY "Users can delete own cart items" ON public.cart_items FOR DELETE TO public USING (auth.uid() = user_id);
 CREATE POLICY "Users can insert into own cart" ON public.cart_items FOR INSERT TO public WITH CHECK (auth.uid() = user_id);

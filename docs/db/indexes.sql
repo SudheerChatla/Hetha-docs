@@ -28,6 +28,10 @@ CREATE INDEX idx_audit_admin ON public.audit_logs USING btree (admin_user_id);
 CREATE INDEX idx_audit_created ON public.audit_logs USING btree (created_at DESC);
 CREATE INDEX idx_audit_table ON public.audit_logs USING btree (table_name, record_id);
 
+-- banners
+CREATE UNIQUE INDEX banners_pkey ON public.banners USING btree (id);
+CREATE INDEX idx_banners_active_order ON public.banners (is_active, display_order) WHERE (is_active = true);
+
 -- cart_items
 CREATE UNIQUE INDEX cart_items_pkey ON public.cart_items USING btree (id);
 CREATE INDEX idx_cart_user_id ON public.cart_items USING btree (user_id);

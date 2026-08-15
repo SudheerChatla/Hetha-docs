@@ -310,6 +310,23 @@ The Flutter app registers the token on every app start (upsert). Token is
 deleted on sign-out. The `send-notification` Edge Function looks up tokens
 here and auto-cleans stale/unregistered ones when FCM returns errors.
 
+### `banners`
+Admin-managed homepage carousel images. Stored in Supabase Storage (`banners`
+bucket), URLs persisted here.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | uuid PK | |
+| `image_url` | text NOT NULL | Public URL from Supabase Storage |
+| `link_url` | text | Optional: deep link or external URL on tap |
+| `display_order` | integer NOT NULL | Sorting order in the carousel |
+| `is_active` | boolean NOT NULL | Toggle visibility without deleting |
+| `created_at` | timestamptz | |
+
+RLS: public `SELECT` for active banners (anon + authenticated can read).
+Write gated by `has_permission('banners:edit')` or `is_super_admin()`.
+Added in migration 017.
+
 ---
 
 ## 8. Admin & RBAC
