@@ -303,6 +303,7 @@ CREATE TABLE public.products (
   in_stock boolean DEFAULT true,
   is_bestseller boolean DEFAULT false,
   is_local boolean DEFAULT false,
+  delivery_scope text NOT NULL DEFAULT 'local' CHECK (delivery_scope IN ('local', 'all_india')),
   is_default_sub boolean DEFAULT false,
   is_additional_sub boolean DEFAULT false,
   created_at timestamp without time zone DEFAULT now(),

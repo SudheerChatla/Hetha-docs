@@ -106,7 +106,9 @@ authentication identity; this is the business profile).
 | `id` | uuid PK | |
 | `category_id` | uuid FK → categories | |
 | `name`, `description`, `hsn_code` | text | `hsn_code` for tax/invoice |
-| `in_stock`, `is_bestseller`, `is_local` | boolean | merchandising flags |
+| `in_stock`, `is_bestseller` | boolean | merchandising flags |
+| `is_local` | boolean | **deprecated** — kept in sync with `delivery_scope` for backward compat |
+| `delivery_scope` | text NOT NULL | `'local'` or `'all_india'`. Determines geographic availability. `local` = only serviceable pincodes (i.e. pincodes in `delivery_areas`). `all_india` = ships anywhere. Enforced by `place_order`. |
 | `is_default_sub`, `is_additional_sub` | boolean | subscription eligibility |
 
 ### `product_variants`
@@ -339,7 +341,7 @@ schema (not exposed through PostgREST) in
 | RPC | Called by | What it does |
 |-----|-----------|--------------|
 | `quote_cart(p_cart_items)` | App (display) | `SECURITY DEFINER STABLE`. Returns `{subtotal, delivery_charge, total}` computed from `product_variants` + `delivery_charge_tiers`. The client shows this; it never supplies pricing. |
-| `place_order(p_user_id, p_address_id, p_payment_method, p_delivery_charge, p_cart_items)` | App (wallet/cod), admin (ad-hoc), edge fn (razorpay) | `SECURITY DEFINER`. Only ids + quantities are trusted: prices come from `product_variants`, the **delivery charge is recomputed server-side** (`p_delivery_charge` is honoured only for admin callers, as a fee waiver), quantities must be whole numbers 1–99, and inactive/out-of-stock variants are rejected. Requires `p_user_id = auth.uid()` unless the caller is an admin with `orders:edit`/service role. Wallet payments additionally reserve **3 × daily subscription commitment**. Customer-initiated `razorpay` orders are created as `status='payment_pending'` until a verified payment arrives. **Order number = `ORD-<YYYYMMDDHH24MISS>-<nnnn>`**, **RETURNS the order UUID** (as text). |
+| `place_order(p_user_id, p_address_id, p_payment_method, p_delivery_charge, p_cart_items)` | App (wallet/cod), admin (ad-hoc), edge fn (razorpay) | `SECURITY DEFINER`. Only ids + quantities are trusted: prices come from `product_variants`, the **delivery charge is recomputed server-side** (`p_delivery_charge` is honoured only for admin callers, as a fee waiver), quantities must be whole numbers 1–99, and inactive/out-of-stock variants are rejected. **Delivery scope enforcement (migration 016):** if the address pincode is not in a serviceable delivery area (per `internal.serviceable_area_id`) and the cart contains any `delivery_scope='local'` product, the order is rejected — admin callers bypass this. Requires `p_user_id = auth.uid()` unless the caller is an admin with `orders:edit`/service role. Wallet payments additionally reserve **3 × daily subscription commitment**. Customer-initiated `razorpay` orders are created as `status='payment_pending'` until a verified payment arrives. **Order number = `ORD-<YYYYMMDDHH24MISS>-<nnnn>`**, **RETURNS the order UUID** (as text). |
 | `create_subscription(…, p_label)` **(7-arg, current)** | App, admin | Enforces **max 5 active/pending per user**, sets `label` (defaults to `Subscription N`), derives `delivary_area`/`delivary_frequency` from the address pincode, and takes `unit_price` from `product_variants` — the `price` field in the payload is ignored. Enforces the **3-day wallet buffer** for customer callers. Does **not** cancel existing subs. |
 | `create_subscription(…)` **(6-arg, legacy)** | Admin ad-hoc only | Older overload still deployed: **cancels the user's active subscription** (`cancellation_type='replaced'`), no label. Same server-side pricing as the 7-arg version. Prefer the 7-arg version in the app. |
 | `get_user_daily_commitment(p_user_id)` | App, `place_order`, `create_subscription` | Σ daily cost across active/pending subs (drives the 3-day buffer rule, now enforced in the DB as well as the UI). |
@@ -353,6 +355,16 @@ schema (not exposed through PostgREST) in
 | `has_permission(p text)` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current `auth.uid()` admin has permission `p` (via `admin_role_permissions`). |
 | `is_super_admin()` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current admin's role is `super_admin`. |
 | `rls_auto_enable()` | event trigger | Auto-runs `ENABLE ROW LEVEL SECURITY` on every new `public` table created (why all tables have RLS on). |
+
+#### Internal helpers (not exposed via PostgREST)
+
+| Function | Notes |
+|----------|-------|
+| `internal.serviceable_area_id(p_pincode text)` | **Added migration 016.** `STABLE SECURITY DEFINER`. Returns the `area_id` (uuid) if the pincode belongs to an active delivery area, `NULL` otherwise. Used by `place_order` for delivery scope enforcement and can be reused by `create_subscription_core` for area derivation. |
+| `internal.normalize_cart(p_items jsonb)` | Parses/validates cart payloads. Returns `(variant_id, quantity, unit_price, product_name, variant_label, weight_grams, free_delivery)`. |
+| `internal.compute_delivery_charge(p_items jsonb)` | Weight-based delivery charge from `delivery_charge_tiers`. |
+| `internal.apply_wallet_delta(…)` | Atomically updates `users.wallet_balance` and inserts a `wallet_transactions` row. |
+| `internal.create_subscription_core(…)` | Shared implementation for both `create_subscription` overloads. |
 
 > Historical note: an older 4-param `place_order` and a
 > `verify_razorpay_recharge` RPC (which had the Razorpay secret hard-coded) were

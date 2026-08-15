@@ -254,6 +254,7 @@ decides money.**
 |----------|------------------|
 | Item price | `product_variants.price`, re-read inside every RPC |
 | Delivery charge | `internal.compute_delivery_charge()` from `delivery_charge_tiers` + variant weights. The client's `p_delivery_charge` is honoured **only** for admin callers (fee waivers) |
+| Delivery scope | `products.delivery_scope` (`'local'`/`'all_india'`). `place_order` rejects local-only items when the address pincode is outside serviceable areas (via `internal.serviceable_area_id`). Admin callers bypass. Added migration 016. |
 | Order total | `internal.place_order_core()`; enforced afterwards by deferred constraint triggers |
 | Amount payable online | `payment_intents.amount_paise`, set server-side |
 | Amount credited | Razorpay's `payments.fetch` response |
@@ -278,7 +279,7 @@ Enforcement layers, outermost first:
    is snapped to the catalog on insert and immutable after.
    Escape hatch for deliberate repair: `SET LOCAL hetha.skip_money_checks = 'on'`.
 
-Deployed by `docs/db/migrations/007`–`012`; regression-tested by
+Deployed by `docs/db/migrations/007`–`012`, `016`; regression-tested by
 [`docs/db/tests/verify_money_integrity.mjs`](./db/tests/verify_money_integrity.mjs),
 which applies those migrations to an in-process Postgres (PGlite) and asserts 37
 attack and happy-path cases. Run it after any change to a money path.

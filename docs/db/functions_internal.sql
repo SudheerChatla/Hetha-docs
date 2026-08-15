@@ -17,12 +17,13 @@
 --   Do NOT add `internal` to the exposed schemas, and do NOT grant EXECUTE on
 --   anything here to anon/authenticated.
 --
--- Contents (15 functions):
+-- Contents (16 functions):
 --   Caller identity        jwt_role, is_service_actor, is_admin_actor
 --   Wallet                 apply_wallet_delta            (the ONLY writer of
 --                                                          users.wallet_balance)
 --   Cart / pricing         normalize_cart, compute_delivery_charge
 --   Order / subscription   place_order_core, create_subscription_core
+--   Serviceability         serviceable_area_id
 --   Access guards          assert_subscription_access, guard_subscription_update
 --   Money invariants       money_checks_disabled, assert_order_totals,
 --                          assert_daily_order_total, snap_order_item,
@@ -33,7 +34,7 @@
 -- create_subscription_core. 009 added assert_subscription_access,
 -- guard_subscription_update. 012 added money_checks_disabled,
 -- assert_order_totals, assert_daily_order_total, snap_order_item,
--- snap_subscription_item.
+-- snap_subscription_item. 016 added serviceable_area_id.
 --
 -- ℹ `SET search_path TO 'public', 'internal'` (as pg_get_functiondef renders it)
 --   is `SET search_path = public, internal` — the qualified form the migrations
@@ -625,6 +626,23 @@ BEGIN
     RAISE EXCEPTION 'Address not found or does not belong to user';
   END IF;
 
+  -- Delivery scope enforcement (migration 016): local-only products cannot
+  -- be ordered from a non-serviceable pincode. Admin callers bypass.
+  IF internal.serviceable_area_id(v_address.pincode) IS NULL
+     AND NOT COALESCE(p_is_admin, false)
+     AND EXISTS (
+       SELECT 1
+       FROM internal.normalize_cart(p_cart_items) c
+       JOIN public.product_variants pv ON pv.id = c.variant_id
+       JOIN public.products pr ON pr.id = pv.product_id
+       WHERE pr.delivery_scope = 'local'
+     )
+  THEN
+    RAISE EXCEPTION
+      'Some items in your cart are only available for local delivery. Pincode % is not in our delivery area.',
+      v_address.pincode;
+  END IF;
+
   -- Prices always come from the catalog, never from the payload.
   SELECT COALESCE(SUM(round(c.unit_price * c.quantity, 2)), 0)
   INTO v_subtotal
@@ -836,3 +854,24 @@ BEGIN
   RETURN NEW;
 END;
 $function$;
+
+
+
+-- serviceable_area_id --------------------------------------------------------
+-- Returns the area_id for a pincode if it belongs to an active delivery area,
+-- NULL otherwise. Used by place_order for delivery scope enforcement and can
+-- replace the inline area-derivation in create_subscription_core.
+-- Added: migration 016_delivery_scope.
+CREATE OR REPLACE FUNCTION internal.serviceable_area_id(p_pincode text)
+ RETURNS uuid
+ LANGUAGE sql
+ STABLE
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $$
+  SELECT p.area_id
+  FROM public.pincodes p
+  JOIN public.delivery_areas a ON a.id = p.area_id
+  WHERE p.pincode = p_pincode AND a.is_active
+  LIMIT 1;
+$$;

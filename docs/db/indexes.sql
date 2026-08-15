@@ -104,6 +104,7 @@ CREATE UNIQUE INDEX product_variants_pkey ON public.product_variants USING btree
 
 -- products
 CREATE INDEX idx_products_category ON public.products USING btree (category_id);
+CREATE INDEX idx_products_delivery_scope ON public.products USING btree (delivery_scope);
 CREATE INDEX idx_products_in_stock ON public.products USING btree (in_stock) WHERE (in_stock = true);
 CREATE UNIQUE INDEX products_pkey ON public.products USING btree (id);
 
