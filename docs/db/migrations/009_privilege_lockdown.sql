@@ -33,19 +33,29 @@
 -- dropped first, then re-granted per column.
 REVOKE UPDATE ON public.users FROM anon, authenticated;
 
-GRANT UPDATE (
-  email,
-  phone,
-  first_name,
-  last_name,
-  area,
-  pincode,
-  notifications_enabled,
-  dark_mode,
-  language,
-  updated_at,
-  is_adhoc
-) ON public.users TO authenticated;
+-- Granted dynamically over the columns that actually exist, so this file still
+-- replays cleanly after migration 018 drops `area` / `pincode` / `dark_mode` /
+-- `language` (a literal column list would raise "column does not exist" and
+-- leave the REVOKE above unpaired, silently making nothing writable).
+DO $$
+DECLARE
+  v_cols text;
+BEGIN
+  SELECT string_agg(quote_ident(column_name), ', ' ORDER BY column_name)
+    INTO v_cols
+    FROM information_schema.columns
+   WHERE table_schema = 'public'
+     AND table_name   = 'users'
+     AND column_name IN ('email', 'phone', 'first_name', 'last_name',
+                         'area', 'pincode', 'notifications_enabled',
+                         'dark_mode', 'language', 'updated_at', 'is_adhoc');
+
+  IF v_cols IS NULL THEN
+    RAISE EXCEPTION 'public.users has none of the expected updatable columns';
+  END IF;
+
+  EXECUTE format('GRANT UPDATE (%s) ON public.users TO authenticated', v_cols);
+END $$;
 
 -- wallet_balance now changes only through internal.apply_wallet_delta(), which
 -- runs as the table owner inside SECURITY DEFINER functions and always writes a

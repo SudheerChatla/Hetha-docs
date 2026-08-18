@@ -76,12 +76,17 @@ authentication identity; this is the business profile).
 | `id` | uuid PK | matches the auth user id |
 | `email` / `phone` | text UNIQUE | |
 | `first_name`, `last_name` | text | |
-| `area`, `pincode` | text | last-known location hint |
 | `wallet_balance` | numeric | `CHECK (>= 0)` — prepaid funds |
-| `notifications_enabled`, `dark_mode` | boolean | preferences |
-| `language` | text | default `'en'` |
+| `notifications_enabled` | boolean | push preference; enforced in `notificationService.sendNotification` |
 | `is_adhoc` | boolean | true for staff-created ad-hoc customers |
 | `created_at`, `updated_at` | timestamp | |
+
+> **Dropped by migration `018`** (applied 2026-08-18): `area`, `pincode`,
+> `dark_mode`, `language`. `area`/`pincode` were unvalidated denormalised copies
+> that drifted from the customer's real addresses — a customer's serviceable
+> area comes from their address pincode via `pincodes` → `delivery_areas`.
+> `dark_mode`/`language` were write-only: no dark theme or localisation exists
+> in the app.
 
 ### `addresses`
 | Column | Type | Notes |

@@ -15,6 +15,12 @@ mirrors that should match.
 > database on 2026-07-28 and are current: `functions.sql` (`public` schema) and
 > `functions_internal.sql` (`internal` schema — the privileged money primitives,
 > not exposed through PostgREST).
+>
+> **Migration `018` applied (2026-08-18).** `users.area`, `users.pincode`,
+> `users.dark_mode` and `users.language` were dropped. `schema.sql` (+ both repo
+> mirrors) and `claim_adhoc_user` in `functions.sql` are hand-edited to match,
+> and confirmed against the live PostgREST schema. Neither Studio-created view
+> (`v_active_subscriptions`, `v_subscription_demand`) depended on them.
 
 ---
 

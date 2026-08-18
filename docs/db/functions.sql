@@ -213,12 +213,13 @@ BEGIN
     END IF;
   END IF;
 
+  -- dark_mode / language removed (migration 018).
   INSERT INTO public.users (
     id, email, phone, first_name, last_name,
-    wallet_balance, notifications_enabled, dark_mode, language, is_adhoc
+    wallet_balance, notifications_enabled, is_adhoc
   ) VALUES (
     p_auth_uid, v_email, v_phone, v_first_name, v_last_name,
-    0, TRUE, FALSE, 'en', FALSE
+    0, TRUE, FALSE
   )
   RETURNING * INTO v_user;
 

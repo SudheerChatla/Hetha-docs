@@ -438,12 +438,9 @@ CREATE TABLE public.users (
   phone text UNIQUE,
   first_name text,
   last_name text,
-  area text,
-  pincode text,
+  -- area, pincode, dark_mode and language dropped by migration 018.
   wallet_balance numeric DEFAULT 0 CHECK (wallet_balance >= 0::numeric),
   notifications_enabled boolean DEFAULT true,
-  dark_mode boolean DEFAULT false,
-  language text DEFAULT 'en'::text,
   created_at timestamp without time zone DEFAULT now(),
   updated_at timestamp without time zone DEFAULT now(),
   is_adhoc boolean DEFAULT false,
