@@ -156,8 +156,8 @@ CREATE TABLE public.notifications (
   reference_id uuid,
   status text NOT NULL DEFAULT 'pending'::text CHECK (status = ANY (ARRAY['pending'::text, 'sent'::text, 'failed'::text])),
   read_at timestamp with time zone DEFAULT NULL,
-  sent_at timestamp without time zone,
-  created_at timestamp without time zone DEFAULT now(),
+  sent_at timestamp with time zone,
+  created_at timestamp with time zone DEFAULT now(),
   CONSTRAINT notifications_pkey PRIMARY KEY (id),
   CONSTRAINT fk_notif_user FOREIGN KEY (user_id) REFERENCES public.users(id)
 );
@@ -456,7 +456,7 @@ CREATE TABLE public.wallet_transactions (
   reference_type text,
   reference_id uuid,
   initiated_by text,
-  created_at timestamp without time zone DEFAULT now(),
+  created_at timestamp with time zone DEFAULT now(),
   CONSTRAINT wallet_transactions_pkey PRIMARY KEY (id),
   CONSTRAINT fk_wallet_user FOREIGN KEY (user_id) REFERENCES public.users(id)
 );
