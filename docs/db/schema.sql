@@ -144,6 +144,32 @@ CREATE TABLE public.delivery_schedule_exceptions (
   CONSTRAINT delivery_schedule_exceptions_pkey PRIMARY KEY (id),
   CONSTRAINT fk_schedule_exceptions_area FOREIGN KEY (area_id) REFERENCES public.delivery_areas(id)
 );
+-- Added migration 020: one-off delivery day overrides (area/route/customer
+-- swap to another area's schedule for a single date). See
+-- docs/db/migrations/020_delivery_day_overrides.sql for full detail.
+CREATE TABLE public.delivery_day_overrides (
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
+  override_date date NOT NULL,
+  swapped_with_area_id uuid NOT NULL,
+  selection_type text NOT NULL CHECK (selection_type IN ('area', 'route', 'customer')),
+  source_area_id uuid,
+  source_route_id uuid,
+  reason text,
+  created_by uuid,
+  created_at timestamp without time zone DEFAULT now(),
+  CONSTRAINT delivery_day_overrides_pkey PRIMARY KEY (id),
+  CONSTRAINT fk_override_swapped_area FOREIGN KEY (swapped_with_area_id) REFERENCES public.delivery_areas(id),
+  CONSTRAINT fk_override_source_area FOREIGN KEY (source_area_id) REFERENCES public.delivery_areas(id),
+  CONSTRAINT fk_override_source_route FOREIGN KEY (source_route_id) REFERENCES public.delivery_routes(id),
+  CONSTRAINT fk_override_created_by FOREIGN KEY (created_by) REFERENCES public.admin_users(user_id)
+);
+CREATE TABLE public.delivery_day_override_subscriptions (
+  override_id uuid NOT NULL,
+  subscription_id uuid NOT NULL,
+  CONSTRAINT delivery_day_override_subscriptions_pkey PRIMARY KEY (override_id, subscription_id),
+  CONSTRAINT fk_ods_override FOREIGN KEY (override_id) REFERENCES public.delivery_day_overrides(id) ON DELETE CASCADE,
+  CONSTRAINT fk_ods_subscription FOREIGN KEY (subscription_id) REFERENCES public.subscriptions(id) ON DELETE CASCADE
+);
 CREATE TABLE public.notifications (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL,
