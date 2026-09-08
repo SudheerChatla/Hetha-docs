@@ -157,6 +157,11 @@ CREATE TABLE public.delivery_day_overrides (
   reason text,
   created_by uuid,
   created_at timestamp without time zone DEFAULT now(),
+  -- Added migration 021: 'move' kind relocates a delivery from from_date to
+  -- to_date in a single row. 'swap' (default) keeps migration 020 behavior.
+  override_kind text NOT NULL DEFAULT 'swap' CHECK (override_kind IN ('swap', 'move')),
+  from_date date,
+  to_date date,
   CONSTRAINT delivery_day_overrides_pkey PRIMARY KEY (id),
   CONSTRAINT fk_override_swapped_area FOREIGN KEY (swapped_with_area_id) REFERENCES public.delivery_areas(id),
   CONSTRAINT fk_override_source_area FOREIGN KEY (source_area_id) REFERENCES public.delivery_areas(id),
