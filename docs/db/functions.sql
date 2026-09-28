@@ -637,6 +637,70 @@ AS $function$
 $function$;
 
 
+-- modify_daily_order / revert_daily_order (migration 022) --------------------
+-- Customer per-day delivery edits. The customer app sends only {variant_id,
+-- quantity} pairs; the RPC prices from the catalog, verifies ownership, enforces
+-- the 3-day buffer, and writes subscription_daily_orders / _items as owner
+-- (those tables are admin-only under RLS since migration 009, which is why a
+-- direct client write failed with 42501). Delegates to
+-- internal.modify_daily_order_core. revert_daily_order drops the customer's
+-- pending edit so the run-sheet generator regenerates the default.
+CREATE OR REPLACE FUNCTION public.modify_daily_order(p_user_id uuid, p_subscription_id uuid, p_delivery_date date, p_items jsonb)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_is_admin boolean := internal.is_admin_actor('subscriptions:edit');
+BEGIN
+  IF NOT v_is_admin THEN
+    IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+      RAISE EXCEPTION 'Not authorized to modify orders for this user';
+    END IF;
+  END IF;
+
+  RETURN internal.modify_daily_order_core(
+    p_user_id, p_subscription_id, p_delivery_date, p_items, v_is_admin
+  );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.revert_daily_order(p_user_id uuid, p_delivery_date date)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_is_admin boolean := internal.is_admin_actor('subscriptions:edit');
+BEGIN
+  IF NOT v_is_admin THEN
+    IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+      RAISE EXCEPTION 'Not authorized to modify orders for this user';
+    END IF;
+  END IF;
+
+  DELETE FROM public.subscription_daily_order_items
+  WHERE daily_order_id IN (
+    SELECT id FROM public.subscription_daily_orders
+    WHERE user_id = p_user_id
+      AND delivery_date = p_delivery_date
+      AND status = 'pending'
+      AND is_finalized = false
+      AND payment_status <> 'paid'
+  );
+
+  DELETE FROM public.subscription_daily_orders
+  WHERE user_id = p_user_id
+    AND delivery_date = p_delivery_date
+    AND status = 'pending'
+    AND is_finalized = false
+    AND payment_status <> 'paid';
+END;
+$function$;
+
+
 -- get_user_role — DROPPED in migration 013 (was broken + unused).
 -- Not recreated. has_permission() / is_super_admin() are the live RBAC helpers.
 

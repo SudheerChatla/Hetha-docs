@@ -486,6 +486,122 @@ AS $function$
 $function$;
 
 
+-- modify_daily_order_core (migration 022) ------------------------------------
+-- Shared body behind public.modify_daily_order. Replace-in-place: verify
+-- ownership, refuse past/finalized/paid days, price every line from the catalog
+-- (client price ignored), enforce the 3-day wallet buffer when the edit raises
+-- the day's cost, then delete any existing pending order for (user, date) and
+-- insert a fresh one flagged is_customer_modified = true so the run-sheet
+-- generator preserves it. Returns the new daily_order id.
+CREATE OR REPLACE FUNCTION internal.modify_daily_order_core(p_user_id uuid, p_subscription_id uuid, p_delivery_date date, p_items jsonb, p_is_admin boolean DEFAULT false)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_owner            uuid;
+  v_order_id         uuid;
+  v_new_daily        numeric := 0;
+  v_existing_daily   numeric := 0;
+  v_committed        numeric := 0;
+  v_wallet_balance   numeric := 0;
+  v_required         numeric := 0;
+  v_existing_status  text;
+  v_existing_final   boolean;
+  v_existing_pay     text;
+BEGIN
+  PERFORM internal.assert_subscription_access(p_subscription_id);
+
+  SELECT user_id INTO v_owner FROM public.subscriptions WHERE id = p_subscription_id;
+  IF v_owner IS DISTINCT FROM p_user_id THEN
+    RAISE EXCEPTION 'Subscription does not belong to this user';
+  END IF;
+
+  IF p_delivery_date < CURRENT_DATE THEN
+    RAISE EXCEPTION 'Cannot modify a delivery date in the past';
+  END IF;
+
+  SELECT status, is_finalized, payment_status
+  INTO v_existing_status, v_existing_final, v_existing_pay
+  FROM public.subscription_daily_orders
+  WHERE user_id = p_user_id AND delivery_date = p_delivery_date
+  ORDER BY created_at DESC
+  LIMIT 1;
+
+  IF FOUND THEN
+    IF v_existing_final THEN
+      RAISE EXCEPTION 'This day''s order is finalized and can no longer be modified';
+    END IF;
+    IF v_existing_status <> 'pending' THEN
+      RAISE EXCEPTION 'This day''s order is % and can no longer be modified', v_existing_status;
+    END IF;
+    IF v_existing_pay = 'paid' THEN
+      RAISE EXCEPTION 'This day''s order is already paid and can no longer be modified';
+    END IF;
+  END IF;
+
+  SELECT COALESCE(SUM(round(c.unit_price * c.quantity, 2)), 0)
+  INTO v_new_daily
+  FROM internal.normalize_cart(p_items) c;
+
+  IF v_new_daily <= 0 THEN
+    RAISE EXCEPTION 'Modified daily value must be greater than zero';
+  END IF;
+
+  IF NOT p_is_admin THEN
+    v_committed := COALESCE(public.get_user_daily_commitment(p_user_id), 0);
+
+    IF v_new_daily > v_committed THEN
+      SELECT COALESCE(wallet_balance, 0) INTO v_wallet_balance
+      FROM public.users WHERE id = p_user_id;
+
+      IF NOT FOUND THEN
+        RAISE EXCEPTION 'User not found';
+      END IF;
+
+      v_existing_daily := v_committed;
+      v_required := round((v_existing_daily + (v_new_daily - v_committed)) * 3, 2);
+
+      IF v_wallet_balance < v_required THEN
+        RAISE EXCEPTION
+          'Insufficient wallet balance (%). You need at least % (3-day buffer for a %/day delivery).',
+          v_wallet_balance, v_required, round(v_new_daily, 2);
+      END IF;
+    END IF;
+  END IF;
+
+  DELETE FROM public.subscription_daily_order_items
+  WHERE daily_order_id IN (
+    SELECT id FROM public.subscription_daily_orders
+    WHERE user_id = p_user_id AND delivery_date = p_delivery_date
+  );
+
+  DELETE FROM public.subscription_daily_orders
+  WHERE user_id = p_user_id AND delivery_date = p_delivery_date;
+
+  INSERT INTO public.subscription_daily_orders (
+    delivery_date, subscription_id, user_id, status, total_value,
+    payment_status, is_finalized, is_customer_modified, created_at
+  ) VALUES (
+    p_delivery_date, p_subscription_id, p_user_id, 'pending', v_new_daily,
+    'pending', false, true, now()
+  ) RETURNING id INTO v_order_id;
+
+  INSERT INTO public.subscription_daily_order_items (
+    daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot,
+    unit_price, quantity, total_price, is_adhoc_addition
+  )
+  SELECT
+    v_order_id, c.variant_id, c.product_name, c.variant_label,
+    c.unit_price, c.quantity, round(c.unit_price * c.quantity, 2), false
+  FROM internal.normalize_cart(p_items) c;
+
+  RETURN v_order_id;
+END;
+$function$;
+
+
 -- money_checks_disabled ------------------------------------------------------
 -- Escape hatch for deliberate data repair: SET LOCAL hetha.skip_money_checks =
 -- 'on'. A session GUC, so it cannot be set through PostgREST by a client.

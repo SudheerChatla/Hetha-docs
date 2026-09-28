@@ -207,7 +207,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '010_grant_hardening.sql', '011_legacy_function_grants.sql',
                  '012_money_invariants.sql',
                  '013_fix_cancel_subscription_and_drop_get_user_role.sql',
-                 '015_pin_search_path.sql']) {
+                 '015_pin_search_path.sql',
+                 '022_customer_daily_order_rpcs.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -653,6 +654,122 @@ if (roleGone === true) {
   ok('get_user_role dropped');
 } else {
   bad('get_user_role', 'still present');
+}
+
+// ---------------------------------------------------------------------------
+// 6u. Customer daily-order modification RPCs (migration 022).
+//     Reproduces the RLS 42501 the app hit, then proves the RPC path is the
+//     controlled way in: owner-only, server-priced, run-sheet-safe.
+// ---------------------------------------------------------------------------
+await db.exec(`UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}'`);
+
+// Enable RLS on the daily-order tables so the direct-write test is meaningful
+// (the schema dump does not carry ALTER TABLE ... ENABLE RLS, and policies.sql
+// is not loaded by this harness). Mirror the admin-only policy from
+// docs/db/policies.sql so a customer INSERT is refused exactly as in prod.
+await db.exec(`
+  ALTER TABLE public.subscription_daily_orders ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE public.subscription_daily_orders FORCE ROW LEVEL SECURITY;
+  CREATE POLICY sdo_admin_insert ON public.subscription_daily_orders
+    FOR INSERT TO public WITH CHECK (is_super_admin() OR has_permission('daily_ops:edit') OR has_permission('subscriptions:edit'));
+  CREATE POLICY sdo_owner_select ON public.subscription_daily_orders
+    FOR SELECT TO public USING (user_id = auth.uid() OR is_super_admin() OR has_permission('daily_ops:view'));
+`);
+
+// A subscription to modify (100/day from the catalog).
+const modSub = (await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.create_subscription($1, now(), NULL, 'active', $2::jsonb, $3::jsonb, 'DailyEdit') AS id`,
+  [CUSTOMER, JSON.stringify({ pincode: '600001', name: 'Cust', phoneNumber: '9000000001' }),
+   JSON.stringify([{ variantId: VAR, name: 'x', variant: 'y', price: 0.01, quantity: 1, startDate: '2026-07-28' }])])).rows[0].id;
+
+const MOD_DATE = '2099-01-01';  // safely in the future
+
+// (a) The bug's root cause: the only INSERT policy on subscription_daily_orders
+//     is admin-only (no `user_id = auth.uid()` branch), so a customer's direct
+//     client INSERT is refused with 42501 in production. We assert the policy
+//     SHAPE here rather than a live RLS block — PGlite runs as the table owner,
+//     for whom RLS is bypassed, so the other tests (like the whole suite) model
+//     authorization at the RPC layer instead. This mirrors docs/db/policies.sql.
+const sdoInsertPol = (await db.query(`
+  SELECT with_check FROM pg_policies
+  WHERE schemaname = 'public' AND tablename = 'subscription_daily_orders' AND cmd = 'INSERT'`)).rows;
+const hasAdminOnlyInsert = sdoInsertPol.length > 0
+  && sdoInsertPol.every((p) => /has_permission|is_super_admin/.test(p.with_check)
+                            && !/auth\.uid\(\)/.test(p.with_check));
+if (hasAdminOnlyInsert) {
+  ok('subscription_daily_orders INSERT is admin-only (no customer branch) — the 42501 the app hit');
+} else {
+  bad('subscription_daily_orders INSERT policy shape', JSON.stringify(sdoInsertPol));
+}
+
+// (b) The fix: modify_daily_order succeeds for the owner and prices from the
+//     catalog. The client only sends variant_id + quantity — no price field.
+const modId = (await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb) AS id`,
+  [CUSTOMER, modSub, MOD_DATE, JSON.stringify([{ variant_id: VAR, quantity: 3 }])])).rows[0].id;
+const modOrder = (await db.query(
+  `SELECT o.total_value, o.is_customer_modified, o.status,
+          (SELECT SUM(i.total_price) FROM public.subscription_daily_order_items i WHERE i.daily_order_id = o.id) AS items_sum,
+          (SELECT i.unit_price FROM public.subscription_daily_order_items i WHERE i.daily_order_id = o.id LIMIT 1) AS unit_price
+   FROM public.subscription_daily_orders o WHERE o.id = $1`, [modId])).rows[0];
+if (Number(modOrder.unit_price) === 100 && Number(modOrder.total_value) === 300
+    && Number(modOrder.items_sum) === 300 && modOrder.is_customer_modified === true
+    && modOrder.status === 'pending') {
+  ok(`modify_daily_order priced 3×₹100 server-side = ₹300, flagged is_customer_modified (${JSON.stringify(modOrder)})`);
+} else {
+  bad('modify_daily_order result', JSON.stringify(modOrder));
+}
+
+// (c) Re-modifying the same day replaces (not duplicates) the order.
+await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
+  [CUSTOMER, modSub, MOD_DATE, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]);
+const dayCount = (await db.query(
+  `SELECT COUNT(*)::int AS c, SUM(total_value)::numeric AS v FROM public.subscription_daily_orders
+   WHERE user_id = $1 AND delivery_date = $2`, [CUSTOMER, MOD_DATE])).rows[0];
+if (dayCount.c === 1 && Number(dayCount.v) === 100) {
+  ok('re-modifying a day replaces in place (1 order, ₹100)');
+} else {
+  bad('modify replace', JSON.stringify(dayCount));
+}
+
+// (d) A different user cannot modify this subscription's day.
+await expectError('cross-user modify_daily_order rejected', () => asQuery({ sub: OTHER, role: 'authenticated' },
+  `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
+  [CUSTOMER, modSub, MOD_DATE, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]),
+  'not authorized|does not belong|Not authorized for this subscription');
+
+// (e) Past dates are refused.
+await expectError('modify_daily_order for a past date rejected', () => asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.modify_daily_order($1, $2, '2000-01-01'::date, $3::jsonb)`,
+  [CUSTOMER, modSub, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]), 'past');
+
+// (f) revert_daily_order clears the pending edit (owner only).
+await expectError('cross-user revert_daily_order rejected', () => asQuery({ sub: OTHER, role: 'authenticated' },
+  `SELECT public.revert_daily_order($1, $2::date)`, [CUSTOMER, MOD_DATE]), 'not authorized');
+await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.revert_daily_order($1, $2::date)`, [CUSTOMER, MOD_DATE]);
+const afterRevert = (await db.query(
+  `SELECT COUNT(*)::int AS c FROM public.subscription_daily_orders WHERE user_id = $1 AND delivery_date = $2`,
+  [CUSTOMER, MOD_DATE])).rows[0].c;
+if (afterRevert === 0) {
+  ok('revert_daily_order removed the pending customer edit');
+} else {
+  bad('revert_daily_order', `${afterRevert} orders remain`);
+}
+
+// (g) Privilege surface for the new RPCs.
+const modGrants = (await db.query(`
+  SELECT
+    has_function_privilege('anon','public.modify_daily_order(uuid,uuid,date,jsonb)','EXECUTE')          AS anon_modify,
+    has_function_privilege('anon','public.revert_daily_order(uuid,date)','EXECUTE')                     AS anon_revert,
+    has_function_privilege('authenticated','public.modify_daily_order(uuid,uuid,date,jsonb)','EXECUTE') AS auth_modify,
+    has_function_privilege('authenticated','public.revert_daily_order(uuid,date)','EXECUTE')            AS auth_revert`)).rows[0];
+if (modGrants.anon_modify === false && modGrants.anon_revert === false
+    && modGrants.auth_modify === true && modGrants.auth_revert === true) {
+  ok('daily-order RPCs: anon blocked, authenticated allowed');
+} else {
+  bad('daily-order RPC grants', JSON.stringify(modGrants));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

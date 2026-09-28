@@ -401,6 +401,7 @@ CREATE TABLE public.subscription_daily_orders (
   finalized_by uuid,
   tracking_info text,
   custom_route text,
+  is_customer_modified boolean NOT NULL DEFAULT false, -- migration 022: customer hand-edited this day; run-sheet generator preserves it
   CONSTRAINT subscription_daily_orders_pkey PRIMARY KEY (id),
   CONSTRAINT fk_sdo_subscription FOREIGN KEY (subscription_id) REFERENCES public.subscriptions(id),
   CONSTRAINT fk_sdo_user FOREIGN KEY (user_id) REFERENCES public.users(id)
