@@ -703,6 +703,53 @@ BEGIN
 END;
 $function$;
 
+-- revert_daily_order (3-arg, migration 026) ---------------------------------
+-- "Reset to Default" for ONE subscription's day. The 2-arg version below is
+-- kept for old app builds; it resets every subscription the user has on the
+-- date.
+CREATE OR REPLACE FUNCTION public.revert_daily_order(p_user_id uuid, p_delivery_date date, p_subscription_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_is_admin boolean := internal.is_admin_actor('subscriptions:edit');
+  v_owner    uuid;
+BEGIN
+  IF NOT v_is_admin THEN
+    IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+      RAISE EXCEPTION 'Not authorized to modify orders for this user';
+    END IF;
+  END IF;
+
+  SELECT user_id INTO v_owner FROM public.subscriptions WHERE id = p_subscription_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Subscription not found';
+  END IF;
+  IF v_owner IS DISTINCT FROM p_user_id THEN
+    RAISE EXCEPTION 'Subscription does not belong to this user';
+  END IF;
+
+  DELETE FROM public.subscription_daily_order_items
+  WHERE daily_order_id IN (
+    SELECT id FROM public.subscription_daily_orders
+    WHERE subscription_id = p_subscription_id
+      AND delivery_date = p_delivery_date
+      AND status = 'pending'
+      AND is_finalized = false
+      AND payment_status <> 'paid'
+  );
+
+  DELETE FROM public.subscription_daily_orders
+  WHERE subscription_id = p_subscription_id
+    AND delivery_date = p_delivery_date
+    AND status = 'pending'
+    AND is_finalized = false
+    AND payment_status <> 'paid';
+END;
+$function$;
+
 CREATE OR REPLACE FUNCTION public.revert_daily_order(p_user_id uuid, p_delivery_date date)
  RETURNS void
  LANGUAGE plpgsql

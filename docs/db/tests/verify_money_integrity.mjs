@@ -213,7 +213,9 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '015_pin_search_path.sql',
                  '022_customer_daily_order_rpcs.sql',
                  '023_register_device_token_rpc.sql',
-                 '024_free_delivery_serviceable_pincodes.sql']) {
+                 '024_free_delivery_serviceable_pincodes.sql',
+                 '025_day_edit_wallet_rule_and_subscription_scope.sql',
+                 '026_revert_daily_order_per_subscription.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -962,6 +964,94 @@ if (quoteSigs.length === 1 && quoteSigs[0] === 'quote_cart(jsonb,uuid)') {
   ok('quote_cart(jsonb) replaced by quote_cart(jsonb,uuid) — no ambiguous overloads');
 } else {
   bad('quote_cart signatures', JSON.stringify(quoteSigs));
+}
+
+// ---------------------------------------------------------------------------
+// 6x. Day-edit wallet rule + per-subscription scope (migration 025).
+//     required = 3 × normal commitment (all subs) + this day's one-off extra,
+//     checked only when the edit raises THIS subscription's cost; and saving
+//     one subscription's day never deletes another subscription's order.
+// ---------------------------------------------------------------------------
+const EDIT_DATE = '2099-02-01';
+const commitment = Number((await db.query(
+  `SELECT public.get_user_daily_commitment($1) AS c`, [CUSTOMER])).rows[0].c);
+// modSub (6u) is 1 × VAR = ₹100/day; editing to 5 × VAR = ₹500 → extra ₹400.
+const EDIT_ITEMS = JSON.stringify([{ variant_id: VAR, quantity: 5 }]);
+const editRequired = Math.round((commitment * 3 + 400) * 100) / 100;
+
+await db.exec(`UPDATE public.users SET wallet_balance = ${editRequired - 1} WHERE id = '${CUSTOMER}'`);
+await expectError('day edit refused when wallet < 3-day commitment + one-off extra',
+  () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
+    [CUSTOMER, modSub, EDIT_DATE, EDIT_ITEMS]), 'Insufficient wallet balance');
+
+await db.exec(`UPDATE public.users SET wallet_balance = ${editRequired} WHERE id = '${CUSTOMER}'`);
+await expectOk(`day edit allowed at exactly 3 × commitment (${commitment}) + extra 400 = ${editRequired} (022 would have needed ${Math.round((commitment + 400) * 3)})`,
+  () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
+    [CUSTOMER, modSub, EDIT_DATE, EDIT_ITEMS]));
+
+// Trimming a day back to (or below) normal needs no wallet at all.
+await db.exec(`UPDATE public.users SET wallet_balance = 0 WHERE id = '${CUSTOMER}'`);
+await expectOk('day edit that does not raise the cost is allowed with an empty wallet',
+  () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
+    [CUSTOMER, modSub, EDIT_DATE, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]));
+
+// Another subscription's order on the same date must survive the edit.
+const otherSubId = sub.rows[0].id;
+await db.exec(`
+  BEGIN;
+  WITH o AS (
+    INSERT INTO public.subscription_daily_orders (delivery_date, subscription_id, user_id, status, total_value)
+    VALUES ('${EDIT_DATE}', '${otherSubId}', '${CUSTOMER}', 'pending', 100)
+    RETURNING id
+  )
+  INSERT INTO public.subscription_daily_order_items
+    (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+  SELECT id, '${VAR}', 'Cow Milk', '1 L', 100, 1, 100 FROM o;
+  COMMIT;
+`);
+await asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
+  [CUSTOMER, modSub, EDIT_DATE, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]);
+const perSub = (await db.query(`
+  SELECT subscription_id::text AS s, COUNT(*)::int AS c FROM public.subscription_daily_orders
+  WHERE user_id = $1 AND delivery_date = $2 GROUP BY subscription_id`, [CUSTOMER, EDIT_DATE])).rows;
+const otherKept = perSub.some((r) => r.s === otherSubId && r.c === 1);
+const editedOne = perSub.some((r) => r.s === modSub && r.c === 1);
+if (otherKept && editedOne) {
+  ok('editing one subscription\'s day keeps the other subscription\'s order for that date');
+} else {
+  bad('per-subscription day scope', JSON.stringify(perSub));
+}
+await db.exec(`UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}'`);
+
+// ---------------------------------------------------------------------------
+// 6y. "Reset to Default" per subscription (migration 026).
+//     State from 6x: on EDIT_DATE, modSub has a customer edit and otherSubId
+//     has its own pending order.
+// ---------------------------------------------------------------------------
+await expectError('3-arg revert_daily_order refuses another user\'s subscription',
+  () => asQuery({ sub: OTHER, role: 'authenticated' },
+    `SELECT public.revert_daily_order($1, $2::date, $3::uuid)`, [OTHER, EDIT_DATE, modSub]),
+  'does not belong');
+
+await asQuery(CUST_CLAIMS, `SELECT public.revert_daily_order($1, $2::date, $3::uuid)`,
+  [CUSTOMER, EDIT_DATE, modSub]);
+const afterScopedRevert = (await db.query(`
+  SELECT subscription_id::text AS s FROM public.subscription_daily_orders
+  WHERE user_id = $1 AND delivery_date = $2`, [CUSTOMER, EDIT_DATE])).rows.map((r) => r.s);
+if (afterScopedRevert.length === 1 && afterScopedRevert[0] === otherSubId) {
+  ok('3-arg revert_daily_order resets only that subscription\'s day; the other subscription\'s order stays');
+} else {
+  bad('scoped revert', JSON.stringify(afterScopedRevert));
+}
+
+const revertGrants = (await db.query(`
+  SELECT
+    has_function_privilege('anon','public.revert_daily_order(uuid,date,uuid)','EXECUTE')          AS anon_ok,
+    has_function_privilege('authenticated','public.revert_daily_order(uuid,date,uuid)','EXECUTE') AS auth_ok`)).rows[0];
+if (revertGrants.anon_ok === false && revertGrants.auth_ok === true) {
+  ok('3-arg revert_daily_order: anon blocked, authenticated allowed');
+} else {
+  bad('3-arg revert grants', JSON.stringify(revertGrants));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

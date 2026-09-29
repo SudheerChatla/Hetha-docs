@@ -506,13 +506,15 @@ AS $function$
 $function$;
 
 
--- modify_daily_order_core (migration 022) ------------------------------------
+-- modify_daily_order_core (migration 022, rewritten in 025) -----------------
 -- Shared body behind public.modify_daily_order. Replace-in-place: verify
 -- ownership, refuse past/finalized/paid days, price every line from the catalog
--- (client price ignored), enforce the 3-day wallet buffer when the edit raises
--- the day's cost, then delete any existing pending order for (user, date) and
--- insert a fresh one flagged is_customer_modified = true so the run-sheet
--- generator preserves it. Returns the new daily_order id.
+-- (client price ignored), then replace THIS subscription's pending order for
+-- the date with a fresh one flagged is_customer_modified = true so the
+-- run-sheet generator preserves it. Returns the new daily_order id.
+-- 025: wallet rule is 3 × normal commitment + this day's one-off extra (only
+-- when the edit raises this subscription's cost); lookups/deletes are scoped
+-- to (subscription_id, delivery_date), not (user_id, delivery_date).
 CREATE OR REPLACE FUNCTION internal.modify_daily_order_core(p_user_id uuid, p_subscription_id uuid, p_delivery_date date, p_items jsonb, p_is_admin boolean DEFAULT false)
  RETURNS uuid
  LANGUAGE plpgsql
@@ -523,7 +525,8 @@ DECLARE
   v_owner            uuid;
   v_order_id         uuid;
   v_new_daily        numeric := 0;
-  v_existing_daily   numeric := 0;
+  v_sub_base         numeric := 0;
+  v_extra            numeric := 0;
   v_committed        numeric := 0;
   v_wallet_balance   numeric := 0;
   v_required         numeric := 0;
@@ -545,7 +548,7 @@ BEGIN
   SELECT status, is_finalized, payment_status
   INTO v_existing_status, v_existing_final, v_existing_pay
   FROM public.subscription_daily_orders
-  WHERE user_id = p_user_id AND delivery_date = p_delivery_date
+  WHERE subscription_id = p_subscription_id AND delivery_date = p_delivery_date
   ORDER BY created_at DESC
   LIMIT 1;
 
@@ -570,9 +573,15 @@ BEGIN
   END IF;
 
   IF NOT p_is_admin THEN
-    v_committed := COALESCE(public.get_user_daily_commitment(p_user_id), 0);
+    SELECT COALESCE(SUM(si.unit_price * si.quantity), 0)
+    INTO v_sub_base
+    FROM public.subscription_items si
+    WHERE si.subscription_id = p_subscription_id
+      AND si.is_active = true;
 
-    IF v_new_daily > v_committed THEN
+    v_extra := round(v_new_daily - v_sub_base, 2);
+
+    IF v_extra > 0 THEN
       SELECT COALESCE(wallet_balance, 0) INTO v_wallet_balance
       FROM public.users WHERE id = p_user_id;
 
@@ -580,13 +589,13 @@ BEGIN
         RAISE EXCEPTION 'User not found';
       END IF;
 
-      v_existing_daily := v_committed;
-      v_required := round((v_existing_daily + (v_new_daily - v_committed)) * 3, 2);
+      v_committed := COALESCE(public.get_user_daily_commitment(p_user_id), 0);
+      v_required  := round(v_committed * 3 + v_extra, 2);
 
       IF v_wallet_balance < v_required THEN
         RAISE EXCEPTION
-          'Insufficient wallet balance (%). You need at least % (3-day buffer for a %/day delivery).',
-          v_wallet_balance, v_required, round(v_new_daily, 2);
+          'Insufficient wallet balance (%). You need at least % (3 days of your subscriptions, %/day, plus % extra for this day).',
+          v_wallet_balance, v_required, round(v_committed, 2), v_extra;
       END IF;
     END IF;
   END IF;
@@ -594,11 +603,11 @@ BEGIN
   DELETE FROM public.subscription_daily_order_items
   WHERE daily_order_id IN (
     SELECT id FROM public.subscription_daily_orders
-    WHERE user_id = p_user_id AND delivery_date = p_delivery_date
+    WHERE subscription_id = p_subscription_id AND delivery_date = p_delivery_date
   );
 
   DELETE FROM public.subscription_daily_orders
-  WHERE user_id = p_user_id AND delivery_date = p_delivery_date;
+  WHERE subscription_id = p_subscription_id AND delivery_date = p_delivery_date;
 
   INSERT INTO public.subscription_daily_orders (
     delivery_date, subscription_id, user_id, status, total_value,
