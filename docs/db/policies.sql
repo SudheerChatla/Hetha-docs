@@ -129,6 +129,15 @@ CREATE POLICY "delivery_schedule_exceptions_insert_policy" ON public.delivery_sc
 CREATE POLICY "delivery_schedule_exceptions_update_policy" ON public.delivery_schedule_exceptions FOR UPDATE TO public USING (is_super_admin() OR has_permission('subscriptions:edit')) WITH CHECK (is_super_admin() OR has_permission('subscriptions:edit'));
 CREATE POLICY "delivery_schedule_exceptions_view_policy" ON public.delivery_schedule_exceptions FOR SELECT TO public USING (is_super_admin() OR has_permission('subscriptions:view') OR has_permission('subscriptions:edit'));
 
+-- device_tokens ----------------------------------------------------------------
+-- Defined ad hoc in Hetha_app/supabase_migrations/create_device_tokens.sql,
+-- not through docs/db/migrations/ — recorded here so this snapshot matches the
+-- live database. A user may only see/insert/update/delete their OWN rows.
+-- This is exactly why a plain client upsert cannot release a stale token left
+-- by a previous account on a shared device (see migration 023 /
+-- register_device_token, and DATA_MODEL.md's device_tokens section).
+CREATE POLICY "Users can manage own device tokens" ON public.device_tokens FOR ALL TO public USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+
 -- notifications --------------------------------------------------------------
 CREATE POLICY "Users can read own notifications" ON public.notifications FOR SELECT TO public USING (auth.uid() = user_id);
 CREATE POLICY "Users can update own notifications" ON public.notifications FOR UPDATE TO public USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);

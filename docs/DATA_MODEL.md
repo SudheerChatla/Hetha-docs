@@ -307,13 +307,40 @@ this table alongside sending the FCM push.
 
 ### `device_tokens`
 
-`user_id` FK, `fcm_token` (text, the Firebase Cloud Messaging device token),
-`platform` (`android`/`ios`), `created_at`, `updated_at`.
-UNIQUE on `(user_id, fcm_token)` — one user can have multiple devices.
+`user_id` FK (→ `auth.users`, not `public.users`), `fcm_token` (text, the
+Firebase Cloud Messaging device token), `platform` (`android`/`ios`),
+`created_at`, `updated_at`. UNIQUE on `(user_id, fcm_token)` — one user can
+have multiple devices.
 
-The Flutter app registers the token on every app start (upsert). Token is
-deleted on sign-out. The `send-notification` Edge Function looks up tokens
-here and auto-cleans stale/unregistered ones when FCM returns errors.
+RLS: `FOR ALL USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id)`
+(defined in `Hetha_app/supabase_migrations/create_device_tokens.sql`, not
+mirrored into `docs/db/policies.sql` until this note). A signed-in user can
+only see/touch their **own** rows — they have no way to read or delete a
+different user's row for the same token, even one sitting on the same physical
+device.
+
+**Cross-account push leak (fixed by migration 023).** The uniqueness is on
+`(user_id, fcm_token)`, not `fcm_token` alone, and FCM delivers by token, not
+by "whoever is currently logged in." On a shared/reused device, logging out of
+account A and into account B used to leave A's `device_tokens` row intact
+(the app's logout button called `auth.signOut()` directly without releasing
+the token, and `NotificationService.initialize()` — the only thing that
+registered a token — ran once at process start, not on every sign-in). Result:
+B could receive pushes addressed to A on the same phone.
+
+Fix: `public.register_device_token(p_token, p_platform)` (`SECURITY DEFINER`)
+first deletes any row for that exact `fcm_token` belonging to a **different**
+user, then upserts the caller's own row — something a plain client upsert
+cannot do under the RLS policy above. The customer app calls this (instead of
+a raw upsert) on every app start, token refresh, **and now also right after a
+successful sign-in** (`sign_in_page.dart`), and calls `unregisterToken()`
+(still a plain client delete of the caller's own row — RLS allows that) before
+`auth.signOut()` on logout (`profile_page.dart`). The RPC path means the leak
+self-heals the next time *anyone* signs in on a device, even if the previous
+session ended by a crash or app kill rather than a clean logout.
+
+The `send-notification` Edge Function looks up tokens here and auto-cleans
+stale/unregistered ones when FCM returns errors.
 
 ### `banners`
 Admin-managed homepage carousel images. Stored in Supabase Storage (`banners`
@@ -376,6 +403,7 @@ schema (not exposed through PostgREST) in
 | `cancel_subscription(p_subscription_id, p_user_id, p_end_date, p_is_immediate, p_cancellation_type, p_reason)` | App | Immediate → `status='cancelled'` + `cancelled_at`; scheduled → `status='pending_cancellation'` with the cutoff in `end_date` (fixed in migration 013). |
 | `modify_daily_order(p_user_id, p_subscription_id, p_delivery_date, p_items)` | App, admin | `SECURITY DEFINER` (migration 022). Customer per-day delivery edit. Client sends only `{variant_id, quantity}` pairs; `unit_price` comes from `product_variants` (client price ignored). Verifies ownership, refuses past/finalized/`paid`/non-`pending` days, enforces the **3-day wallet buffer** when the edit raises the day's cost, then replaces the day's `subscription_daily_orders` row (flagged `is_customer_modified=true`) and its items atomically. Replaces the old direct client write that failed RLS with `42501`. |
 | `revert_daily_order(p_user_id, p_delivery_date)` | App, admin | `SECURITY DEFINER` (migration 022). "Reset to Default": drops the customer's **pending, unfinalized, unpaid** daily-order edit for a date so the run-sheet generator regenerates it from the subscription template. No-op if there is nothing to revert. |
+| `register_device_token(p_token, p_platform)` | App | `SECURITY DEFINER` (migration 023). Deletes any `device_tokens` row for this exact `fcm_token` belonging to a **different** user, then upserts the caller's own row. Fixes a cross-account push leak: `device_tokens` RLS only lets a user touch their own rows, so a stale row left by a previous account on a shared device could never be cleaned up by a plain client upsert. Called on app start, token refresh, and right after sign-in. |
 | `has_permission(p text)` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current `auth.uid()` admin has permission `p` (via `admin_role_permissions`). |
 | `is_super_admin()` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current admin's role is `super_admin`. |
 | `rls_auto_enable()` | event trigger | Auto-runs `ENABLE ROW LEVEL SECURITY` on every new `public` table created (why all tables have RLS on). |

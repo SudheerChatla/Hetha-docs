@@ -666,6 +666,42 @@ BEGIN
 END;
 $function$;
 
+-- register_device_token (migration 023) --------------------------------------
+-- Fixes a cross-account push leak on shared devices. device_tokens' RLS only
+-- lets a user see/touch their own rows, so a plain client upsert can never
+-- release a token a previous account left behind on this device. This RPC
+-- deletes any OTHER user's row for the exact same fcm_token before claiming it
+-- for the caller. Called by the app on start, token refresh, and post-sign-in.
+CREATE OR REPLACE FUNCTION public.register_device_token(p_token text, p_platform text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated';
+  END IF;
+
+  IF p_token IS NULL OR length(trim(p_token)) = 0 THEN
+    RAISE EXCEPTION 'Device token is required';
+  END IF;
+
+  IF p_platform NOT IN ('android', 'ios') THEN
+    RAISE EXCEPTION 'Invalid platform: %', p_platform;
+  END IF;
+
+  DELETE FROM public.device_tokens
+  WHERE fcm_token = p_token
+    AND user_id <> auth.uid();
+
+  INSERT INTO public.device_tokens (user_id, fcm_token, platform, updated_at)
+  VALUES (auth.uid(), p_token, p_platform, now())
+  ON CONFLICT (user_id, fcm_token)
+  DO UPDATE SET platform = EXCLUDED.platform, updated_at = EXCLUDED.updated_at;
+END;
+$function$;
+
 CREATE OR REPLACE FUNCTION public.revert_daily_order(p_user_id uuid, p_delivery_date date)
  RETURNS void
  LANGUAGE plpgsql

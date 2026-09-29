@@ -208,7 +208,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '012_money_invariants.sql',
                  '013_fix_cancel_subscription_and_drop_get_user_role.sql',
                  '015_pin_search_path.sql',
-                 '022_customer_daily_order_rpcs.sql']) {
+                 '022_customer_daily_order_rpcs.sql',
+                 '023_register_device_token_rpc.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -770,6 +771,85 @@ if (modGrants.anon_modify === false && modGrants.anon_revert === false
   ok('daily-order RPCs: anon blocked, authenticated allowed');
 } else {
   bad('daily-order RPC grants', JSON.stringify(modGrants));
+}
+
+// ---------------------------------------------------------------------------
+// 6v. register_device_token: fixes the cross-account push leak (migration 023).
+//     device_tokens RLS is "own rows only" — a plain client upsert can never
+//     release a token a PREVIOUS account left on a shared device, so this RPC
+//     is the only correct place to do it.
+// ---------------------------------------------------------------------------
+await db.exec(`
+  ALTER TABLE public.device_tokens ENABLE ROW LEVEL SECURITY;
+  ALTER TABLE public.device_tokens FORCE ROW LEVEL SECURITY;
+  CREATE POLICY device_tokens_own_rows ON public.device_tokens
+    FOR ALL TO public USING (auth.uid() = user_id) WITH CHECK (auth.uid() = user_id);
+`);
+
+const SHARED_TOKEN = 'fcm-shared-device-token-001';
+
+// Account A registers first (simulates the first person to use this phone).
+await asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.register_device_token($1, 'android')`, [SHARED_TOKEN]);
+const afterA = (await db.query(
+  `SELECT user_id FROM public.device_tokens WHERE fcm_token = $1`, [SHARED_TOKEN])).rows;
+if (afterA.length === 1 && afterA[0].user_id === CUSTOMER) {
+  ok('register_device_token: first account claims the token');
+} else {
+  bad('register_device_token (first claim)', JSON.stringify(afterA));
+}
+
+// (a) The bug this replaces: device_tokens' only policy is "own rows only" —
+//     no branch lets one user's session see or delete another user's row, so
+//     a plain client upsert/delete as account B could never reach account A's
+//     row for the same token. (We assert the policy SHAPE rather than a live
+//     cross-account DELETE — PGlite runs as the table owner, for whom RLS is
+//     bypassed, same reason the migration-022 tests above do the same.)
+const dtPolicies = (await db.query(`
+  SELECT qual, with_check FROM pg_policies
+  WHERE schemaname = 'public' AND tablename = 'device_tokens'`)).rows;
+const ownRowsOnly = dtPolicies.length === 1
+  && /auth\.uid\(\)\s*=\s*user_id/.test(dtPolicies[0].qual || '')
+  && !/is_super_admin|has_permission/.test(dtPolicies[0].qual || '');
+if (ownRowsOnly) {
+  ok('device_tokens RLS is own-rows-only — no path for account B to reach account A\'s row directly');
+} else {
+  bad('device_tokens policy shape', JSON.stringify(dtPolicies));
+}
+
+// (b) The fix: account B registering the SAME physical token (the real-world
+//     "logged out of A, into B on the same phone" scenario) releases it from A.
+await asQuery({ sub: OTHER, role: 'authenticated' },
+  `SELECT public.register_device_token($1, 'android')`, [SHARED_TOKEN]);
+const afterB = (await db.query(
+  `SELECT user_id FROM public.device_tokens WHERE fcm_token = $1`, [SHARED_TOKEN])).rows;
+if (afterB.length === 1 && afterB[0].user_id === OTHER) {
+  ok('register_device_token: second account on the same device takes over the token, first account\'s row is gone (leak fixed)');
+} else {
+  bad('register_device_token (takeover)', JSON.stringify(afterB));
+}
+
+// (c) Re-registering (app restart / token refresh) for the same account is a
+//     stable no-op, not a duplicate.
+await asQuery({ sub: OTHER, role: 'authenticated' },
+  `SELECT public.register_device_token($1, 'android')`, [SHARED_TOKEN]);
+const stable = (await db.query(
+  `SELECT COUNT(*)::int AS c FROM public.device_tokens WHERE fcm_token = $1`, [SHARED_TOKEN])).rows[0].c;
+if (stable === 1) {
+  ok('re-registering the same token for the same account stays at 1 row');
+} else {
+  bad('register_device_token idempotency', `${stable} rows`);
+}
+
+// (d) Anonymous cannot call it; authenticated can.
+const tokenGrants = (await db.query(`
+  SELECT
+    has_function_privilege('anon','public.register_device_token(text,text)','EXECUTE')          AS anon_ok,
+    has_function_privilege('authenticated','public.register_device_token(text,text)','EXECUTE') AS auth_ok`)).rows[0];
+if (tokenGrants.anon_ok === false && tokenGrants.auth_ok === true) {
+  ok('register_device_token: anon blocked, authenticated allowed');
+} else {
+  bad('register_device_token grants', JSON.stringify(tokenGrants));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
