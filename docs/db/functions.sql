@@ -263,8 +263,9 @@ BEGIN
       RAISE EXCEPTION 'Address not found or does not belong to user';
     END IF;
 
-    -- Authoritative amount: catalog prices + server-computed delivery charge.
-    v_quote := public.quote_cart(p_cart_items);
+    -- Authoritative amount: catalog prices + server-computed delivery charge
+    -- for this delivery address (₹0 in a serviceable area — migration 024).
+    v_quote := public.quote_cart(p_cart_items, p_address_id);
     v_amount_paise := round((v_quote->>'total')::numeric * 100)::bigint;
 
     IF v_amount_paise <= 0 THEN
@@ -837,9 +838,12 @@ $function$;
 
 -- quote_cart -----------------------------------------------------------------
 -- Read-only quote for display: {subtotal, delivery_charge, total} from the
--- catalog. Safe to expose to anon/authenticated — it writes nothing and is the
--- same maths place_order uses, so the UI matches the charge.
-CREATE OR REPLACE FUNCTION public.quote_cart(p_cart_items jsonb)
+-- catalog — the same maths place_order uses, so the UI matches the charge.
+-- Migration 024: replaced quote_cart(jsonb). With p_address_id the fee follows
+-- that address's pincode (₹0 when it is in an active delivery area); the
+-- address must belong to the caller unless staff/service. Without it, the
+-- weight-tier fee (pre-024 behaviour). authenticated + service_role only.
+CREATE OR REPLACE FUNCTION public.quote_cart(p_cart_items jsonb, p_address_id uuid DEFAULT NULL::uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
@@ -848,12 +852,26 @@ AS $function$
 DECLARE
   v_subtotal numeric := 0;
   v_delivery numeric := 0;
+  v_pincode  text;
 BEGIN
   SELECT COALESCE(SUM(round(c.unit_price * c.quantity, 2)), 0)
   INTO v_subtotal
   FROM internal.normalize_cart(p_cart_items) c;
 
-  v_delivery := internal.compute_delivery_charge(p_cart_items);
+  IF p_address_id IS NULL THEN
+    v_delivery := internal.compute_delivery_charge(p_cart_items);
+  ELSE
+    SELECT a.pincode INTO v_pincode
+    FROM public.addresses a
+    WHERE a.id = p_address_id
+      AND (a.user_id = auth.uid() OR internal.is_admin_actor('orders:view'));
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Address not found or does not belong to user';
+    END IF;
+
+    v_delivery := internal.compute_delivery_charge(p_cart_items, v_pincode);
+  END IF;
 
   RETURN jsonb_build_object(
     'subtotal',        round(v_subtotal, 2),

@@ -293,6 +293,26 @@ END;
 $function$;
 
 
+-- compute_delivery_charge(jsonb, text) (migration 024) -----------------------
+-- Pincode-aware fee used by place_order_core and quote_cart: ₹0 when the
+-- pincode is in an active delivery area (Hetha's own riders — see
+-- serviceable_area_id), otherwise the weight-tier fee above.
+CREATE OR REPLACE FUNCTION internal.compute_delivery_charge(p_items jsonb, p_pincode text)
+ RETURNS numeric
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+BEGIN
+  IF p_pincode IS NOT NULL AND internal.serviceable_area_id(p_pincode) IS NOT NULL THEN
+    RETURN 0;
+  END IF;
+
+  RETURN internal.compute_delivery_charge(p_items);
+END;
+$function$;
+
+
 -- create_subscription_core ---------------------------------------------------
 -- The body behind both public.create_subscription overloads. Reads unit_price
 -- from product_variants (client `price` ignored), enforces max-5 and the 3-day
@@ -768,12 +788,13 @@ BEGIN
     RAISE EXCEPTION 'Order subtotal must be greater than zero';
   END IF;
 
-  -- Delivery charge: server-computed for customers. Admins may override it
+  -- Delivery charge: server-computed for customers — ₹0 for a serviceable
+  -- pincode (migration 024), weight tiers elsewhere. Admins may override it
   -- (fee waivers / manual corrections) but never below zero.
   IF p_is_admin AND p_delivery_charge IS NOT NULL THEN
     v_delivery := round(GREATEST(p_delivery_charge, 0), 2);
   ELSE
-    v_delivery := internal.compute_delivery_charge(p_cart_items);
+    v_delivery := internal.compute_delivery_charge(p_cart_items, v_address.pincode);
   END IF;
 
   v_total := round(v_subtotal + v_delivery, 2);

@@ -81,7 +81,8 @@ code obvious.
   Enforced in the database (`place_order`, `create_subscription`) and mirrored in
   both UIs for a friendlier message.
 - **Money is decided server-side.** Clients send variant ids and quantities;
-  prices come from `product_variants`, the delivery charge from
+  prices come from `product_variants`, the delivery charge is ₹0 for pincodes
+  in an active delivery area and otherwise comes from
   `delivery_charge_tiers`, and the payable amount from a server-created payment
   intent. See [money integrity](./docs/ARCHITECTURE.md#money-integrity).
 - **Daily order / run sheet.** Each day, operations generates the list of

@@ -85,7 +85,9 @@ select tablename, indexname, indexdef from pg_indexes
 where schemaname='public' order by tablename, indexname;
 
 -- (H) grant surface → paste the result into DATA_MODEL.md §11.
---     Expected: anon may execute ONLY quote_cart, has_permission, is_super_admin.
+--     Expected: anon may execute ONLY has_permission, is_super_admin
+--     (quote_cart was revoked from anon in 015; its current signature is
+--     quote_cart(jsonb, uuid) since 024).
 --     Anything else appearing for anon is a regression (see migrations 010/011 —
 --     Supabase's default privileges grant EXECUTE on new public functions to
 --     anon/authenticated, so every new function needs an explicit REVOKE).

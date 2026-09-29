@@ -150,8 +150,11 @@ await db.exec(`
          ('${OTHER}',    'other@example.com','9000000002', 'Other', 5000);
 
   INSERT INTO public.categories (id, name) VALUES ('${CAT}', 'Dairy');
-  INSERT INTO public.products (id, category_id, name, in_stock)
-  VALUES ('${PROD}', '${CAT}', 'Cow Milk', true);
+  -- all_india: migration 024 brings the 016 local-only check into
+  -- place_order_core here, and ADDR (600001) is deliberately NOT a serviceable
+  -- pincode so the tier-charge assertions below keep their ₹40 fee.
+  INSERT INTO public.products (id, category_id, name, in_stock, delivery_scope)
+  VALUES ('${PROD}', '${CAT}', 'Cow Milk', true, 'all_india');
   INSERT INTO public.product_variants (id, product_id, label, price, weight_grams, is_active, free_delivery)
   VALUES ('${VAR}', '${PROD}', '1 L', 100, 1000, true, false);
 
@@ -209,7 +212,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '013_fix_cancel_subscription_and_drop_get_user_role.sql',
                  '015_pin_search_path.sql',
                  '022_customer_daily_order_rpcs.sql',
-                 '023_register_device_token_rpc.sql']) {
+                 '023_register_device_token_rpc.sql',
+                 '024_free_delivery_serviceable_pincodes.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -463,7 +467,7 @@ const grants = await db.query(`
     has_schema_privilege('authenticated','internal','USAGE')                                                      AS cust_internal,
     has_table_privilege('authenticated','public.payment_intents','SELECT')                                        AS cust_intents_table,
     has_function_privilege('authenticated','public.place_order(uuid,uuid,text,numeric,jsonb)','EXECUTE')           AS cust_place_order,
-    has_function_privilege('anon','public.quote_cart(jsonb)','EXECUTE')                                           AS anon_quote`);
+    has_function_privilege('anon','public.quote_cart(jsonb,uuid)','EXECUTE')                                      AS anon_quote`);
 const g = grants.rows[0];
 const mustBeFalse = ['anon_place_order','anon_wallet','cust_intent','cust_settle','cust_internal','cust_intents_table','anon_quote'];
 const leaks = mustBeFalse.filter((k) => g[k] !== false);
@@ -850,6 +854,114 @@ if (tokenGrants.anon_ok === false && tokenGrants.auth_ok === true) {
   ok('register_device_token: anon blocked, authenticated allowed');
 } else {
   bad('register_device_token grants', JSON.stringify(tokenGrants));
+}
+
+// ---------------------------------------------------------------------------
+// 6w. Free delivery for serviceable pincodes (migration 024).
+//     Pincode in an ACTIVE delivery area → ₹0 fee; not in any area, or in an
+//     area switched off in the admin panel → the weight-tier fee (₹40 here).
+// ---------------------------------------------------------------------------
+const AREA_ON   = '88888888-8888-4888-8888-888888888801';
+const AREA_OFF  = '88888888-8888-4888-8888-888888888802';
+const ADDR_FREE = '99999999-9999-4999-8999-999999999901';  // pincode in active area
+const ADDR_OFF  = '99999999-9999-4999-8999-999999999902';  // pincode in inactive area
+
+await db.exec(`
+  UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}';
+
+  INSERT INTO public.delivery_areas (id, display_name, is_active)
+  VALUES ('${AREA_ON}', 'Rider Area', true), ('${AREA_OFF}', 'Closed Area', false);
+  INSERT INTO public.pincodes (area_id, pincode)
+  VALUES ('${AREA_ON}', '600002'), ('${AREA_OFF}', '600003');
+
+  INSERT INTO public.addresses (id, user_id, name, phone_number, address_line1, city, state, pincode, address_type)
+  VALUES ('${ADDR_FREE}', '${CUSTOMER}', 'Cust', '9000000001', '2 Rider St', 'Chennai', 'TN', '600002', 'home'),
+         ('${ADDR_OFF}',  '${CUSTOMER}', 'Cust', '9000000001', '3 Closed St', 'Chennai', 'TN', '600003', 'home');
+`);
+
+const quoteFor = async (claims, addressId) => (await asQuery(claims,
+  `SELECT public.quote_cart($1::jsonb, $2::uuid) AS q`, [CART, addressId])).rows[0].q;
+const CUST_CLAIMS = { sub: CUSTOMER, role: 'authenticated' };
+
+// (a) Quotes follow the address pincode.
+const qFree = await quoteFor(CUST_CLAIMS, ADDR_FREE);
+if (Number(qFree.delivery_charge) === 0 && Number(qFree.total) === 100) {
+  ok(`quote_cart: serviceable pincode 600002 → free delivery ${JSON.stringify(qFree)}`);
+} else {
+  bad('quote_cart serviceable pincode', JSON.stringify(qFree));
+}
+
+const qOutside = await quoteFor(CUST_CLAIMS, ADDR);
+if (Number(qOutside.delivery_charge) === 40 && Number(qOutside.total) === 140) {
+  ok(`quote_cart: pincode 600001 not in any area → tier charge ${JSON.stringify(qOutside)}`);
+} else {
+  bad('quote_cart non-serviceable pincode', JSON.stringify(qOutside));
+}
+
+const qInactive = await quoteFor(CUST_CLAIMS, ADDR_OFF);
+if (Number(qInactive.delivery_charge) === 40) {
+  ok('quote_cart: pincode in an INACTIVE area → tier charge (not free)');
+} else {
+  bad('quote_cart inactive area', JSON.stringify(qInactive));
+}
+
+// (b) Someone else's address id cannot be used to probe/quote.
+await expectError('quote_cart with another user\'s address rejected',
+  () => quoteFor({ sub: OTHER, role: 'authenticated' }, ADDR_FREE), 'does not belong');
+
+// (c) The order itself is charged by pincode — and a customer-sent fee is
+//     still ignored (₹40 sent, ₹0 charged).
+const freeOrder = await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1,$2,'wallet',40,$3::jsonb) AS id`, [CUSTOMER, ADDR_FREE, CART]);
+const freeRow = (await db.query(
+  `SELECT subtotal, delivery_charge, total FROM public.orders WHERE id = $1`,
+  [freeOrder.rows[0].id])).rows[0];
+if (Number(freeRow.delivery_charge) === 0 && Number(freeRow.total) === 100) {
+  ok(`place_order to serviceable pincode charged no delivery ${JSON.stringify(freeRow)}`);
+} else {
+  bad('place_order serviceable pincode', JSON.stringify(freeRow));
+}
+
+const offOrder = await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1,$2,'wallet',0,$3::jsonb) AS id`, [CUSTOMER, ADDR_OFF, CART]);
+const offRow = (await db.query(
+  `SELECT delivery_charge, total FROM public.orders WHERE id = $1`, [offOrder.rows[0].id])).rows[0];
+if (Number(offRow.delivery_charge) === 40 && Number(offRow.total) === 140) {
+  ok('place_order to an inactive-area pincode still pays the tier charge');
+} else {
+  bad('place_order inactive area', JSON.stringify(offRow));
+}
+
+// (d) Razorpay: the payment intent amount follows the same rule.
+const freeIntent = (await asQuery({ role: 'service_role' },
+  `SELECT public.create_payment_intent($1, 'order', NULL, $2, $3::jsonb) AS i`,
+  [CUSTOMER, ADDR_FREE, CART])).rows[0].i;
+if (Number(freeIntent.amount_paise) === 10000) {
+  ok('create_payment_intent for a serviceable pincode = 10000 paise (₹100, no delivery fee)');
+} else {
+  bad('payment intent serviceable pincode', JSON.stringify(freeIntent));
+}
+
+// (e) Admin fee override still works (explicit waiver/charge by staff).
+const adminOrder = await asQuery({ role: 'service_role' },
+  `SELECT public.place_order($1,$2,'cod',25,$3::jsonb) AS id`, [CUSTOMER, ADDR_FREE, CART]);
+const adminRow = (await db.query(
+  `SELECT delivery_charge FROM public.orders WHERE id = $1`, [adminOrder.rows[0].id])).rows[0];
+if (Number(adminRow.delivery_charge) === 25) {
+  ok('admin/service caller p_delivery_charge override still honoured');
+} else {
+  bad('admin delivery override', JSON.stringify(adminRow));
+}
+
+// (f) Only the new quote_cart signature exists.
+const quoteSigs = (await db.query(`
+  SELECT p.oid::regprocedure::text AS sig
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public' AND p.proname = 'quote_cart'`)).rows.map((r) => r.sig);
+if (quoteSigs.length === 1 && quoteSigs[0] === 'quote_cart(jsonb,uuid)') {
+  ok('quote_cart(jsonb) replaced by quote_cart(jsonb,uuid) — no ambiguous overloads');
+} else {
+  bad('quote_cart signatures', JSON.stringify(quoteSigs));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

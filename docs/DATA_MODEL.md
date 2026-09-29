@@ -263,6 +263,14 @@ Weight-based shipping price: `min_weight_grams`, `max_weight_grams`, `charge`
 items) selects a tier. Variants with `free_delivery = true` are excluded from
 the weight sum; if all cart items are free-delivery, the charge is ₹0.
 
+**Serviceable pincodes pay nothing (migration 024).** Tiers apply only when the
+delivery address pincode is **not** serviceable. A pincode listed in `pincodes`
+whose `delivery_areas.is_active` is true is delivered by Hetha's own riders
+(no third-party courier), so its delivery charge is ₹0 regardless of weight.
+Same check as `internal.serviceable_area_id()`, which also gates local-only
+products and drives the customer app's product visibility; an area switched
+off in the admin panel pays tiers again.
+
 ---
 
 ## 7. Wallet & reviews & notifications
@@ -389,7 +397,7 @@ schema (not exposed through PostgREST) in
 
 | RPC | Called by | What it does |
 |-----|-----------|--------------|
-| `quote_cart(p_cart_items)` | App (display) | `SECURITY DEFINER STABLE`. Returns `{subtotal, delivery_charge, total}` computed from `product_variants` + `delivery_charge_tiers`. The client shows this; it never supplies pricing. |
+| `quote_cart(p_cart_items, p_address_id = NULL)` | App (display), `create_payment_intent` | `SECURITY DEFINER STABLE`. Returns `{subtotal, delivery_charge, total}` computed from `product_variants` + the delivery-fee rule. **Migration 024:** with `p_address_id` the fee follows that address's pincode — ₹0 when the pincode is in an active delivery area, weight tiers otherwise; the address must belong to the caller (or the caller is staff/service). Without an address it is the weight-tier fee. Replaced the old 1-arg `quote_cart(p_cart_items)`. The client shows this; it never supplies pricing. |
 | `place_order(p_user_id, p_address_id, p_payment_method, p_delivery_charge, p_cart_items)` | App (wallet/cod), admin (ad-hoc), edge fn (razorpay) | `SECURITY DEFINER`. Only ids + quantities are trusted: prices come from `product_variants`, the **delivery charge is recomputed server-side** (`p_delivery_charge` is honoured only for admin callers, as a fee waiver), quantities must be whole numbers 1–99, and inactive/out-of-stock variants are rejected. **Delivery scope enforcement (migration 016):** if the address pincode is not in a serviceable delivery area (per `internal.serviceable_area_id`) and the cart contains any `delivery_scope='local'` product, the order is rejected — admin callers bypass this. Requires `p_user_id = auth.uid()` unless the caller is an admin with `orders:edit`/service role. Wallet payments additionally reserve **3 × daily subscription commitment**. Customer-initiated `razorpay` orders are created as `status='payment_pending'` until a verified payment arrives. **Order number = `ORD-<YYYYMMDDHH24MISS>-<nnnn>`**, **RETURNS the order UUID** (as text). |
 | `create_subscription(…, p_label)` **(7-arg, current)** | App, admin | Enforces **max 5 active/pending per user**, sets `label` (defaults to `Subscription N`), derives `delivary_area`/`delivary_frequency` from the address pincode, and takes `unit_price` from `product_variants` — the `price` field in the payload is ignored. Enforces the **3-day wallet buffer** for customer callers. Does **not** cancel existing subs. |
 | `create_subscription(…)` **(6-arg, legacy)** | Admin ad-hoc only | Older overload still deployed: **cancels the user's active subscription** (`cancellation_type='replaced'`), no label. Same server-side pricing as the 7-arg version. Prefer the 7-arg version in the app. |

@@ -253,7 +253,7 @@ decides money.**
 | Decision | Where it is made |
 |----------|------------------|
 | Item price | `product_variants.price`, re-read inside every RPC |
-| Delivery charge | `internal.compute_delivery_charge()` from `delivery_charge_tiers` + variant weights. The client's `p_delivery_charge` is honoured **only** for admin callers (fee waivers) |
+| Delivery charge | `internal.compute_delivery_charge(items, pincode)`: **₹0 when the delivery pincode is in an active delivery area** (Hetha's own riders — migration 024); otherwise weight tiers from `delivery_charge_tiers` + variant weights (`free_delivery` variants add no weight). The client's `p_delivery_charge` is honoured **only** for admin callers (fee waivers) |
 | Delivery scope | `products.delivery_scope` (`'local'`/`'all_india'`). `place_order` rejects local-only items when the address pincode is outside serviceable areas (via `internal.serviceable_area_id`). Admin callers bypass. Added migration 016. |
 | Order total | `internal.place_order_core()`; enforced afterwards by deferred constraint triggers |
 | Amount payable online | `payment_intents.amount_paise`, set server-side |
