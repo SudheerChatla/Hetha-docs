@@ -7,6 +7,19 @@ listed under [Already done](#already-done).
 
 Ordered by consequence, not by effort.
 
+> **Update 2026-09-30.** Still accurate as a list of launch work, with these
+> changes since it was written (details in `CHANGES_2026-09-28_29.md` and
+> `CHANGES_2026-09-30.md`):
+> - Verification gates today: money-path DB suite **93 passed, 0 failed**;
+>   `flutter analyze` clean apart from one existing `sized_box_for_whitespace`
+>   hint; `flutter test` **73 passed** (`Hetha_app/test/` now exists); admin
+>   `tsc` / ESLint / `next build` pass.
+> - Item 3 (Delete Account) is **still open** — the button now at least clears
+>   the navigation stack, but still deletes nothing.
+> - Item 7 is **partly addressed** — see the note under it.
+> - New Supabase dashboard steps (email-code templates, OTP expiry, SMTP) are
+>   listed under [Supabase dashboard items](#supabase-dashboard-items).
+
 **Current verification state** — all three gates pass today:
 
 | Gate | Command | Result |
@@ -202,6 +215,21 @@ settles whenever the sweeper hasn't happened to run yet.
 
 ### 7. Serviceability, cutoff and frequency are client-only
 
+> **Update 2026-09-30 — partly addressed.**
+> - **Serviceability is now server-side for money and products:** migration 016
+>   refuses local-only products outside a serviceable pincode in `place_order`,
+>   and migration 024 computes the delivery fee from the address pincode
+>   (`internal.serviceable_area_id`).
+> - **Still client-only:** the order and cancellation **cut-off times**.
+>   `modify_daily_order` / `modify_daily_orders_bulk` refuse past, finalized and
+>   paid days but not edits after the cut-off (`CHANGES_2026-09-30.md` open
+>   item 8).
+> - **No area has a cut-off set yet.** On 2026-09-30 Delhi, Noida and Ghaziabad
+>   all had both cut-offs NULL (open item 7).
+> - `subscription_address_page.dart` (third bullet below) was deleted on
+>   2026-09-30. Create Subscription greys out out-of-area addresses itself.
+> - Line numbers below are from 2026-07-31.
+
 **State.** Three logistics rules are enforced only in the Flutter app:
 
 - `delivery_area_service.dart:56` requests active areas only; line 283 checks the
@@ -282,10 +310,28 @@ Small, and none require code:
   SELECT/listing policy stops enumeration while public URLs keep working.
 - **`admin_permissions` RLS-enabled-no-policy** (INFO) — almost certainly a
   legacy table; live RBAC uses `admin_role_permissions`. Confirm and drop.
+- **Email codes (added 2026-09-30):**
+  - **Confirm signup** and **Reset Password** templates must show `{{ .Token }}`
+    instead of the link — do this only once the app build with the code
+    screens (`Hetha_app` `4e9c217`) is installed.
+  - Under Email provider settings: set **Email OTP Expiration** to 600 and
+    **Email OTP Length** to 6.
+- **Custom SMTP before launch** — the built-in sender allows only a few emails
+  per hour. Planned provider: Zoho ZeptoMail.
+  - Verify `hetha.in` in ZeptoMail (SPF / DKIM).
+  - In Supabase → Authentication → SMTP use the host from the ZeptoMail agent's
+    SMTP tab, port 587, username `emailapikey`, and the Send Mail Token as the
+    password.
+  - Then raise the auth email rate limit.
 
 ---
 
 ## Structural gap: no application tests
+
+> **Update 2026-09-30:** `Hetha_app/test/` exists now (73 passing unit/widget
+> tests, including the auth-code helpers, SessionWatcher and tab reset). The
+> admin panel still has no test runner; its pure helpers were checked with
+> throwaway scripts only.
 
 `Hetha_app` has no `test/` directory. `Hetha_admin` has no test suite. The DB
 money suite is the only executable check on behaviour, and it covers the database

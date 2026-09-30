@@ -238,13 +238,14 @@ Serviceable areas and their operating rules.
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `display_name` | text UNIQUE | |
-| `is_active` | boolean | |
-| `support_email`, `support_phone`, `support_hours` | | |
-| `advance_order_days`, `max_order_days` | integer | ordering window |
-| `order_cutoff_time`, `cancellation_cutoff_time` | time | drives run-sheet cutoff |
-| `delivary_frequency` | bigint | **(sic)** delivery cadence |
-| `reference_date` | date | anchor for frequency math |
+| `display_name` | text UNIQUE | Subscriptions reference the area by this name (`subscriptions.delivary_area`). |
+| `is_active` | boolean | Shown as **"Serviceable area"** in the admin form. On → its pincodes get local-only products, free delivery (migration 024) and new subscriptions. The run-sheet generator does **not** check it, so existing subscriptions keep being delivered when it is off. |
+| `support_email`, `support_phone`, `support_hours` | | Saved per area; **not shown anywhere in the customer app** yet. |
+| `advance_order_days`, `max_order_days` | integer | **Unused** — loaded by the app but read by no logic. Removed from the admin form on 2026-09-30 (no longer written; values left as they were). |
+| `order_cutoff_time` | time | After this time the customer app locks changes to **tomorrow's** order; the run sheet skips a subscription created after it the previous day. NULL → app treats it as 23:59, run sheet applies no cut-off. **Not enforced in SQL** (`modify_daily_order*` only refuse past / finalized / paid days). |
+| `cancellation_cutoff_time` | time | Earliest cancellation date: tomorrow before this time, the day after once it has passed. NULL → 23:59. (Until 2026-09-30 every admin save wiped it to NULL.) |
+| `delivary_frequency` | bigint | **(sic)** delivery cadence: 1 = daily, N = every N days |
+| `reference_date` | date | A delivery day; the schedule counts forward from it when `delivary_frequency` > 1. **Required** in that case — without it the app shows no delivery days. |
 | `version`, `created_at`, `updated_at` | | |
 
 ### `delivery_routes`
@@ -279,6 +280,11 @@ off in the admin panel pays tiers again.
 ### `wallet_transactions`
 Append-only ledger. `type` (`credit`/`debit`), `amount` (`CHECK > 0`),
 `balance_after`, `description`, `reference_type`, `reference_id`, `initiated_by`.
+`description` is shown to the customer in the app. `reference_type` values in
+use: `order`, `subscription`, `wallet_topup` / `recharge`, and
+`admin_adjustment` (manual change from the admin panel; `reference_id` = the
+acting admin's user id — since 2026-09-30). `initiated_by` holds the actor role
+(`user` / `admin` / `system`), not an id.
 Always written alongside a wallet change — `users.wallet_balance` is only
 writable by `internal.apply_wallet_delta()`, which writes both in one
 transaction. `authenticated` has **no** UPDATE grant on that column.

@@ -86,11 +86,20 @@ because both read the same `subscriptions` table.
 
 ### Customer auth (Hetha_app)
 
-- Supabase Auth email/password (`SupabaseAuthService`).
+- Supabase Auth email/password. Email verification and password reset use a
+  **6-digit emailed code** (`verifyOTP`), not a link — the "Confirm signup" and
+  "Reset Password" templates must show `{{ .Token }}` (since 2026-09-30; see
+  `CHANGES_2026-09-30.md` §10). Supabase generates, stores (hashed), expires
+  and checks the code. Normal sign-in never asks for a code.
 - `authStateChangesProvider` (Riverpod) streams `onAuthStateChange`; the
-  `AuthWrapper` routes to the app shell or the sign-in page.
+  `AuthWrapper` routes to the app shell or the sign-in page. `SessionWatcher`
+  returns the user to Sign In if the session ends unexpectedly while the app is
+  open; sign-in and sign-out clear the whole navigation stack so no screen from a
+  previous account survives.
 - Every query runs as the signed-in user; **RLS** restricts rows to that user
   (their cart, orders, subscriptions, wallet, addresses).
+- Production email (codes, resets) needs a custom SMTP provider (e.g. Zoho
+  ZeptoMail) — the built-in Supabase sender is rate-limited to a few per hour.
 
 ### Admin auth (Hetha_admin)
 
@@ -142,6 +151,12 @@ participate.
   (service role, super admin, or `customers:edit`). Customer JWTs are rejected.
 - `authenticated` has **no UPDATE grant on the `wallet_balance` column**, so the
   balance cannot be written from a client even though RLS allows own-row updates.
+- **Manual admin adjustments** (Customers → Wallet) are validated by the API
+  (amount > 0, ≤ 2 decimals, ≤ ₹1,00,000 per adjustment, reason 3–200 chars) and
+  confirmed in the UI with a before → after preview. `description` holds **only
+  the reason** — the customer sees it in the app — and the acting admin is
+  recorded as `reference_type = 'admin_adjustment'`, `reference_id` = admin user
+  id (entries before 2026-09-30 carried "(admin: <uuid>)" in the text).
 
 ### Subscriptions
 

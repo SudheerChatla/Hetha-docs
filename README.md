@@ -116,6 +116,11 @@ The Razorpay **secret** lives only in the Supabase Edge Function environment
 (`key_secret`) and never ships in either client. See
 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md#payments).
 
+Customer sign-up verification and password reset use a **6-digit emailed
+code**, so the Supabase Auth **Confirm signup** and **Reset Password** email
+templates must show `{{ .Token }}` (not a link). For production, connect a
+custom SMTP provider — see [REMAINING_FIXES.md](./REMAINING_FIXES.md#supabase-dashboard-items).
+
 ---
 
 ## Documentation map
@@ -134,6 +139,8 @@ The Razorpay **secret** lives only in the Supabase Edge Function environment
 | [Hetha_app/CONTRIBUTING.md](./Hetha_app/CONTRIBUTING.md) | App conventions & how to add features |
 | [Hetha_admin/README.md](./Hetha_admin/README.md) | Admin panel: setup, run, build, structure |
 | [Hetha_admin/docs/ARCHITECTURE.md](./Hetha_admin/docs/ARCHITECTURE.md) | Next.js layers, auth/RBAC, services, API |
+| [Hetha_admin/docs/UI_GUIDELINES.md](./Hetha_admin/docs/UI_GUIDELINES.md) | Admin design tokens, badges, number/date formatting |
+| [Hetha_admin/docs/daily_ops.md](./Hetha_admin/docs/daily_ops.md) | Run-sheet generation rules (cutoff, pauses, frequency, snapshots) |
 | [Hetha_admin/CONTRIBUTING.md](./Hetha_admin/CONTRIBUTING.md) | Admin conventions & how to add features |
 | `CHANGES_*.md` | Dated change logs of recent work |
 
