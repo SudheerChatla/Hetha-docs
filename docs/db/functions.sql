@@ -79,11 +79,26 @@ $function$;
 -- with the cutoff in end_date (fixed in migration 013 — it previously wrote a
 -- non-existent scheduled_end_date column). SubscriptionStatusManager flips the
 -- pending row to 'cancelled' once end_date passes.
+-- Migration 030: SECURITY DEFINER with an explicit caller check (owner, or
+-- subscriptions:edit admin / service role), and deletes THIS subscription's
+-- pending, unfinalized, unpaid daily orders after the last delivered date
+-- (today for immediate, end_date for scheduled) — customer-edited days used
+-- to survive run-sheet regeneration and be billed after the cancellation.
 CREATE OR REPLACE FUNCTION public.cancel_subscription(p_subscription_id uuid, p_user_id uuid, p_end_date timestamp with time zone, p_is_immediate boolean, p_cancellation_type text, p_reason text DEFAULT NULL::text)
  RETURNS void
  LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
 AS $function$
+DECLARE
+  v_cutoff date;
 BEGIN
+  IF NOT internal.is_admin_actor('subscriptions:edit') THEN
+    IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+      RAISE EXCEPTION 'Not authorized to cancel this subscription';
+    END IF;
+  END IF;
+
   IF p_is_immediate THEN
     UPDATE public.subscriptions
     SET status = 'cancelled',
@@ -106,6 +121,26 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'Subscription not found or does not belong to user';
   END IF;
+
+  v_cutoff := CASE WHEN p_is_immediate THEN CURRENT_DATE
+                   ELSE COALESCE(p_end_date::date, CURRENT_DATE) END;
+
+  DELETE FROM public.subscription_daily_order_items
+  WHERE daily_order_id IN (
+    SELECT id FROM public.subscription_daily_orders
+    WHERE subscription_id = p_subscription_id
+      AND delivery_date > v_cutoff
+      AND status = 'pending'
+      AND is_finalized = false
+      AND payment_status <> 'paid'
+  );
+
+  DELETE FROM public.subscription_daily_orders
+  WHERE subscription_id = p_subscription_id
+    AND delivery_date > v_cutoff
+    AND status = 'pending'
+    AND is_finalized = false
+    AND payment_status <> 'paid';
 END;
 $function$;
 
@@ -667,6 +702,31 @@ BEGIN
 END;
 $function$;
 
+-- modify_daily_orders_bulk (migration 027) -----------------------------------
+-- Customer/admin entry point for the atomic multi-day edit. Same
+-- authorization shape as modify_daily_order; delegates the validate-then-write
+-- work to internal.modify_daily_orders_bulk_core.
+CREATE OR REPLACE FUNCTION public.modify_daily_orders_bulk(p_user_id uuid, p_subscription_id uuid, p_days jsonb)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_is_admin boolean := internal.is_admin_actor('subscriptions:edit');
+BEGIN
+  IF NOT v_is_admin THEN
+    IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
+      RAISE EXCEPTION 'Not authorized to modify orders for this user';
+    END IF;
+  END IF;
+
+  RETURN internal.modify_daily_orders_bulk_core(
+    p_user_id, p_subscription_id, p_days, v_is_admin
+  );
+END;
+$function$;
+
 -- register_device_token (migration 023) --------------------------------------
 -- Fixes a cross-account push leak on shared devices. device_tokens' RLS only
 -- lets a user see/touch their own rows, so a plain client upsert can never
@@ -704,9 +764,8 @@ END;
 $function$;
 
 -- revert_daily_order (3-arg, migration 026) ---------------------------------
--- "Reset to Default" for ONE subscription's day. The 2-arg version below is
--- kept for old app builds; it resets every subscription the user has on the
--- date.
+-- "Reset to Default" for ONE subscription's day. (The 2-arg version that
+-- reset every subscription on the date was dropped in migration 031.)
 CREATE OR REPLACE FUNCTION public.revert_daily_order(p_user_id uuid, p_delivery_date date, p_subscription_id uuid)
  RETURNS void
  LANGUAGE plpgsql
@@ -750,40 +809,125 @@ BEGIN
 END;
 $function$;
 
-CREATE OR REPLACE FUNCTION public.revert_daily_order(p_user_id uuid, p_delivery_date date)
+-- revert_daily_order (2-arg, migration 022) — DROPPED in migration 031. It
+-- reset every subscription the user had on the date; only the 3-arg version
+-- above remains.
+
+
+-- delete_product (migration 028) ---------------------------------------------
+-- Atomic, history-aware product delete for the admin panel. Refuses (with the
+-- counts) if any order_items / subscription_items / subscription_daily_order_
+-- items / reviews reference the product — archive it instead. Otherwise removes
+-- cart rows, images, variants and the product in one transaction. Replaces the
+-- old three-call route delete that lost images when the variant delete failed.
+CREATE OR REPLACE FUNCTION public.delete_product(p_product_id uuid)
  RETURNS void
  LANGUAGE plpgsql
  SECURITY DEFINER
  SET search_path TO 'public', 'internal'
 AS $function$
 DECLARE
-  v_is_admin boolean := internal.is_admin_actor('subscriptions:edit');
+  v_order_lines  integer;
+  v_sub_lines    integer;
+  v_day_lines    integer;
+  v_reviews      integer;
 BEGIN
-  IF NOT v_is_admin THEN
-    IF auth.uid() IS NULL OR auth.uid() <> p_user_id THEN
-      RAISE EXCEPTION 'Not authorized to modify orders for this user';
-    END IF;
+  IF NOT internal.is_admin_actor('products:edit') THEN
+    RAISE EXCEPTION 'Not authorized to delete products';
   END IF;
 
-  DELETE FROM public.subscription_daily_order_items
-  WHERE daily_order_id IN (
-    SELECT id FROM public.subscription_daily_orders
-    WHERE user_id = p_user_id
-      AND delivery_date = p_delivery_date
-      AND status = 'pending'
-      AND is_finalized = false
-      AND payment_status <> 'paid'
-  );
+  PERFORM 1 FROM public.products WHERE id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found';
+  END IF;
 
-  DELETE FROM public.subscription_daily_orders
-  WHERE user_id = p_user_id
-    AND delivery_date = p_delivery_date
-    AND status = 'pending'
-    AND is_finalized = false
-    AND payment_status <> 'paid';
+  SELECT COUNT(*) INTO v_order_lines
+  FROM public.order_items oi
+  JOIN public.product_variants pv ON pv.id = oi.variant_id
+  WHERE pv.product_id = p_product_id;
+
+  SELECT COUNT(*) INTO v_sub_lines
+  FROM public.subscription_items si
+  JOIN public.product_variants pv ON pv.id = si.variant_id
+  WHERE pv.product_id = p_product_id;
+
+  SELECT COUNT(*) INTO v_day_lines
+  FROM public.subscription_daily_order_items di
+  JOIN public.product_variants pv ON pv.id = di.variant_id
+  WHERE pv.product_id = p_product_id;
+
+  SELECT COUNT(*) INTO v_reviews
+  FROM public.reviews r
+  WHERE r.product_id = p_product_id
+     OR r.variant_id IN (SELECT id FROM public.product_variants WHERE product_id = p_product_id);
+
+  IF v_order_lines + v_sub_lines + v_day_lines + v_reviews > 0 THEN
+    RAISE EXCEPTION
+      'This product has history (% order line(s), % subscription line(s), % daily-delivery line(s), % review(s)) and cannot be deleted. Archive it instead.',
+      v_order_lines, v_sub_lines, v_day_lines, v_reviews;
+  END IF;
+
+  DELETE FROM public.cart_items
+  WHERE variant_id IN (SELECT id FROM public.product_variants WHERE product_id = p_product_id);
+
+  DELETE FROM public.product_images   WHERE product_id = p_product_id;
+  DELETE FROM public.product_variants WHERE product_id = p_product_id;
+  DELETE FROM public.products         WHERE id = p_product_id;
 END;
 $function$;
 
+
+-- set_product_archived (migration 028) ---------------------------------------
+-- Archive / restore. Archiving is refused while an active or pending-
+-- cancellation subscription still has the product as a live item, and clears
+-- the product from every customer's cart (normalize_cart refuses it anyway).
+CREATE OR REPLACE FUNCTION public.set_product_archived(p_product_id uuid, p_archived boolean)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_active_subs integer;
+BEGIN
+  IF NOT internal.is_admin_actor('products:edit') THEN
+    RAISE EXCEPTION 'Not authorized to archive products';
+  END IF;
+
+  IF p_archived IS NULL THEN
+    RAISE EXCEPTION 'p_archived is required';
+  END IF;
+
+  PERFORM 1 FROM public.products WHERE id = p_product_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Product not found';
+  END IF;
+
+  IF p_archived THEN
+    SELECT COUNT(DISTINCT s.id) INTO v_active_subs
+    FROM public.subscription_items si
+    JOIN public.subscriptions s     ON s.id  = si.subscription_id
+    JOIN public.product_variants pv ON pv.id = si.variant_id
+    WHERE pv.product_id = p_product_id
+      AND si.is_active = true
+      AND (si.item_end_date IS NULL OR si.item_end_date >= CURRENT_DATE)
+      AND s.status IN ('active', 'pending_cancellation');
+
+    IF v_active_subs > 0 THEN
+      RAISE EXCEPTION
+        '% active subscription(s) still include this product. Remove it from those subscriptions first, or switch "In Stock" off instead.',
+        v_active_subs;
+    END IF;
+
+    DELETE FROM public.cart_items
+    WHERE variant_id IN (SELECT id FROM public.product_variants WHERE product_id = p_product_id);
+  END IF;
+
+  UPDATE public.products
+  SET is_archived = p_archived, updated_at = now()
+  WHERE id = p_product_id;
+END;
+$function$;
 
 -- get_user_role — DROPPED in migration 013 (was broken + unused).
 -- Not recreated. has_permission() / is_super_admin() are the live RBAC helpers.

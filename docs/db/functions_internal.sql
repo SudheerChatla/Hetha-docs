@@ -631,6 +631,215 @@ END;
 $function$;
 
 
+-- modify_daily_orders_bulk_core (migration 027) ------------------------------
+-- Atomic multi-day edit for the "Edit multiple days" flow. p_days is a jsonb
+-- array of {delivery_date, items:[{variant_id, quantity}]}. Two passes:
+--   1. Validate EVERY day (ownership already checked once above; per day:
+--      not past, not finalized/non-pending/paid, priced via normalize_cart),
+--      accumulating v_total_extra = SUM of every day's positive
+--      (new_daily - this subscription's normal daily cost).
+--   2. ONE wallet check: wallet >= 3 × commitment + v_total_extra (the same
+--      per-day formula from 025, aggregated across the whole batch instead of
+--      re-checked per day against a balance that hasn't moved).
+--   3. Only then apply every day's delete/insert. Any RAISE in pass 1 aborts
+--      before any write; the whole function body is the RPC's implicit
+--      transaction, so a late failure in pass 2 rolls back every day already
+--      written in this call too. An empty items array for a day reverts it.
+-- Returns {days:[{delivery_date, order_id | reverted}], total_extra}.
+CREATE OR REPLACE FUNCTION internal.modify_daily_orders_bulk_core(p_user_id uuid, p_subscription_id uuid, p_days jsonb, p_is_admin boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_owner            uuid;
+  v_day              jsonb;
+  v_delivery_date    date;
+  v_items            jsonb;
+  v_day_count        integer;
+  v_seen_dates       date[] := ARRAY[]::date[];
+  v_new_daily        numeric;
+  v_sub_base         numeric := 0;
+  v_extra            numeric;
+  v_total_extra      numeric := 0;
+  v_committed        numeric := 0;
+  v_wallet_balance   numeric := 0;
+  v_required         numeric := 0;
+  v_existing_status  text;
+  v_existing_final   boolean;
+  v_existing_pay     text;
+  v_plan             jsonb := '[]'::jsonb;
+  v_order_id         uuid;
+  v_result_ids       jsonb := '[]'::jsonb;
+BEGIN
+  PERFORM internal.assert_subscription_access(p_subscription_id);
+
+  SELECT user_id INTO v_owner FROM public.subscriptions WHERE id = p_subscription_id;
+  IF v_owner IS DISTINCT FROM p_user_id THEN
+    RAISE EXCEPTION 'Subscription does not belong to this user';
+  END IF;
+
+  IF p_days IS NULL OR jsonb_typeof(p_days) <> 'array' THEN
+    RAISE EXCEPTION 'Days payload must be a JSON array';
+  END IF;
+
+  v_day_count := jsonb_array_length(p_days);
+  IF v_day_count = 0 THEN
+    RAISE EXCEPTION 'At least one day is required';
+  END IF;
+  IF v_day_count > 60 THEN
+    RAISE EXCEPTION 'Too many days in one batch (%). Maximum is 60', v_day_count;
+  END IF;
+
+  SELECT COALESCE(SUM(si.unit_price * si.quantity), 0)
+  INTO v_sub_base
+  FROM public.subscription_items si
+  WHERE si.subscription_id = p_subscription_id
+    AND si.is_active = true;
+
+  -- Pass 1: validate every day, compute the aggregate extra. No writes here.
+  FOR v_day IN SELECT * FROM jsonb_array_elements(p_days)
+  LOOP
+    v_delivery_date := NULLIF(v_day->>'delivery_date', '')::date;
+    v_items         := v_day->'items';
+
+    IF v_delivery_date IS NULL THEN
+      RAISE EXCEPTION 'Every day entry needs a delivery_date';
+    END IF;
+
+    IF v_delivery_date = ANY(v_seen_dates) THEN
+      RAISE EXCEPTION 'Duplicate delivery_date % in the same batch', v_delivery_date;
+    END IF;
+    v_seen_dates := v_seen_dates || v_delivery_date;
+
+    IF v_delivery_date < CURRENT_DATE THEN
+      RAISE EXCEPTION 'Cannot modify a delivery date in the past (%)', v_delivery_date;
+    END IF;
+
+    SELECT status, is_finalized, payment_status
+    INTO v_existing_status, v_existing_final, v_existing_pay
+    FROM public.subscription_daily_orders
+    WHERE subscription_id = p_subscription_id AND delivery_date = v_delivery_date
+    ORDER BY created_at DESC
+    LIMIT 1;
+
+    IF FOUND THEN
+      IF v_existing_final THEN
+        RAISE EXCEPTION 'The order for % is finalized and can no longer be modified', v_delivery_date;
+      END IF;
+      IF v_existing_status <> 'pending' THEN
+        RAISE EXCEPTION 'The order for % is % and can no longer be modified', v_delivery_date, v_existing_status;
+      END IF;
+      IF v_existing_pay = 'paid' THEN
+        RAISE EXCEPTION 'The order for % is already paid and can no longer be modified', v_delivery_date;
+      END IF;
+    END IF;
+
+    IF v_items IS NULL OR jsonb_typeof(v_items) <> 'array' OR jsonb_array_length(v_items) = 0 THEN
+      v_plan := v_plan || jsonb_build_object('delivery_date', v_delivery_date, 'revert', true);
+      CONTINUE;
+    END IF;
+
+    SELECT COALESCE(SUM(round(c.unit_price * c.quantity, 2)), 0)
+    INTO v_new_daily
+    FROM internal.normalize_cart(v_items) c;
+
+    IF v_new_daily <= 0 THEN
+      RAISE EXCEPTION 'Modified daily value for % must be greater than zero', v_delivery_date;
+    END IF;
+
+    v_extra := round(v_new_daily - v_sub_base, 2);
+    IF v_extra > 0 THEN
+      v_total_extra := v_total_extra + v_extra;
+    END IF;
+
+    v_plan := v_plan || jsonb_build_object(
+      'delivery_date', v_delivery_date, 'revert', false,
+      'items', v_items, 'new_daily', v_new_daily
+    );
+  END LOOP;
+
+  -- Aggregate wallet check, once, across the whole batch.
+  IF NOT p_is_admin AND v_total_extra > 0 THEN
+    SELECT COALESCE(wallet_balance, 0) INTO v_wallet_balance
+    FROM public.users WHERE id = p_user_id;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'User not found';
+    END IF;
+
+    v_committed := COALESCE(public.get_user_daily_commitment(p_user_id), 0);
+    v_required  := round(v_committed * 3 + v_total_extra, 2);
+
+    IF v_wallet_balance < v_required THEN
+      RAISE EXCEPTION
+        'Insufficient wallet balance (%). You need at least % (3 days of your subscriptions, %/day, plus % extra across % day(s) in this batch).',
+        v_wallet_balance, v_required, round(v_committed, 2), v_total_extra, v_day_count;
+    END IF;
+  END IF;
+
+  -- Pass 2: apply every day's change.
+  FOR v_day IN SELECT * FROM jsonb_array_elements(v_plan)
+  LOOP
+    v_delivery_date := (v_day->>'delivery_date')::date;
+
+    IF (v_day->>'revert')::boolean THEN
+      DELETE FROM public.subscription_daily_order_items
+      WHERE daily_order_id IN (
+        SELECT id FROM public.subscription_daily_orders
+        WHERE subscription_id = p_subscription_id
+          AND delivery_date = v_delivery_date
+          AND status = 'pending'
+          AND is_finalized = false
+          AND payment_status <> 'paid'
+      );
+
+      DELETE FROM public.subscription_daily_orders
+      WHERE subscription_id = p_subscription_id
+        AND delivery_date = v_delivery_date
+        AND status = 'pending'
+        AND is_finalized = false
+        AND payment_status <> 'paid';
+
+      v_result_ids := v_result_ids || jsonb_build_object('delivery_date', v_delivery_date, 'reverted', true);
+      CONTINUE;
+    END IF;
+
+    DELETE FROM public.subscription_daily_order_items
+    WHERE daily_order_id IN (
+      SELECT id FROM public.subscription_daily_orders
+      WHERE subscription_id = p_subscription_id AND delivery_date = v_delivery_date
+    );
+
+    DELETE FROM public.subscription_daily_orders
+    WHERE subscription_id = p_subscription_id AND delivery_date = v_delivery_date;
+
+    INSERT INTO public.subscription_daily_orders (
+      delivery_date, subscription_id, user_id, status, total_value,
+      payment_status, is_finalized, is_customer_modified, created_at
+    ) VALUES (
+      v_delivery_date, p_subscription_id, p_user_id, 'pending',
+      (v_day->>'new_daily')::numeric, 'pending', false, true, now()
+    ) RETURNING id INTO v_order_id;
+
+    INSERT INTO public.subscription_daily_order_items (
+      daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot,
+      unit_price, quantity, total_price, is_adhoc_addition
+    )
+    SELECT
+      v_order_id, c.variant_id, c.product_name, c.variant_label,
+      c.unit_price, c.quantity, round(c.unit_price * c.quantity, 2), false
+    FROM internal.normalize_cart(v_day->'items') c;
+
+    v_result_ids := v_result_ids || jsonb_build_object('delivery_date', v_delivery_date, 'order_id', v_order_id);
+  END LOOP;
+
+  RETURN jsonb_build_object('days', v_result_ids, 'total_extra', v_total_extra);
+END;
+$function$;
+
+
 -- money_checks_disabled ------------------------------------------------------
 -- Escape hatch for deliberate data repair: SET LOCAL hetha.skip_money_checks =
 -- 'on'. A session GUC, so it cannot be set through PostgREST by a client.
@@ -646,7 +855,8 @@ $function$;
 -- normalize_cart -------------------------------------------------------------
 -- The single parser/validator for cart payloads (accepts variant_id or
 -- variantId). UUID-format + whole-number-quantity (1–99) validation, duplicate
--- merge, and a join that rejects unknown / inactive / out-of-stock variants.
+-- merge, and a join that rejects unknown / inactive / out-of-stock / archived
+-- (migration 028) variants.
 -- Everything monetary (price, name, label, weight) comes from the catalog.
 CREATE OR REPLACE FUNCTION internal.normalize_cart(p_items jsonb)
  RETURNS TABLE(variant_id uuid, quantity integer, unit_price numeric, product_name text, variant_label text, weight_grams numeric, free_delivery boolean)
@@ -706,7 +916,8 @@ BEGIN
   JOIN public.product_variants pv ON pv.id = req.v_id
   JOIN public.products p          ON p.id  = pv.product_id
   WHERE COALESCE(pv.is_active, true) = true
-    AND COALESCE(p.in_stock, true)   = true;
+    AND COALESCE(p.in_stock, true)   = true
+    AND COALESCE(p.is_archived, false) = false;   -- migration 028
 
   IF v_matched <> v_expected THEN
     RAISE EXCEPTION 'One or more items are unavailable, inactive, or out of stock';

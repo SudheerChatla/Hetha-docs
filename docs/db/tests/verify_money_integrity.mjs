@@ -215,7 +215,12 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '023_register_device_token_rpc.sql',
                  '024_free_delivery_serviceable_pincodes.sql',
                  '025_day_edit_wallet_rule_and_subscription_scope.sql',
-                 '026_revert_daily_order_per_subscription.sql']) {
+                 '026_revert_daily_order_per_subscription.sql',
+                 '027_bulk_modify_daily_orders.sql',
+                 '028_product_archive_and_safe_delete.sql',
+                 '029_trim_product_names.sql',
+                 '030_cancel_subscription_cleanup.sql',
+                 '031_drop_2arg_revert_daily_order.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -751,11 +756,12 @@ await expectError('modify_daily_order for a past date rejected', () => asQuery({
   `SELECT public.modify_daily_order($1, $2, '2000-01-01'::date, $3::jsonb)`,
   [CUSTOMER, modSub, JSON.stringify([{ variant_id: VAR, quantity: 1 }])]), 'past');
 
-// (f) revert_daily_order clears the pending edit (owner only).
+// (f) revert_daily_order clears the pending edit (owner only). 3-arg form —
+//     the 2-arg version was dropped in migration 031.
 await expectError('cross-user revert_daily_order rejected', () => asQuery({ sub: OTHER, role: 'authenticated' },
-  `SELECT public.revert_daily_order($1, $2::date)`, [CUSTOMER, MOD_DATE]), 'not authorized');
+  `SELECT public.revert_daily_order($1, $2::date, $3::uuid)`, [CUSTOMER, MOD_DATE, modSub]), 'not authorized');
 await asQuery({ sub: CUSTOMER, role: 'authenticated' },
-  `SELECT public.revert_daily_order($1, $2::date)`, [CUSTOMER, MOD_DATE]);
+  `SELECT public.revert_daily_order($1, $2::date, $3::uuid)`, [CUSTOMER, MOD_DATE, modSub]);
 const afterRevert = (await db.query(
   `SELECT COUNT(*)::int AS c FROM public.subscription_daily_orders WHERE user_id = $1 AND delivery_date = $2`,
   [CUSTOMER, MOD_DATE])).rows[0].c;
@@ -769,9 +775,9 @@ if (afterRevert === 0) {
 const modGrants = (await db.query(`
   SELECT
     has_function_privilege('anon','public.modify_daily_order(uuid,uuid,date,jsonb)','EXECUTE')          AS anon_modify,
-    has_function_privilege('anon','public.revert_daily_order(uuid,date)','EXECUTE')                     AS anon_revert,
+    has_function_privilege('anon','public.revert_daily_order(uuid,date,uuid)','EXECUTE')                AS anon_revert,
     has_function_privilege('authenticated','public.modify_daily_order(uuid,uuid,date,jsonb)','EXECUTE') AS auth_modify,
-    has_function_privilege('authenticated','public.revert_daily_order(uuid,date)','EXECUTE')            AS auth_revert`)).rows[0];
+    has_function_privilege('authenticated','public.revert_daily_order(uuid,date,uuid)','EXECUTE')       AS auth_revert`)).rows[0];
 if (modGrants.anon_modify === false && modGrants.anon_revert === false
     && modGrants.auth_modify === true && modGrants.auth_revert === true) {
   ok('daily-order RPCs: anon blocked, authenticated allowed');
@@ -1052,6 +1058,278 @@ if (revertGrants.anon_ok === false && revertGrants.auth_ok === true) {
   ok('3-arg revert_daily_order: anon blocked, authenticated allowed');
 } else {
   bad('3-arg revert grants', JSON.stringify(revertGrants));
+}
+
+// ---------------------------------------------------------------------------
+// 6z. Atomic bulk day-edit RPC (migration 027).
+//     modify_daily_orders_bulk must (a) check the wallet ONCE against the SUM
+//     of every day's one-off extra in the batch, not per day against the same
+//     stored balance, and (b) apply every day or none — a bad day anywhere in
+//     the batch must leave every other day exactly as it was.
+// ---------------------------------------------------------------------------
+const bulkGrants = (await db.query(`
+  SELECT
+    has_function_privilege('anon','public.modify_daily_orders_bulk(uuid,uuid,jsonb)','EXECUTE')          AS anon_ok,
+    has_function_privilege('authenticated','public.modify_daily_orders_bulk(uuid,uuid,jsonb)','EXECUTE') AS auth_ok`)).rows[0];
+if (bulkGrants.anon_ok === false && bulkGrants.auth_ok === true) {
+  ok('modify_daily_orders_bulk: anon blocked, authenticated allowed');
+} else {
+  bad('modify_daily_orders_bulk grants', JSON.stringify(bulkGrants));
+}
+
+// Clean slate on modSub for these dates (each 1 × VAR = ₹100/day normal cost).
+const BULK_DATES = ['2099-03-01', '2099-03-02', '2099-03-03'];
+await db.query(`DELETE FROM public.subscription_daily_order_items WHERE daily_order_id IN
+  (SELECT id FROM public.subscription_daily_orders WHERE subscription_id = $1 AND delivery_date = ANY($2::date[]))`,
+  [modSub, BULK_DATES]);
+await db.query(`DELETE FROM public.subscription_daily_orders WHERE subscription_id = $1 AND delivery_date = ANY($2::date[])`,
+  [modSub, BULK_DATES]);
+
+const bulkCommitment = Number((await db.query(
+  `SELECT public.get_user_daily_commitment($1) AS c`, [CUSTOMER])).rows[0].c);
+
+// Each day raised to 5 × VAR = ₹500 → extra ₹400/day. Across 3 days: ₹1200 total.
+const bulkDaysPayload = (extraDays) => JSON.stringify(
+  BULK_DATES.slice(0, extraDays).map((d) => ({ delivery_date: d, items: [{ variant_id: VAR, quantity: 5 }] })));
+
+const totalExtraFor3 = 400 * 3;
+const bulkRequired3 = Math.round((bulkCommitment * 3 + totalExtraFor3) * 100) / 100;
+// A per-day-only check (022/025's OLD behaviour re-applied 3 times) would have
+// passed at (commitment*3 + 400) for each call; this must refuse below the
+// AGGREGATE requirement even though it's above any single day's requirement.
+const perDayOnlyRequired = Math.round((bulkCommitment * 3 + 400) * 100) / 100;
+
+await db.exec(`UPDATE public.users SET wallet_balance = ${perDayOnlyRequired} WHERE id = '${CUSTOMER}'`);
+await expectError(
+  `bulk edit refused when wallet (${perDayOnlyRequired}) covers only ONE day's extra but the batch has 3 (needs ${bulkRequired3})`,
+  () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_orders_bulk($1, $2, $3::jsonb)`,
+    [CUSTOMER, modSub, bulkDaysPayload(3)]),
+  'Insufficient wallet balance');
+
+// Nothing should have been written for ANY of the 3 days after the refusal.
+const afterRefusal = (await db.query(
+  `SELECT COUNT(*)::int AS c FROM public.subscription_daily_orders
+   WHERE subscription_id = $1 AND delivery_date = ANY($2::date[])`,
+  [modSub, BULK_DATES])).rows[0].c;
+if (afterRefusal === 0) {
+  ok('bulk edit refusal is atomic: zero days written when the aggregate wallet check fails');
+} else {
+  bad('bulk edit atomicity on wallet refusal', `expected 0 rows, found ${afterRefusal}`);
+}
+
+// Fund exactly the aggregate requirement — must now succeed for all 3 days.
+await db.exec(`UPDATE public.users SET wallet_balance = ${bulkRequired3} WHERE id = '${CUSTOMER}'`);
+const bulkResult = (await asQuery(CUST_CLAIMS,
+  `SELECT public.modify_daily_orders_bulk($1, $2, $3::jsonb) AS r`,
+  [CUSTOMER, modSub, bulkDaysPayload(3)])).rows[0].r;
+const writtenDates = (await db.query(
+  `SELECT delivery_date::text AS d, total_value FROM public.subscription_daily_orders
+   WHERE subscription_id = $1 AND delivery_date = ANY($2::date[]) ORDER BY delivery_date`,
+  [modSub, BULK_DATES])).rows;
+const allThreeWritten = writtenDates.length === 3 && writtenDates.every((r) => Number(r.total_value) === 500);
+const reportedExtra = Number(bulkResult.total_extra) === totalExtraFor3;
+if (allThreeWritten && reportedExtra) {
+  ok(`bulk edit funded at the AGGREGATE requirement (${bulkRequired3}) applies all 3 days, total_extra=${totalExtraFor3} reported`);
+} else {
+  bad('bulk edit aggregate success', JSON.stringify({ writtenDates, bulkResult }));
+}
+
+// Non-atomicity check: a batch with one invalid day (past date) must leave
+// every valid day in the SAME batch untouched too.
+await db.query(`DELETE FROM public.subscription_daily_order_items WHERE daily_order_id IN
+  (SELECT id FROM public.subscription_daily_orders WHERE subscription_id = $1 AND delivery_date = ANY($2::date[]))`,
+  [modSub, BULK_DATES]);
+await db.query(`DELETE FROM public.subscription_daily_orders WHERE subscription_id = $1 AND delivery_date = ANY($2::date[])`,
+  [modSub, BULK_DATES]);
+await db.query(`UPDATE public.users SET wallet_balance = 100000 WHERE id = $1`, [CUSTOMER]);
+
+const mixedBatch = JSON.stringify([
+  { delivery_date: BULK_DATES[0], items: [{ variant_id: VAR, quantity: 2 }] },
+  { delivery_date: '2020-01-01', items: [{ variant_id: VAR, quantity: 2 }] },  // invalid: in the past
+  { delivery_date: BULK_DATES[1], items: [{ variant_id: VAR, quantity: 2 }] },
+]);
+await expectError('bulk edit refuses a batch containing a past date',
+  () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_orders_bulk($1, $2, $3::jsonb)`,
+    [CUSTOMER, modSub, mixedBatch]),
+  'past');
+
+const afterMixedFailure = (await db.query(
+  `SELECT COUNT(*)::int AS c FROM public.subscription_daily_orders
+   WHERE subscription_id = $1 AND delivery_date = ANY($2::date[])`,
+  [modSub, [BULK_DATES[0], BULK_DATES[1]]])).rows[0].c;
+if (afterMixedFailure === 0) {
+  ok('one invalid day in a bulk batch rolls back the OTHER valid days too (no partial apply)');
+} else {
+  bad('bulk edit atomicity with a mixed valid/invalid batch', `expected 0 rows for the valid dates, found ${afterMixedFailure}`);
+}
+
+await db.exec(`UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}'`);
+
+// ---------------------------------------------------------------------------
+// 7a. Product archive + atomic delete (migration 028).
+// ---------------------------------------------------------------------------
+await db.query(
+  `INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'products:edit')`, [roleId]);
+const ADMIN_CLAIMS = { sub: ADMIN, role: 'authenticated' };
+
+const prodGrants = (await db.query(`
+  SELECT
+    has_function_privilege('anon','public.delete_product(uuid)','EXECUTE')                          AS anon_del,
+    has_function_privilege('anon','public.set_product_archived(uuid,boolean)','EXECUTE')            AS anon_arch,
+    has_function_privilege('authenticated','public.delete_product(uuid)','EXECUTE')                 AS auth_del,
+    has_function_privilege('authenticated','public.set_product_archived(uuid,boolean)','EXECUTE')   AS auth_arch`)).rows[0];
+if (!prodGrants.anon_del && !prodGrants.anon_arch && prodGrants.auth_del && prodGrants.auth_arch) {
+  ok('delete_product / set_product_archived: anon blocked, authenticated allowed');
+} else {
+  bad('product RPC grants', JSON.stringify(prodGrants));
+}
+
+await expectError('customer cannot delete a product',
+  () => asQuery(CUST_CLAIMS, `SELECT public.delete_product($1)`, [PROD]), 'Not authorized');
+await expectError('customer cannot archive a product',
+  () => asQuery(CUST_CLAIMS, `SELECT public.set_product_archived($1, true)`, [PROD]), 'Not authorized');
+
+// PROD (Cow Milk) has order lines from earlier tests. Deleting it must be
+// refused WITHOUT touching its images — the old route lost them first.
+await db.query(`INSERT INTO public.product_images (product_id, image_url) VALUES ($1, 'milk.png')`, [PROD]);
+await expectError('product with order history cannot be deleted',
+  () => asQuery(ADMIN_CLAIMS, `SELECT public.delete_product($1)`, [PROD]), 'has history');
+const milkLeft = (await db.query(`
+  SELECT (SELECT COUNT(*)::int FROM public.products WHERE id = $1)            AS p,
+         (SELECT COUNT(*)::int FROM public.product_variants WHERE product_id = $1) AS v,
+         (SELECT COUNT(*)::int FROM public.product_images WHERE product_id = $1)   AS i`, [PROD])).rows[0];
+if (milkLeft.p === 1 && milkLeft.v === 1 && milkLeft.i === 1) {
+  ok('refused delete changed nothing: product, variant and image all still there');
+} else {
+  bad('refused delete left partial state', JSON.stringify(milkLeft));
+}
+
+// PROD is in active subscriptions → archiving it is refused.
+await expectError('archiving a product that active subscriptions deliver is refused',
+  () => asQuery(ADMIN_CLAIMS, `SELECT public.set_product_archived($1, true)`, [PROD]), 'active subscription');
+
+// A product nobody ever ordered: delete removes cart rows, images, variants
+// and the product together.
+const P2 = 'a2a2a2a2-0000-4000-8000-000000000002', V2 = 'b2b2b2b2-0000-4000-8000-000000000002';
+await db.exec(`
+  INSERT INTO public.products (id, category_id, name, in_stock, delivery_scope) VALUES ('${P2}', '${CAT}', 'Test Curd', true, 'all_india');
+  INSERT INTO public.product_variants (id, product_id, label, price, weight_grams, is_active) VALUES ('${V2}', '${P2}', '500 g', 60, 500, true);
+  INSERT INTO public.product_images (product_id, image_url) VALUES ('${P2}', 'curd.png');
+  INSERT INTO public.cart_items (user_id, variant_id, quantity) VALUES ('${CUSTOMER}', '${V2}', 1);
+`);
+await expectOk('product with no history is deleted', () =>
+  asQuery(ADMIN_CLAIMS, `SELECT public.delete_product($1)`, [P2]));
+const curdLeft = (await db.query(`
+  SELECT (SELECT COUNT(*)::int FROM public.products WHERE id = $1)
+       + (SELECT COUNT(*)::int FROM public.product_variants WHERE product_id = $1)
+       + (SELECT COUNT(*)::int FROM public.product_images WHERE product_id = $1)
+       + (SELECT COUNT(*)::int FROM public.cart_items WHERE variant_id = $2) AS n`, [P2, V2])).rows[0].n;
+if (curdLeft === 0) {
+  ok('delete removed the product with its variants, images and cart rows');
+} else {
+  bad('delete_product cleanup', `${curdLeft} rows remain`);
+}
+
+// Archive: hidden from checkout, cleared from carts, restorable.
+const P3 = 'a3a3a3a3-0000-4000-8000-000000000003', V3 = 'b3b3b3b3-0000-4000-8000-000000000003';
+await db.exec(`
+  INSERT INTO public.products (id, category_id, name, in_stock, delivery_scope) VALUES ('${P3}', '${CAT}', 'Test Paneer', true, 'all_india');
+  INSERT INTO public.product_variants (id, product_id, label, price, weight_grams, is_active) VALUES ('${V3}', '${P3}', '200 g', 90, 200, true);
+  INSERT INTO public.cart_items (user_id, variant_id, quantity) VALUES ('${CUSTOMER}', '${V3}', 2);
+`);
+const PANEER_CART = JSON.stringify([{ variant_id: V3, quantity: 1 }]);
+await expectOk('archive a product with no active subscriptions', () =>
+  asQuery(ADMIN_CLAIMS, `SELECT public.set_product_archived($1, true)`, [P3]));
+await expectError('archived product is refused at checkout (normalize_cart)',
+  () => asQuery(CUST_CLAIMS, `SELECT public.quote_cart($1::jsonb)`, [PANEER_CART]), 'unavailable');
+const paneerCart = (await db.query(
+  `SELECT COUNT(*)::int AS c FROM public.cart_items WHERE variant_id = $1`, [V3])).rows[0].c;
+if (paneerCart === 0) {
+  ok('archiving removed the product from customer carts');
+} else {
+  bad('archive cart cleanup', `${paneerCart} cart rows remain`);
+}
+await asQuery(ADMIN_CLAIMS, `SELECT public.set_product_archived($1, false)`, [P3]);
+await expectOk('restored product can be quoted again', () =>
+  asQuery(CUST_CLAIMS, `SELECT public.quote_cart($1::jsonb)`, [PANEER_CART]));
+
+// ---------------------------------------------------------------------------
+// 7b. Name trim (migration 029) — re-run the migration over a dirty row.
+// ---------------------------------------------------------------------------
+await db.query(`UPDATE public.products SET name = '  Honey ' WHERE id = $1`, [P3]);
+await db.exec(read(`${ROOT}/migrations/029_trim_product_names.sql`));
+const trimmed = (await db.query(`SELECT name FROM public.products WHERE id = $1`, [P3])).rows[0].name;
+if (trimmed === 'Honey') {
+  ok('migration 029 trims product names ("  Honey " → "Honey")');
+} else {
+  bad('name trim', JSON.stringify(trimmed));
+}
+
+// ---------------------------------------------------------------------------
+// 7c. cancel_subscription removes the cancelled subscription's leftover
+//     orders after its end date — and nothing else (migration 030).
+// ---------------------------------------------------------------------------
+const cSub = (await asQuery(CUST_CLAIMS,
+  `SELECT public.create_subscription($1, now(), NULL, 'active', $2::jsonb, $3::jsonb, 'CancelTest') AS id`,
+  [CUSTOMER, JSON.stringify({ pincode: '600001', name: 'Cust', phoneNumber: '9000000001' }),
+   JSON.stringify([{ variantId: VAR, name: 'x', variant: 'y', price: 1, quantity: 1, startDate: '2026-07-28' }])])).rows[0].id;
+const ONE_ITEM = JSON.stringify([{ variant_id: VAR, quantity: 1 }]);
+for (const d of ['2099-05-01', '2099-05-10']) {
+  await asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`, [CUSTOMER, cSub, d, ONE_ITEM]);
+}
+// Another subscription's order on 2099-05-10 must survive.
+await db.exec(`
+  BEGIN;
+  WITH o AS (
+    INSERT INTO public.subscription_daily_orders (delivery_date, subscription_id, user_id, status, total_value)
+    VALUES ('2099-05-10', '${modSub}', '${CUSTOMER}', 'pending', 100) RETURNING id
+  )
+  INSERT INTO public.subscription_daily_order_items
+    (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+  SELECT id, '${VAR}', 'Cow Milk', '1 L', 100, 1, 100 FROM o;
+  COMMIT;
+`);
+
+await expectError('another user cannot cancel this subscription',
+  () => asQuery({ sub: OTHER, role: 'authenticated' },
+    `SELECT public.cancel_subscription($1, $2, '2099-05-05'::timestamptz, false, 'scheduled', NULL)`, [cSub, CUSTOMER]),
+  'Not authorized');
+
+await asQuery(CUST_CLAIMS,
+  `SELECT public.cancel_subscription($1, $2, '2099-05-05'::timestamptz, false, 'scheduled', NULL)`, [cSub, CUSTOMER]);
+const cancelDays = (await db.query(`
+  SELECT subscription_id::text AS s, delivery_date::text AS d FROM public.subscription_daily_orders
+  WHERE user_id = $1 AND delivery_date IN ('2099-05-01', '2099-05-10') ORDER BY d, s`, [CUSTOMER])).rows;
+const keptBeforeEnd = cancelDays.some((r) => r.s === cSub && r.d === '2099-05-01');
+const droppedAfterEnd = !cancelDays.some((r) => r.s === cSub && r.d === '2099-05-10');
+const otherSubKept = cancelDays.some((r) => r.s === modSub && r.d === '2099-05-10');
+if (keptBeforeEnd && droppedAfterEnd && otherSubKept) {
+  ok('scheduled cancel drops this subscription\'s edited day after end_date, keeps the day before it and other subscriptions\' orders');
+} else {
+  bad('cancel cleanup', JSON.stringify(cancelDays));
+}
+
+await asQuery(CUST_CLAIMS,
+  `SELECT public.cancel_subscription($1, $2, now(), true, 'immediate', NULL)`, [cSub, CUSTOMER]);
+const afterImmediate = (await db.query(
+  `SELECT COUNT(*)::int AS c FROM public.subscription_daily_orders WHERE subscription_id = $1 AND delivery_date > CURRENT_DATE`,
+  [cSub])).rows[0].c;
+if (afterImmediate === 0) {
+  ok('immediate cancel drops every future pending order of that subscription');
+} else {
+  bad('immediate cancel cleanup', `${afterImmediate} future orders remain`);
+}
+
+// ---------------------------------------------------------------------------
+// 7d. Only the per-subscription revert_daily_order remains (migration 031).
+// ---------------------------------------------------------------------------
+const revertSigs = (await db.query(`
+  SELECT p.oid::regprocedure::text AS sig FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'public' AND p.proname = 'revert_daily_order'`)).rows.map((r) => r.sig);
+if (revertSigs.length === 1 && revertSigs[0] === 'revert_daily_order(uuid,date,uuid)') {
+  ok('2-arg revert_daily_order dropped; only revert_daily_order(uuid,date,uuid) remains');
+} else {
+  bad('revert_daily_order signatures', JSON.stringify(revertSigs));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

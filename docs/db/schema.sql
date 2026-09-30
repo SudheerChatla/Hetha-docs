@@ -346,6 +346,7 @@ CREATE TABLE public.products (
   delivery_scope text NOT NULL DEFAULT 'local' CHECK (delivery_scope IN ('local', 'all_india')),
   is_default_sub boolean DEFAULT false,
   is_additional_sub boolean DEFAULT false,
+  is_archived boolean NOT NULL DEFAULT false, -- migration 028: retired; hidden from customers, refused by normalize_cart
   created_at timestamp without time zone DEFAULT now(),
   updated_at timestamp without time zone DEFAULT now(),
   CONSTRAINT products_pkey PRIMARY KEY (id),
