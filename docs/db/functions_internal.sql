@@ -1232,3 +1232,31 @@ AS $$
   WHERE p.pincode = p_pincode AND a.is_active
   LIMIT 1;
 $$;
+
+
+-- normalize_phone_10 ---------------------------------------------------------
+-- 10-digit national form of an Indian phone (strips +91 / spaces). NULL if not
+-- 10 digits. Used by claim_adhoc_user for matching (migration 032).
+CREATE OR REPLACE FUNCTION internal.normalize_phone_10(p_raw text)
+ RETURNS text
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+DECLARE
+  v_digits text;
+BEGIN
+  IF p_raw IS NULL THEN
+    RETURN NULL;
+  END IF;
+  v_digits := regexp_replace(p_raw, '[^0-9]', '', 'g');
+  IF length(v_digits) = 12 AND v_digits LIKE '91%' THEN
+    v_digits := right(v_digits, 10);
+  END IF;
+  IF length(v_digits) = 10 THEN
+    RETURN v_digits;
+  END IF;
+  RETURN NULL;  -- invalid / unknown format
+END;
+$function$;
+
+-- Drop

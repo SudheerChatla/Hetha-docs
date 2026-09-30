@@ -220,7 +220,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '028_product_archive_and_safe_delete.sql',
                  '029_trim_product_names.sql',
                  '030_cancel_subscription_cleanup.sql',
-                 '031_drop_2arg_revert_daily_order.sql']) {
+                 '031_drop_2arg_revert_daily_order.sql',
+                 '032_claim_adhoc_user_hardening.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -1331,6 +1332,272 @@ if (revertSigs.length === 1 && revertSigs[0] === 'revert_daily_order(uuid,date,u
 } else {
   bad('revert_daily_order signatures', JSON.stringify(revertSigs));
 }
+
+// ---------------------------------------------------------------------------
+// 7e. claim_adhoc_user hardening (migration 032).
+//     Fixes phone spoofing: email-only JWTs can no longer claim a victim's
+//     ad-hoc row by passing the victim's phone in p_phone.
+// ---------------------------------------------------------------------------
+
+// Setup: create a victim ad-hoc customer with a phone and wallet.
+const VICTIM_ADHOC     = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+const VICTIM_PHONE     = '9876500001';
+const VICTIM_WALLET    = 777;
+const ATTACKER_AUTH_ID = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${VICTIM_ADHOC}', '${ATTACKER_AUTH_ID}');
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${VICTIM_ADHOC}', NULL, '${VICTIM_PHONE}', ${VICTIM_WALLET}, true, 'Victim');
+`);
+
+// (a) Attacker with email-only JWT passes victim's phone in p_phone → no claim.
+//     Attacker gets a fresh row; victim row still is_adhoc with its wallet.
+await asQuery(
+  { sub: ATTACKER_AUTH_ID, role: 'authenticated', email: 'attacker@evil.com' },
+  `SELECT public.claim_adhoc_user($1, NULL, $2, 'Attacker', NULL)`,
+  [ATTACKER_AUTH_ID, VICTIM_PHONE]);
+const attackerRow = (await db.query(
+  `SELECT id, is_adhoc, wallet_balance FROM public.users WHERE id = $1`, [ATTACKER_AUTH_ID])).rows[0];
+const victimAfterAttack = (await db.query(
+  `SELECT id, phone, wallet_balance, is_adhoc FROM public.users WHERE id = $1`, [VICTIM_ADHOC])).rows[0];
+
+if (attackerRow && attackerRow.is_adhoc === false && Number(attackerRow.wallet_balance) === 0
+    && victimAfterAttack && victimAfterAttack.is_adhoc === true
+    && Number(victimAfterAttack.wallet_balance) === VICTIM_WALLET
+    && victimAfterAttack.phone === VICTIM_PHONE) {
+  ok('attacker with email-only JWT passing victim phone → gets fresh row; victim ad-hoc row untouched');
+} else {
+  bad('phone spoofing protection', JSON.stringify({ attackerRow, victimAfterAttack }));
+}
+
+// (b) Customer whose JWT email matches an ad-hoc row → claimed, wallet carried over.
+const EMAIL_ADHOC = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const EMAIL_CLAIM = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+const ADHOC_EMAIL = 'adhoc@example.com';
+const ADHOC_WALLET = 555;
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${EMAIL_ADHOC}', '${EMAIL_CLAIM}');
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${EMAIL_ADHOC}', '${ADHOC_EMAIL}', NULL, ${ADHOC_WALLET}, true, 'AdHocEmail');
+`);
+
+await asQuery(
+  { sub: EMAIL_CLAIM, role: 'authenticated', email: ADHOC_EMAIL },
+  `SELECT public.claim_adhoc_user($1, $2, NULL, 'Claimed', 'User')`,
+  [EMAIL_CLAIM, ADHOC_EMAIL]);
+const emailClaimedRow = (await db.query(
+  `SELECT id, email, is_adhoc, wallet_balance FROM public.users WHERE id = $1`, [EMAIL_CLAIM])).rows[0];
+const emailOldRow = (await db.query(
+  `SELECT id FROM public.users WHERE id = $1`, [EMAIL_ADHOC])).rows[0];
+
+if (emailClaimedRow && emailClaimedRow.is_adhoc === false
+    && emailClaimedRow.email.toLowerCase() === ADHOC_EMAIL.toLowerCase()
+    && Number(emailClaimedRow.wallet_balance) === ADHOC_WALLET
+    && !emailOldRow) {
+  ok('JWT email matches ad-hoc row → claimed, wallet carried over');
+} else {
+  bad('email claim', JSON.stringify({ emailClaimedRow, emailOldRow }));
+}
+
+// (c) JWT phone '919876500001' matches ad-hoc phone '9876500001' → claimed.
+const PHONE_ADHOC = 'cccccccc-dddd-4eee-8fff-aaaaaaaaaaaa';
+const PHONE_CLAIM = 'dddddddd-eeee-4fff-8aaa-bbbbbbbbbbbb';
+const ADHOC_PHONE_10 = '9876500002';
+const ADHOC_PHONE_WALLET = 333;
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${PHONE_ADHOC}', '${PHONE_CLAIM}');
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${PHONE_ADHOC}', NULL, '${ADHOC_PHONE_10}', ${ADHOC_PHONE_WALLET}, true, 'PhoneAdhoc');
+`);
+
+await asQuery(
+  { sub: PHONE_CLAIM, role: 'authenticated', phone: '91' + ADHOC_PHONE_10 },
+  `SELECT public.claim_adhoc_user($1, NULL, '91${ADHOC_PHONE_10}', NULL, NULL)`,
+  [PHONE_CLAIM]);
+const phoneClaimedRow = (await db.query(
+  `SELECT id, is_adhoc, wallet_balance FROM public.users WHERE id = $1`, [PHONE_CLAIM])).rows[0];
+const phoneOldRow = (await db.query(
+  `SELECT id FROM public.users WHERE id = $1`, [PHONE_ADHOC])).rows[0];
+
+if (phoneClaimedRow && phoneClaimedRow.is_adhoc === false
+    && Number(phoneClaimedRow.wallet_balance) === ADHOC_PHONE_WALLET
+    && !phoneOldRow) {
+  ok('JWT phone 91XXXXXXXXXX matches ad-hoc phone XXXXXXXXXX → claimed');
+} else {
+  bad('phone normalisation claim', JSON.stringify({ phoneClaimedRow, phoneOldRow }));
+}
+
+// (d) Two ad-hoc rows: one matches by email, one by phone (different identities)
+//     → JWT with email only finds exactly one match → claimed.
+//     This test confirms that when only ONE row matches, it is claimed.
+const DUP_ADHOC_EMAIL = 'eeeeeeee-ffff-4aaa-8bbb-cccccccccccc';
+const DUP_CLAIM_EMAIL = 'aaaabbbb-cccc-4ddd-8eee-ffffffffffff';
+const DUP_EMAIL_VAL = 'dupclaim@example.com';
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${DUP_ADHOC_EMAIL}', '${DUP_CLAIM_EMAIL}');
+  DELETE FROM public.users WHERE email = '${DUP_EMAIL_VAL}';
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${DUP_ADHOC_EMAIL}', '${DUP_EMAIL_VAL}', NULL, 100, true, 'AdhocEmail');
+`);
+
+await asQuery(
+  { sub: DUP_CLAIM_EMAIL, role: 'authenticated', email: DUP_EMAIL_VAL },
+  `SELECT public.claim_adhoc_user($1, $2, NULL, 'Claimed', NULL)`,
+  [DUP_CLAIM_EMAIL, DUP_EMAIL_VAL]);
+const dupClaimedRow = (await db.query(
+  `SELECT id, is_adhoc, wallet_balance FROM public.users WHERE id = $1`, [DUP_CLAIM_EMAIL])).rows[0];
+const dupOldRow = (await db.query(
+  `SELECT id FROM public.users WHERE id = $1`, [DUP_ADHOC_EMAIL])).rows[0];
+
+if (dupClaimedRow && dupClaimedRow.is_adhoc === false
+    && Number(dupClaimedRow.wallet_balance) === 100
+    && !dupOldRow) {
+  ok('exactly one ad-hoc matches JWT email → claimed (old row gone, wallet transferred)');
+} else {
+  bad('single email match claim', JSON.stringify({ dupClaimedRow, dupOldRow }));
+}
+
+// (e) Service role with p_adhoc_id claims exactly that row even when there's ambiguity.
+//     Two ad-hoc rows with same email (not possible in real schema, but let's use different phones).
+const SVC_ADHOC_1 = 'bbbbcccc-dddd-4eee-8fff-aaaaaaaaaaaa';
+const SVC_ADHOC_2 = 'ccccdddd-eeee-4fff-8aaa-bbbbbbbbbbbb';
+const SVC_AUTH = 'ddddeeee-ffff-4aaa-8bbb-cccccccccccc';
+const SVC_PHONE_1 = '9876500004';
+const SVC_PHONE_2 = '9876500007';
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${SVC_ADHOC_1}', '${SVC_ADHOC_2}', '${SVC_AUTH}');
+  DELETE FROM public.users WHERE phone IN ('${SVC_PHONE_1}', '${SVC_PHONE_2}');
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${SVC_ADHOC_1}', 'svc1@example.com', '${SVC_PHONE_1}', 111, true, 'Svc1'),
+         ('${SVC_ADHOC_2}', 'svc2@example.com', '${SVC_PHONE_2}', 222, true, 'Svc2');
+`);
+
+await asQuery({ role: 'service_role' },
+  `SELECT public.claim_adhoc_user($1, 'svc1@example.com', $2, 'Converted', NULL, $3)`,
+  [SVC_AUTH, SVC_PHONE_1, SVC_ADHOC_1]);
+const svcClaimedRow = (await db.query(
+  `SELECT id, is_adhoc, wallet_balance FROM public.users WHERE id = $1`, [SVC_AUTH])).rows[0];
+const svcOtherRow = (await db.query(
+  `SELECT id, is_adhoc FROM public.users WHERE id = $1`, [SVC_ADHOC_2])).rows[0];
+
+if (svcClaimedRow && svcClaimedRow.is_adhoc === false
+    && Number(svcClaimedRow.wallet_balance) === 111
+    && svcOtherRow && svcOtherRow.is_adhoc === true) {
+  ok('service role with p_adhoc_id claims exactly that row; other ad-hoc rows untouched');
+} else {
+  bad('service p_adhoc_id claim', JSON.stringify({ svcClaimedRow, svcOtherRow }));
+}
+
+// (f) Service role p_adhoc_id on a non-adhoc row → error.
+await expectError('service p_adhoc_id on non-adhoc row → error',
+  () => asQuery({ role: 'service_role' },
+    `SELECT public.claim_adhoc_user($1, 'x@example.com', NULL, NULL, NULL, $2)`,
+    ['eeeeffff-aaaa-4bbb-8ccc-dddddddddddd', SVC_AUTH]),  // SVC_AUTH is now non-adhoc
+  'already an app user');
+
+// (g) Service role without p_adhoc_id when matching returns more than one row.
+//     We simulate this by having two adhoc rows match on the same email (one by email, one by email).
+//     But that's not possible with unique email. Instead test: service provides an email that matches
+//     one ad-hoc, it claims it.
+const SVC_AMB_1 = 'ffffaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+const SVC_AMB_EMAIL = 'amb@x.com';
+await db.exec(`
+  DELETE FROM public.users WHERE id = '${SVC_AMB_1}';
+  DELETE FROM public.users WHERE email = '${SVC_AMB_EMAIL}';
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc)
+  VALUES ('${SVC_AMB_1}', '${SVC_AMB_EMAIL}', NULL, 10, true);
+`);
+
+// Service with exactly one match (no p_adhoc_id) should claim it
+const svcAmbAuth = 'bbbbcccc-dddd-4eee-8fff-111111111111';
+await asQuery({ role: 'service_role' },
+  `SELECT public.claim_adhoc_user($1, $2, NULL, NULL, NULL, NULL)`,
+  [svcAmbAuth, SVC_AMB_EMAIL]);
+const svcAmbClaimed = (await db.query(
+  `SELECT id, is_adhoc, wallet_balance FROM public.users WHERE id = $1`, [svcAmbAuth])).rows[0];
+if (svcAmbClaimed && svcAmbClaimed.is_adhoc === false && Number(svcAmbClaimed.wallet_balance) === 10) {
+  ok('service role without p_adhoc_id + exactly one match → claims the row');
+} else {
+  bad('service single match claim', JSON.stringify(svcAmbClaimed));
+}
+
+// (h) p_adhoc_id from an authenticated (non-service) caller → Not authorized.
+await expectError('p_adhoc_id from authenticated caller → Not authorized',
+  () => asQuery({ sub: CUSTOMER, role: 'authenticated', email: 'cust@example.com' },
+    `SELECT public.claim_adhoc_user($1, 'cust@example.com', NULL, NULL, NULL, $2)`,
+    [CUSTOMER, VICTIM_ADHOC]),
+  'Not authorized');
+
+// (i) anon cannot execute.
+const anonClaimGrant = (await db.query(
+  `SELECT has_function_privilege('anon', 'public.claim_adhoc_user(uuid,text,text,text,text,uuid)', 'EXECUTE') AS ok`)).rows[0].ok;
+if (anonClaimGrant === false) {
+  ok('anon cannot execute claim_adhoc_user');
+} else {
+  bad('anon claim_adhoc_user grant', `expected false, got ${anonClaimGrant}`);
+}
+
+// (j) service claim where email collides with an existing app user → unique_violation.
+const EXISTING_APP_USER = 'ccccdddd-eeee-4fff-8111-222222222222';
+const COLLISION_ADHOC = 'ddddeeee-ffff-4aaa-8222-333333333333';
+const COLLISION_AUTH = 'eeeeffff-aaaa-4bbb-8333-444444444444';
+const COLLISION_EMAIL = 'collision@example.com';
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${EXISTING_APP_USER}', '${COLLISION_ADHOC}', '${COLLISION_AUTH}');
+  DELETE FROM public.users WHERE email = '${COLLISION_EMAIL}';
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc)
+  VALUES ('${EXISTING_APP_USER}', '${COLLISION_EMAIL}', NULL, 0, false),
+         ('${COLLISION_ADHOC}', 'otheremail@example.com', '9876500006', 50, true);
+`);
+
+await expectError('service claim where email collides with existing app user → unique_violation',
+  () => asQuery({ role: 'service_role' },
+    `SELECT public.claim_adhoc_user($1, $2, '9876500006', NULL, NULL, $3)`,
+    [COLLISION_AUTH, COLLISION_EMAIL, COLLISION_ADHOC]),
+  'Another account already exists');
+
+// (k) Email and phone point at DIFFERENT ad-hoc rows → the email row (the
+//     verified identity) is claimed; the phone row stays ad-hoc.
+const AMB_A = 'abababab-abab-4bab-8bab-abababababab';
+const AMB_B = 'bcbcbcbc-bcbc-4cbc-8cbc-bcbcbcbcbcbc';
+const AMB_AUTH = 'cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd';
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${AMB_A}', '${AMB_B}', '${AMB_AUTH}');
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${AMB_A}', 'both@example.com', NULL, 40, true, 'ByEmail'),
+         ('${AMB_B}', NULL, '9876500099', 60, true, 'ByPhone');
+`);
+await asQuery({ sub: AMB_AUTH, role: 'authenticated', email: 'both@example.com', phone: '919876500099' },
+  `SELECT public.claim_adhoc_user($1, NULL, NULL, NULL, NULL)`, [AMB_AUTH]);
+const ambClaimed = (await db.query(`SELECT wallet_balance, is_adhoc FROM public.users WHERE id = $1`, [AMB_AUTH])).rows[0];
+const ambPhoneRow = (await db.query(`SELECT is_adhoc FROM public.users WHERE id = $1`, [AMB_B])).rows[0];
+if (ambClaimed && Number(ambClaimed.wallet_balance) === 40 && ambClaimed.is_adhoc === false
+    && ambPhoneRow && ambPhoneRow.is_adhoc === true) {
+  ok('email and phone match different ad-hoc rows → the email row is claimed, the phone row untouched');
+} else {
+  bad('email-over-phone precedence', JSON.stringify({ ambClaimed, ambPhoneRow }));
+}
+
+// (l) Same phone stored in two spellings ('9876500098' and '+91 98765 00098')
+//     → service role without p_adhoc_id refuses to guess.
+await db.exec(`
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc)
+  VALUES ('dededede-dede-4ede-8ede-000000000001', NULL, '9876500098', 0, true),
+         ('dededede-dede-4ede-8ede-000000000002', NULL, '+91 98765 00098', 0, true);
+`);
+await expectError('service role without p_adhoc_id + two spellings of one phone → ambiguous error',
+  () => asQuery({ role: 'service_role' },
+    `SELECT public.claim_adhoc_user($1, NULL, '9876500098', NULL, NULL)`,
+    ['dededede-dede-4ede-8ede-000000000003']),
+  'More than one ad-hoc customer');
+
+// (m) Same tie from a customer's own sign-in → refused, nothing merged.
+await expectError('customer sign-in with a phone tie → refused, nothing merged',
+  () => asQuery({ sub: 'dededede-dede-4ede-8ede-000000000004', role: 'authenticated', phone: '919876500098' },
+    `SELECT public.claim_adhoc_user($1, NULL, NULL, NULL, NULL)`,
+    ['dededede-dede-4ede-8ede-000000000004']),
+  'More than one staff-created customer record');
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);
