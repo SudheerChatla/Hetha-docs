@@ -97,6 +97,14 @@ authentication identity; this is the business profile).
 | `address_line1` … `pincode` | text | `address_type` ∈ Home/Work/Family/Other |
 | `is_default` | boolean | |
 | `is_deleted` | boolean | soft delete |
+| `route_id` | uuid FK → delivery_routes | **Migration 033.** Assigned by staff; the route must belong to the delivery area that serves the address's pincode. NULL = unassigned. |
+
+> **Route per address (migration 033).** A delivery route is assigned to the
+> *address*, not the subscription. All deliveries to that address (subscriptions
+> and one-time orders) go via the same route. Staff assigns routes using
+> `set_address_route`; customers cannot change it. The `guard_address_route`
+> trigger enforces the constraint; if a customer moves their address to a
+> different area, the route is silently unassigned so the app keeps working.
 
 ---
 
@@ -161,10 +169,23 @@ One-time purchases (distinct from subscription daily orders).
 | `snapshot_*` | text | name/phone/address copied at order time |
 | `cancellation_reason`, `cancelled_by`, `cancelled_at` | | |
 | `placed_at`, `updated_at`, `expected_delivery_date`, `delivery_time_slot` | | |
+| `delivered_at` | timestamptz | **Migration 033.** When the order was recorded as delivered via `record_order_delivery`. |
+| `tracking_info` | text | **Migration 033.** Optional delivery notes (set by `record_order_delivery`). |
+
+> **Automatic delivery date (migration 033).** When a new order is inserted with
+> `expected_delivery_date` NULL, the `set_order_delivery_date` trigger computes
+> it from the area's delivery schedule: base = tomorrow (or day after if past the
+> area's cutoff), then `internal.next_delivery_date` finds the next delivery day.
 
 ### `order_items`
 `order_id` FK, `variant_id` FK, `product_name_snapshot`,
-`variant_label_snapshot`, `unit_price`, `quantity` (`CHECK > 0`), `total_price`.
+`variant_label_snapshot`, `unit_price`, `quantity` (`CHECK > 0`), `total_price`,
+`delivered_qty` (**migration 033**: NULL = not recorded yet, CHECK >= 0).
+
+> **Short delivery (migration 033).** `delivered_qty` records the actual quantity
+> delivered. When less than `quantity`, the difference is refunded to the
+> customer's wallet (for paid orders) via `record_order_delivery`. The order's
+> `subtotal` / `total` remain unchanged (migration 012 invariants).
 
 ### `order_tracking`
 Per-order shipping/tracking trail: `status`, `courier_service`, `awb_number`,
@@ -422,6 +443,9 @@ schema (not exposed through PostgREST) in
 | `modify_daily_orders_bulk(p_user_id, p_subscription_id, p_days)` | App, admin | `SECURITY DEFINER` (migration 027). Atomic multi-day edit for "Edit multiple days" — `p_days` is `[{delivery_date, items:[{variant_id, quantity}]}, …]`. Validates every day first (ownership once; per day: not past, not finalized/non-`pending`/`paid`, priced from the catalog), then checks the wallet **once** against `3 × commitment + SUM of every day's positive extra in the batch`, and only then applies every day's insert/delete. A failure on any day (bad date, locked day, insufficient aggregate balance) leaves **every** day in the batch unchanged — the previous client-side loop over `modify_daily_order` committed each day separately and both stopped partway through on error and re-checked the wallet per day against the same stored balance, letting several expensive same-sitting edits each pass a check meant to cover only one of them. An empty `items` array for a day reverts that day to the default, same as `modify_daily_order`. Returns `{days:[…], total_extra}`. |
 | `revert_daily_order(p_user_id, p_delivery_date, p_subscription_id)` | App | `SECURITY DEFINER` (migration 026). "Reset to Default" for **one subscription's** day: drops that subscription's pending, unfinalized, unpaid order for the date. The subscription must belong to `p_user_id`. The old 2-arg `revert_daily_order(p_user_id, p_delivery_date)` (022), which reset **every** subscription's order on the date, was **dropped in migration 031**. |
 | `register_device_token(p_token, p_platform)` | App | `SECURITY DEFINER` (migration 023). Deletes any `device_tokens` row for this exact `fcm_token` belonging to a **different** user, then upserts the caller's own row. Fixes a cross-account push leak: `device_tokens` RLS only lets a user touch their own rows, so a stale row left by a previous account on a shared device could never be cleaned up by a plain client upsert. Called on app start, token refresh, and right after sign-in. |
+| `set_address_route(p_address_id, p_route_id)` | Admin | `SECURITY DEFINER` (migration 033). Assigns a delivery route to a customer address. Requires `customers:edit` or service role. `p_route_id` NULL unassigns. Validates the route exists, is active, and its area serves the address's pincode. Returns the updated `addresses` row. |
+| `record_order_delivery(p_order_id, p_items, p_note)` | Admin | `SECURITY DEFINER` (migration 033). Records actual delivery quantities for a one-time order. `p_items` is `[{item_id, delivered_qty}]`. Order status must be one of `placed`/`processing`/`shipped`/`out_for_delivery`. Updates `delivered_qty` on items, sets `delivered_at`, `tracking_info`. If all items have `delivered_qty = 0` → status `cancelled`; otherwise → `delivered`. Short deliveries on paid orders refund the difference to the wallet. Returns `{status, refunded, short}`. Never changes `subtotal`/`total` (migration 012 invariants). |
+| `reschedule_order(p_order_id, p_date)` | Admin | `SECURITY DEFINER` (migration 033). Moves a pending order to a different delivery date. Requires `orders:edit`. Refuses delivered/cancelled orders and past dates. Returns the updated `orders` row. |
 | `has_permission(p text)` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current `auth.uid()` admin has permission `p` (via `admin_role_permissions`). |
 | `is_super_admin()` | **RLS policies** | `SECURITY DEFINER STABLE`. True if the current admin's role is `super_admin`. |
 | `rls_auto_enable()` | event trigger | Auto-runs `ENABLE ROW LEVEL SECURITY` on every new `public` table created (why all tables have RLS on). |
@@ -434,7 +458,10 @@ schema (not exposed through PostgREST) in
 | `internal.normalize_cart(p_items jsonb)` | Parses/validates cart payloads. Returns `(variant_id, quantity, unit_price, product_name, variant_label, weight_grams, free_delivery)`. |
 | `internal.compute_delivery_charge(p_items jsonb)` | Weight-based delivery charge from `delivery_charge_tiers`. |
 | `internal.apply_wallet_delta(…)` | Atomically updates `users.wallet_balance` and inserts a `wallet_transactions` row. |
-| `internal.create_subscription_core(…)` | Shared implementation for both `create_subscription` overloads. |
+| `internal.create_subscription_core(…)` | Shared implementation for both `create_subscription` overloads. **Migration 033:** also stores `address_id` from `p_address->>'id'` when it is a valid uuid belonging to the user. |
+| `internal.next_delivery_date(p_area_id, p_from)` | **Migration 033.** `STABLE`. Computes the next delivery day for an area: frequency ≤ 1 → `p_from`; frequency > 1 with reference_date → first date ≥ `p_from` on cadence; frequency > 1 without reference_date → NULL. |
+| `internal.guard_address_route()` | **Trigger (migration 033).** BEFORE INSERT OR UPDATE on `addresses`. Non-admin callers cannot change `route_id`; route must serve the address pincode. |
+| `internal.set_order_delivery_date()` | **Trigger (migration 033).** BEFORE INSERT on `orders`. Auto-populates `expected_delivery_date` when NULL, using the area's schedule and cutoff time. |
 
 > Historical note: an older 4-param `place_order` and a
 > `verify_razorpay_recharge` RPC (which had the Razorpay secret hard-coded) were

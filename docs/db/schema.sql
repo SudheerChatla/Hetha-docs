@@ -31,8 +31,10 @@ CREATE TABLE public.addresses (
   is_default boolean DEFAULT false,
   created_at timestamp without time zone DEFAULT now(),
   is_deleted boolean DEFAULT false,
+  route_id uuid,
   CONSTRAINT addresses_pkey PRIMARY KEY (id),
-  CONSTRAINT fk_address_user FOREIGN KEY (user_id) REFERENCES public.users(id)
+  CONSTRAINT fk_address_user FOREIGN KEY (user_id) REFERENCES public.users(id),
+  CONSTRAINT fk_address_route FOREIGN KEY (route_id) REFERENCES public.delivery_routes(id)
 );
 CREATE TABLE public.admin_permissions (
   id uuid NOT NULL DEFAULT gen_random_uuid(),
@@ -212,6 +214,7 @@ CREATE TABLE public.order_items (
   unit_price numeric NOT NULL,
   quantity integer NOT NULL CHECK (quantity > 0),
   total_price numeric NOT NULL,
+  delivered_qty integer CHECK (delivered_qty >= 0),
   CONSTRAINT order_items_pkey PRIMARY KEY (id),
   CONSTRAINT fk_order_items_order FOREIGN KEY (order_id) REFERENCES public.orders(id),
   CONSTRAINT fk_order_items_variant FOREIGN KEY (variant_id) REFERENCES public.product_variants(id)
@@ -287,6 +290,8 @@ CREATE TABLE public.orders (
   cancellation_reason text,
   cancelled_by text,
   cancelled_at timestamp without time zone,
+  delivered_at timestamptz,
+  tracking_info text,
   CONSTRAINT orders_pkey PRIMARY KEY (id),
   CONSTRAINT fk_order_address FOREIGN KEY (address_snapshot_id) REFERENCES public.addresses(id),
   CONSTRAINT fk_order_user FOREIGN KEY (user_id) REFERENCES public.users(id)
@@ -463,6 +468,7 @@ CREATE TABLE public.subscriptions (
   label text,
   CONSTRAINT subscriptions_pkey PRIMARY KEY (id),
   CONSTRAINT fk_route FOREIGN KEY (route_id) REFERENCES public.delivery_routes(id),
+  CONSTRAINT fk_subscription_address FOREIGN KEY (address_id) REFERENCES public.addresses(id),
   CONSTRAINT fk_user FOREIGN KEY (user_id) REFERENCES public.users(id)
 );
 CREATE TABLE public.users (

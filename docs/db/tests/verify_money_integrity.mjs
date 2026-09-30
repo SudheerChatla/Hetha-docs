@@ -221,7 +221,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '029_trim_product_names.sql',
                  '030_cancel_subscription_cleanup.sql',
                  '031_drop_2arg_revert_daily_order.sql',
-                 '032_claim_adhoc_user_hardening.sql']) {
+                 '032_claim_adhoc_user_hardening.sql',
+                 '033_route_per_address_and_delivery_dates.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -1598,6 +1599,349 @@ await expectError('customer sign-in with a phone tie → refused, nothing merged
     `SELECT public.claim_adhoc_user($1, NULL, NULL, NULL, NULL)`,
     ['dededede-dede-4ede-8ede-000000000004']),
   'More than one staff-created customer record');
+
+// ---------------------------------------------------------------------------
+// 8. Migration 033: Route per address, automatic delivery dates, delivery recording
+// ---------------------------------------------------------------------------
+console.log('\n--- Migration 033: Routes, delivery dates, delivery recording ---');
+
+// Grant orders:edit to the admin for these tests
+await db.query(
+  `INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'orders:edit') ON CONFLICT DO NOTHING`, [roleId]);
+
+// Setup: create a delivery area with routes and pincodes for testing
+const AREA_DAILY = 'aaaaaaaa-0033-4000-8000-000000000001';
+const AREA_ALTERNATE = 'aaaaaaaa-0033-4000-8000-000000000002';
+const ROUTE_A = 'bbbbbbbb-0033-4000-8000-000000000001';
+const ROUTE_B = 'bbbbbbbb-0033-4000-8000-000000000002';
+const ROUTE_C = 'bbbbbbbb-0033-4000-8000-000000000003';
+const ADDR_TEST = 'cccccccc-0033-4000-8000-000000000001';
+const ADDR_TEST2 = 'cccccccc-0033-4000-8000-000000000002';
+
+await db.exec(`
+  -- Clean up any existing test data
+  DELETE FROM public.addresses WHERE pincode IN ('700001', '700002', '700003');
+  DELETE FROM public.pincodes WHERE pincode IN ('700001', '700002', '700003');
+  DELETE FROM public.delivery_routes WHERE id IN ('${ROUTE_A}', '${ROUTE_B}', '${ROUTE_C}');
+  DELETE FROM public.delivery_areas WHERE id IN ('${AREA_DAILY}', '${AREA_ALTERNATE}');
+
+  -- Create test areas
+  INSERT INTO public.delivery_areas (id, display_name, is_active, delivary_frequency, reference_date, order_cutoff_time)
+  VALUES
+    ('${AREA_DAILY}', 'Daily Area 033', true, 1, NULL, '16:00:00'),
+    ('${AREA_ALTERNATE}', 'Alternate Area 033', true, 2, '2026-10-01', '18:00:00');
+
+  -- Create test pincodes
+  INSERT INTO public.pincodes (area_id, pincode) VALUES
+    ('${AREA_DAILY}', '700001'),
+    ('${AREA_ALTERNATE}', '700002');
+
+  -- Create test routes
+  INSERT INTO public.delivery_routes (id, area_id, route_name, is_active) VALUES
+    ('${ROUTE_A}', '${AREA_DAILY}', 'Route A 033', true),
+    ('${ROUTE_B}', '${AREA_ALTERNATE}', 'Route B 033', true),
+    ('${ROUTE_C}', '${AREA_DAILY}', 'Route C Inactive 033', false);
+
+  -- Create test addresses
+  INSERT INTO public.addresses (id, user_id, name, phone_number, address_line1, city, state, pincode, address_type)
+  VALUES
+    ('${ADDR_TEST}', '${CUSTOMER}', 'Test Customer', '9000000001', '1 Test St', 'Test City', 'TS', '700001', 'home'),
+    ('${ADDR_TEST2}', '${CUSTOMER}', 'Test Customer 2', '9000000001', '2 Test St', 'Test City', 'TS', '700002', 'home');
+`);
+
+// 8a. Address route: admin can set a route that serves the pincode
+const setRouteResult = await asQuery(ADMIN_CLAIMS,
+  `SELECT public.set_address_route($1, $2) AS addr`, [ADDR_TEST, ROUTE_A]);
+const setRouteAddr = (await db.query(`SELECT route_id FROM public.addresses WHERE id = $1`, [ADDR_TEST])).rows[0];
+if (setRouteAddr.route_id === ROUTE_A) {
+  ok('set_address_route: admin can assign a route that serves the pincode');
+} else {
+  bad('set_address_route valid', JSON.stringify(setRouteAddr));
+}
+
+// 8b. Address route: refused when route doesn't serve the pincode
+await expectError('set_address_route: refused when route does not serve pincode',
+  () => asQuery(ADMIN_CLAIMS,
+    `SELECT public.set_address_route($1, $2)`, [ADDR_TEST, ROUTE_B]),
+  'serves area .* but pincode .* is in area');
+
+// 8c. Address route: customer cannot directly set route_id
+await expectError('customer cannot directly set route_id on address',
+  () => asQuery(CUST_CLAIMS,
+    `UPDATE public.addresses SET route_id = $1 WHERE id = $2`, [ROUTE_A, ADDR_TEST2]),
+  'delivery route is set by staff');
+
+// 8d. set_address_route: NULL unassigns
+await asQuery(ADMIN_CLAIMS,
+  `SELECT public.set_address_route($1, NULL) AS addr`, [ADDR_TEST]);
+const unassignResult = (await db.query(`SELECT route_id FROM public.addresses WHERE id = $1`, [ADDR_TEST])).rows[0];
+if (unassignResult.route_id === null) {
+  ok('set_address_route: NULL unassigns the route');
+} else {
+  bad('set_address_route unassign', JSON.stringify(unassignResult));
+}
+
+// 8e. set_address_route: refused for inactive route
+await expectError('set_address_route: refused for inactive route',
+  () => asQuery(ADMIN_CLAIMS,
+    `SELECT public.set_address_route($1, $2)`, [ADDR_TEST, ROUTE_C]),
+  'not active');
+
+// 8f. anon cannot execute the new RPCs
+const rpc033Grants = (await db.query(`
+  SELECT
+    has_function_privilege('anon', 'public.set_address_route(uuid,uuid)', 'EXECUTE') AS anon_set_route,
+    has_function_privilege('anon', 'public.record_order_delivery(uuid,jsonb,text)', 'EXECUTE') AS anon_record,
+    has_function_privilege('anon', 'public.reschedule_order(uuid,date)', 'EXECUTE') AS anon_reschedule,
+    has_function_privilege('authenticated', 'public.set_address_route(uuid,uuid)', 'EXECUTE') AS auth_set_route,
+    has_function_privilege('authenticated', 'public.record_order_delivery(uuid,jsonb,text)', 'EXECUTE') AS auth_record,
+    has_function_privilege('authenticated', 'public.reschedule_order(uuid,date)', 'EXECUTE') AS auth_reschedule`)).rows[0];
+if (!rpc033Grants.anon_set_route && !rpc033Grants.anon_record && !rpc033Grants.anon_reschedule
+    && rpc033Grants.auth_set_route && rpc033Grants.auth_record && rpc033Grants.auth_reschedule) {
+  ok('new RPCs: anon blocked, authenticated allowed');
+} else {
+  bad('new RPC grants', JSON.stringify(rpc033Grants));
+}
+
+// 8g. next_delivery_date for frequency 1 (daily)
+const nddDaily = (await db.query(
+  `SELECT internal.next_delivery_date($1, '2026-10-05'::date)::text AS d`, [AREA_DAILY])).rows[0].d;
+if (nddDaily === '2026-10-05') {
+  ok('next_delivery_date: frequency 1 → same day');
+} else {
+  bad('next_delivery_date daily', nddDaily);
+}
+
+// 8h. next_delivery_date for frequency 2 ON cadence (reference_date = 2026-10-01, testing 2026-10-03)
+// 2026-10-03 - 2026-10-01 = 2 days, 2 % 2 = 0 → on cadence
+const nddOnCadence = (await db.query(
+  `SELECT internal.next_delivery_date($1, '2026-10-03'::date)::text AS d`, [AREA_ALTERNATE])).rows[0].d;
+if (nddOnCadence === '2026-10-03') {
+  ok('next_delivery_date: frequency 2, on cadence day → same day');
+} else {
+  bad('next_delivery_date on cadence', nddOnCadence);
+}
+
+// 8i. next_delivery_date for frequency 2 OFF cadence (reference_date = 2026-10-01, testing 2026-10-02)
+// 2026-10-02 - 2026-10-01 = 1 day, 1 % 2 = 1 → off cadence, should return 2026-10-03
+const nddOffCadence = (await db.query(
+  `SELECT internal.next_delivery_date($1, '2026-10-02'::date)::text AS d`, [AREA_ALTERNATE])).rows[0].d;
+if (nddOffCadence === '2026-10-03') {
+  ok('next_delivery_date: frequency 2, off cadence day → next delivery day');
+} else {
+  bad('next_delivery_date off cadence', nddOffCadence);
+}
+
+// 8j. next_delivery_date for frequency > 1 with no reference_date → NULL
+await db.exec(`UPDATE public.delivery_areas SET reference_date = NULL WHERE id = '${AREA_ALTERNATE}'`);
+const nddNoRef = (await db.query(
+  `SELECT internal.next_delivery_date($1, '2026-10-02'::date) AS d`, [AREA_ALTERNATE])).rows[0].d;
+if (nddNoRef === null) {
+  ok('next_delivery_date: frequency > 1 with no reference_date → NULL');
+} else {
+  bad('next_delivery_date no reference', nddNoRef);
+}
+await db.exec(`UPDATE public.delivery_areas SET reference_date = '2026-10-01' WHERE id = '${AREA_ALTERNATE}'`);
+
+// 8k. New order gets expected_delivery_date from the area
+await db.exec(`UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}'`);
+const orderWithDateResult = await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'wallet', 40, $3::jsonb) AS id`,
+  [CUSTOMER, ADDR_TEST, CART]);
+const orderWithDate = (await db.query(
+  `SELECT expected_delivery_date FROM public.orders WHERE id = $1`,
+  [orderWithDateResult.rows[0].id])).rows[0];
+if (orderWithDate.expected_delivery_date !== null) {
+  ok(`new order gets expected_delivery_date: ${orderWithDate.expected_delivery_date}`);
+} else {
+  bad('order delivery date', JSON.stringify(orderWithDate));
+}
+
+// 8l. record_order_delivery: full delivery → status delivered, no refund
+const orderForDelivery = (await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'wallet', 40, $3::jsonb) AS id`,
+  [CUSTOMER, ADDR_TEST, CART])).rows[0].id;
+const orderItemsForDelivery = (await db.query(
+  `SELECT id, quantity FROM public.order_items WHERE order_id = $1`, [orderForDelivery])).rows;
+const fullDeliveryPayload = JSON.stringify(orderItemsForDelivery.map(i => ({
+  item_id: i.id,
+  delivered_qty: i.quantity
+})));
+const balBeforeFullDelivery = Number((await db.query(
+  `SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance);
+
+const fullDeliveryResult = await asQuery(ADMIN_CLAIMS,
+  `SELECT public.record_order_delivery($1, $2::jsonb, NULL) AS r`,
+  [orderForDelivery, fullDeliveryPayload]);
+const fullDeliveryOrder = (await db.query(
+  `SELECT status, delivered_at FROM public.orders WHERE id = $1`, [orderForDelivery])).rows[0];
+const balAfterFullDelivery = Number((await db.query(
+  `SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance);
+
+if (fullDeliveryResult.rows[0].r.status === 'delivered'
+    && Number(fullDeliveryResult.rows[0].r.refunded) === 0
+    && fullDeliveryOrder.status === 'delivered'
+    && fullDeliveryOrder.delivered_at !== null
+    && balAfterFullDelivery === balBeforeFullDelivery) {
+  ok('record_order_delivery: full delivery → delivered, no refund');
+} else {
+  bad('full delivery', JSON.stringify({ result: fullDeliveryResult.rows[0].r, order: fullDeliveryOrder, balBefore: balBeforeFullDelivery, balAfter: balAfterFullDelivery }));
+}
+
+// 8m. record_order_delivery: short delivery on paid order → wallet credited
+const orderForShort = (await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'wallet', 40, $3::jsonb) AS id`,
+  [CUSTOMER, ADDR_TEST, CART])).rows[0].id;
+const shortItems = (await db.query(
+  `SELECT id, quantity, unit_price FROM public.order_items WHERE order_id = $1`, [orderForShort])).rows;
+const shortDeliveryPayload = JSON.stringify(shortItems.map(i => ({
+  item_id: i.id,
+  delivered_qty: 0  // nothing delivered
+})));
+const expectedRefund = shortItems.reduce((sum, i) => sum + (i.quantity * Number(i.unit_price)), 0);
+const balBeforeShort = Number((await db.query(
+  `SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance);
+const orderTotalBefore = Number((await db.query(
+  `SELECT total FROM public.orders WHERE id = $1`, [orderForShort])).rows[0].total);
+
+const shortResult = await asQuery(ADMIN_CLAIMS,
+  `SELECT public.record_order_delivery($1, $2::jsonb, 'Customer unavailable') AS r`,
+  [orderForShort, shortDeliveryPayload]);
+const shortOrder = (await db.query(
+  `SELECT status, total, cancellation_reason FROM public.orders WHERE id = $1`, [orderForShort])).rows[0];
+const balAfterShort = Number((await db.query(
+  `SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance);
+
+// Zero delivered should result in cancelled status
+if (shortResult.rows[0].r.status === 'cancelled'
+    && Number(shortResult.rows[0].r.refunded) === expectedRefund
+    && shortOrder.status === 'cancelled'
+    && Number(shortOrder.total) === orderTotalBefore  // total unchanged
+    && balAfterShort === balBeforeShort + expectedRefund) {
+  ok(`record_order_delivery: zero delivery → cancelled, wallet refunded by ${expectedRefund}, order total unchanged`);
+} else {
+  bad('short delivery refund', JSON.stringify({
+    result: shortResult.rows[0].r,
+    order: shortOrder,
+    expectedRefund,
+    balBefore: balBeforeShort,
+    balAfter: balAfterShort,
+    orderTotalBefore
+  }));
+}
+
+// 8n. record_order_delivery on already delivered order → error
+await expectError('record_order_delivery on delivered order → error',
+  () => asQuery(ADMIN_CLAIMS,
+    `SELECT public.record_order_delivery($1, '[]'::jsonb, NULL)`, [orderForDelivery]),
+  'status is delivered');
+
+// 8o. Non-admin calling record_order_delivery → error
+await expectError('non-admin cannot call record_order_delivery',
+  () => asQuery(CUST_CLAIMS,
+    `SELECT public.record_order_delivery($1, '[]'::jsonb, NULL)`, [orderForDelivery]),
+  'Not authorized');
+
+// 8p. Non-admin calling reschedule_order → error
+await expectError('non-admin cannot call reschedule_order',
+  () => asQuery(CUST_CLAIMS,
+    `SELECT public.reschedule_order($1, '2026-12-01'::date)`, [orderForDelivery]),
+  'Not authorized');
+
+// 8q. reschedule_order into the past → error
+const orderForReschedule = (await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'wallet', 40, $3::jsonb) AS id`,
+  [CUSTOMER, ADDR_TEST, CART])).rows[0].id;
+await expectError('reschedule_order into the past → error',
+  () => asQuery(ADMIN_CLAIMS,
+    `SELECT public.reschedule_order($1, '2020-01-01'::date)`, [orderForReschedule]),
+  'past date');
+
+// 8r. reschedule_order works for admin
+await asQuery(ADMIN_CLAIMS,
+  `SELECT public.reschedule_order($1, '2026-12-25'::date) AS o`, [orderForReschedule]);
+const rescheduleResult = (await db.query(
+  `SELECT expected_delivery_date::text AS d FROM public.orders WHERE id = $1`, [orderForReschedule])).rows[0];
+if (rescheduleResult.d === '2026-12-25') {
+  ok('reschedule_order: admin can reschedule to a future date');
+} else {
+  bad('reschedule_order', JSON.stringify(rescheduleResult));
+}
+
+// 8s. create_subscription via app path now stores address_id
+await db.exec(`UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}'`);
+const subWithAddrPayload = JSON.stringify({
+  id: ADDR_TEST,
+  pincode: '700001',
+  name: 'Test Customer',
+  phoneNumber: '9000000001',
+  addressLine1: '1 Test St',
+  city: 'Test City',
+  state: 'TS',
+  addressType: 'home'
+});
+const subWithAddr = (await asQuery(CUST_CLAIMS,
+  `SELECT public.create_subscription($1, now(), NULL, 'active', $2::jsonb, $3::jsonb, 'AddrTest') AS id`,
+  [CUSTOMER, subWithAddrPayload, JSON.stringify([{ variantId: VAR, name: 'Cow Milk', variant: '1 L', price: 100, quantity: 1, startDate: '2026-10-01' }])])).rows[0].id;
+const subAddrIdResult = (await db.query(
+  `SELECT address_id FROM public.subscriptions WHERE id = $1`, [subWithAddr])).rows[0];
+if (subAddrIdResult.address_id === ADDR_TEST) {
+  ok('create_subscription via app path now stores address_id');
+} else {
+  bad('subscription address_id', JSON.stringify(subAddrIdResult));
+}
+
+// 8t. Partial delivery with some items delivered → status delivered, partial refund
+const orderForPartial = (await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'wallet', 40, '[{"variant_id":"${VAR}","quantity":3}]'::jsonb) AS id`,
+  [CUSTOMER, ADDR_TEST])).rows[0].id;
+const partialItems = (await db.query(
+  `SELECT id, quantity, unit_price FROM public.order_items WHERE order_id = $1`, [orderForPartial])).rows;
+// Deliver 1 out of 3
+const partialPayload = JSON.stringify(partialItems.map(i => ({
+  item_id: i.id,
+  delivered_qty: 1
+})));
+const expectedPartialRefund = partialItems.reduce((sum, i) => sum + ((i.quantity - 1) * Number(i.unit_price)), 0);
+const balBeforePartial = Number((await db.query(
+  `SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance);
+
+const partialResult = await asQuery(ADMIN_CLAIMS,
+  `SELECT public.record_order_delivery($1, $2::jsonb, NULL) AS r`,
+  [orderForPartial, partialPayload]);
+const balAfterPartial = Number((await db.query(
+  `SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance);
+const partialOrder = (await db.query(
+  `SELECT status FROM public.orders WHERE id = $1`, [orderForPartial])).rows[0];
+
+if (partialResult.rows[0].r.status === 'delivered'
+    && Number(partialResult.rows[0].r.refunded) === expectedPartialRefund
+    && partialOrder.status === 'delivered'
+    && balAfterPartial === balBeforePartial + expectedPartialRefund) {
+  ok(`partial delivery: delivered 1 of 3, refunded ${expectedPartialRefund}`);
+} else {
+  bad('partial delivery', JSON.stringify({
+    result: partialResult.rows[0].r,
+    expectedPartialRefund,
+    balBefore: balBeforePartial,
+    balAfter: balAfterPartial
+  }));
+}
+
+// 8u. Customer changing address pincode to a different area unassigns the route
+await asQuery(ADMIN_CLAIMS, `SELECT public.set_address_route($1, $2)`, [ADDR_TEST, ROUTE_A]);
+// Now change pincode to one not served by ROUTE_A (which serves AREA_DAILY/700001)
+// This requires a pincode in a different area or no area
+await db.exec(`INSERT INTO public.pincodes (area_id, pincode) VALUES ('${AREA_ALTERNATE}', '700003') ON CONFLICT DO NOTHING`);
+await asQuery(CUST_CLAIMS,
+  `UPDATE public.addresses SET pincode = '700003' WHERE id = $1`, [ADDR_TEST]);
+const addrAfterPincodeChange = (await db.query(
+  `SELECT route_id FROM public.addresses WHERE id = $1`, [ADDR_TEST])).rows[0];
+if (addrAfterPincodeChange.route_id === null) {
+  ok('customer changing pincode to different area unassigns the route (app keeps working)');
+} else {
+  bad('pincode change route unassign', JSON.stringify(addrAfterPincodeChange));
+}
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

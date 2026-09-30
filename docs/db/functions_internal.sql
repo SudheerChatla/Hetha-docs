@@ -1259,4 +1259,134 @@ BEGIN
 END;
 $function$;
 
--- Drop
+
+-- next_delivery_date (migration 033) -----------------------------------------
+-- Computes the next delivery day for an area, mirroring the TypeScript logic
+-- in Hetha_admin/lib/deliverySchedule.ts isAreaDeliveryDay exactly:
+-- - frequency <= 1 → p_from (daily delivery)
+-- - frequency > 1 with reference_date → first date >= p_from where
+--   (date - reference_date) >= 0 and divisible by frequency
+-- - frequency > 1 with no reference_date → NULL (can't compute)
+CREATE OR REPLACE FUNCTION internal.next_delivery_date(p_area_id uuid, p_from date)
+  RETURNS date
+  LANGUAGE plpgsql
+  STABLE
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_frequency      bigint;
+  v_reference_date date;
+  v_diff           integer;
+  v_check_date     date;
+  v_max_days       integer := 366;
+BEGIN
+  IF p_area_id IS NULL OR p_from IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT delivary_frequency, reference_date
+  INTO v_frequency, v_reference_date
+  FROM public.delivery_areas WHERE id = p_area_id;
+
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  IF v_frequency IS NULL OR v_frequency <= 1 THEN RETURN p_from; END IF;
+  IF v_reference_date IS NULL THEN RETURN NULL; END IF;
+
+  v_check_date := p_from;
+  FOR i IN 0..v_max_days LOOP
+    v_diff := v_check_date - v_reference_date;
+    IF v_diff >= 0 AND v_diff % v_frequency = 0 THEN
+      RETURN v_check_date;
+    END IF;
+    v_check_date := v_check_date + 1;
+  END LOOP;
+
+  RETURN NULL;
+END;
+$function$;
+
+
+-- guard_address_route (TRIGGER, migration 033) -------------------------------
+-- Non-admin callers cannot change route_id. Route must serve the address pincode.
+CREATE OR REPLACE FUNCTION internal.guard_address_route()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_pincode_area_id uuid;
+  v_route_area_id   uuid;
+  v_route_name      text;
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.route_id IS NOT NULL THEN
+      IF NOT internal.is_admin_actor('customers:edit') AND NOT internal.is_service_actor() THEN
+        RAISE EXCEPTION 'The delivery route is set by staff';
+      END IF;
+    END IF;
+  ELSIF TG_OP = 'UPDATE' THEN
+    IF NEW.route_id IS DISTINCT FROM OLD.route_id THEN
+      IF NOT internal.is_admin_actor('customers:edit') AND NOT internal.is_service_actor() THEN
+        RAISE EXCEPTION 'The delivery route is set by staff';
+      END IF;
+    END IF;
+  END IF;
+
+  IF NEW.route_id IS NOT NULL THEN
+    SELECT area_id INTO v_pincode_area_id FROM public.pincodes WHERE pincode = NEW.pincode;
+    SELECT area_id, route_name INTO v_route_area_id, v_route_name
+    FROM public.delivery_routes WHERE id = NEW.route_id;
+
+    IF v_route_area_id IS NULL THEN RAISE EXCEPTION 'Route not found'; END IF;
+    IF v_pincode_area_id IS NULL OR v_route_area_id <> v_pincode_area_id THEN
+      IF TG_OP = 'UPDATE' AND NEW.pincode IS DISTINCT FROM OLD.pincode THEN
+        NEW.route_id := NULL;
+      ELSE
+        RAISE EXCEPTION 'Route % does not serve pincode %', v_route_name, NEW.pincode;
+      END IF;
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$function$;
+
+
+-- set_order_delivery_date (TRIGGER, migration 033) ---------------------------
+-- Sets expected_delivery_date on INSERT when NULL, using the area's schedule
+-- and cutoff time (IST).
+CREATE OR REPLACE FUNCTION internal.set_order_delivery_date()
+  RETURNS trigger
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_area_id       uuid;
+  v_cutoff_time   time;
+  v_current_ist   time;
+  v_base_date     date;
+BEGIN
+  IF NEW.expected_delivery_date IS NOT NULL THEN RETURN NEW; END IF;
+
+  SELECT p.area_id INTO v_area_id
+  FROM public.pincodes p
+  JOIN public.delivery_areas da ON da.id = p.area_id AND da.is_active = true
+  WHERE p.pincode = COALESCE(NEW.snapshot_pincode, NEW.pincode);
+
+  IF v_area_id IS NULL THEN RETURN NEW; END IF;
+
+  SELECT order_cutoff_time INTO v_cutoff_time FROM public.delivery_areas WHERE id = v_area_id;
+  v_current_ist := (now() AT TIME ZONE 'Asia/Kolkata')::time;
+
+  v_base_date := CURRENT_DATE + 1;
+  IF v_cutoff_time IS NOT NULL AND v_current_ist > v_cutoff_time THEN
+    v_base_date := CURRENT_DATE + 2;
+  END IF;
+
+  NEW.expected_delivery_date := internal.next_delivery_date(v_area_id, v_base_date);
+  RETURN NEW;
+END;
+$function$;

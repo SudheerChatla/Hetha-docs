@@ -9,6 +9,7 @@
 CREATE UNIQUE INDEX addresses_pkey ON public.addresses USING btree (id);
 CREATE INDEX idx_addresses_pincode ON public.addresses USING btree (pincode);
 CREATE INDEX idx_addresses_user_id ON public.addresses USING btree (user_id);
+CREATE INDEX idx_addresses_route_id ON public.addresses USING btree (route_id);
 
 -- admin_permissions
 CREATE UNIQUE INDEX admin_permissions_pkey ON public.admin_permissions USING btree (id);

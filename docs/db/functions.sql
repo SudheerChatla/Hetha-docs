@@ -1405,3 +1405,187 @@ BEGIN
   END LOOP;
 END;
 $function$;
+
+
+-- set_address_route (migration 033) ------------------------------------------
+-- Assigns a delivery route to a customer address. Admin-only; validates the
+-- route belongs to the area serving the address's pincode.
+CREATE OR REPLACE FUNCTION public.set_address_route(p_address_id uuid, p_route_id uuid)
+  RETURNS public.addresses
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_address        public.addresses;
+  v_route          public.delivery_routes;
+  v_pincode_area   uuid;
+  v_area_name      text;
+  v_route_area_name text;
+BEGIN
+  IF NOT internal.is_admin_actor('customers:edit') AND NOT internal.is_service_actor() THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT * INTO v_address FROM public.addresses WHERE id = p_address_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Address not found';
+  END IF;
+
+  IF p_route_id IS NULL THEN
+    UPDATE public.addresses SET route_id = NULL WHERE id = p_address_id RETURNING * INTO v_address;
+    RETURN v_address;
+  END IF;
+
+  SELECT * INTO v_route FROM public.delivery_routes WHERE id = p_route_id;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Route not found';
+  END IF;
+  IF NOT v_route.is_active THEN
+    RAISE EXCEPTION 'Route % is not active', v_route.route_name;
+  END IF;
+
+  SELECT p.area_id, da.display_name INTO v_pincode_area, v_area_name
+  FROM public.pincodes p JOIN public.delivery_areas da ON da.id = p.area_id
+  WHERE p.pincode = v_address.pincode;
+
+  SELECT da.display_name INTO v_route_area_name
+  FROM public.delivery_areas da WHERE da.id = v_route.area_id;
+
+  IF v_pincode_area IS NULL THEN
+    RAISE EXCEPTION 'Pincode % is not in any delivery area; route % serves area %',
+      v_address.pincode, v_route.route_name, v_route_area_name;
+  END IF;
+
+  IF v_route.area_id <> v_pincode_area THEN
+    RAISE EXCEPTION 'Route % serves area % but pincode % is in area %',
+      v_route.route_name, v_route_area_name, v_address.pincode, v_area_name;
+  END IF;
+
+  UPDATE public.addresses SET route_id = p_route_id WHERE id = p_address_id RETURNING * INTO v_address;
+  RETURN v_address;
+END;
+$function$;
+
+
+-- record_order_delivery (migration 033) --------------------------------------
+-- Records actual delivery quantities for a one-time order, sets status, and
+-- refunds shorts on paid orders.
+CREATE OR REPLACE FUNCTION public.record_order_delivery(
+  p_order_id uuid,
+  p_items jsonb,
+  p_note text DEFAULT NULL
+)
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_order          public.orders;
+  v_item           jsonb;
+  v_item_id        uuid;
+  v_delivered_qty  integer;
+  v_order_item     public.order_items;
+  v_all_zero       boolean := true;
+  v_short          numeric := 0;
+  v_result_status  text;
+  v_refunded       numeric := 0;
+BEGIN
+  IF NOT internal.is_admin_actor('orders:edit') THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT * INTO v_order FROM public.orders WHERE id = p_order_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Order not found';
+  END IF;
+
+  IF v_order.status NOT IN ('placed', 'processing', 'shipped', 'out_for_delivery') THEN
+    RAISE EXCEPTION 'Cannot record delivery: order status is %', v_order.status;
+  END IF;
+
+  IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' THEN
+    RAISE EXCEPTION 'p_items must be a JSON array';
+  END IF;
+
+  FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
+  LOOP
+    v_item_id := (v_item->>'item_id')::uuid;
+    v_delivered_qty := (v_item->>'delivered_qty')::integer;
+
+    IF v_item_id IS NULL THEN RAISE EXCEPTION 'Each item must have an item_id'; END IF;
+    IF v_delivered_qty IS NULL THEN RAISE EXCEPTION 'Each item must have a delivered_qty'; END IF;
+    IF v_delivered_qty < 0 THEN RAISE EXCEPTION 'delivered_qty cannot be negative'; END IF;
+
+    SELECT * INTO v_order_item FROM public.order_items WHERE id = v_item_id AND order_id = p_order_id;
+    IF NOT FOUND THEN RAISE EXCEPTION 'Item % does not belong to order %', v_item_id, p_order_id; END IF;
+    IF v_delivered_qty > v_order_item.quantity THEN
+      RAISE EXCEPTION 'delivered_qty (%) exceeds ordered quantity (%) for item %',
+        v_delivered_qty, v_order_item.quantity, v_item_id;
+    END IF;
+
+    UPDATE public.order_items SET delivered_qty = v_delivered_qty WHERE id = v_item_id;
+    IF v_delivered_qty > 0 THEN v_all_zero := false; END IF;
+    v_short := v_short + ((v_order_item.quantity - v_delivered_qty) * v_order_item.unit_price);
+  END LOOP;
+
+  IF v_all_zero THEN
+    v_result_status := 'cancelled';
+    UPDATE public.orders
+    SET status = 'cancelled', cancelled_by = 'admin', cancelled_at = now(),
+        cancellation_reason = COALESCE(p_note, 'Not delivered'),
+        delivered_at = now(), tracking_info = COALESCE(p_note, tracking_info)
+    WHERE id = p_order_id;
+  ELSE
+    v_result_status := 'delivered';
+    UPDATE public.orders
+    SET status = 'delivered', delivered_at = now(), tracking_info = COALESCE(p_note, tracking_info)
+    WHERE id = p_order_id;
+  END IF;
+
+  IF v_short > 0 AND v_order.payment_status = 'paid' THEN
+    v_short := round(v_short, 2);
+    PERFORM internal.apply_wallet_delta(
+      v_order.user_id, v_short, 'credit',
+      'Refund for undelivered items in order ' || v_order.order_number,
+      'admin', 'order_refund', p_order_id::text
+    );
+    v_refunded := v_short;
+  END IF;
+
+  RETURN jsonb_build_object('status', v_result_status, 'refunded', v_refunded, 'short', round(v_short, 2));
+END;
+$function$;
+
+
+-- reschedule_order (migration 033) -------------------------------------------
+-- Admin can move a pending order to a different delivery date.
+CREATE OR REPLACE FUNCTION public.reschedule_order(p_order_id uuid, p_date date)
+  RETURNS public.orders
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_order public.orders;
+BEGIN
+  IF NOT internal.is_admin_actor('orders:edit') THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT * INTO v_order FROM public.orders WHERE id = p_order_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Order not found'; END IF;
+  IF v_order.status IN ('delivered', 'cancelled') THEN
+    RAISE EXCEPTION 'Cannot reschedule: order status is %', v_order.status;
+  END IF;
+  IF p_date < CURRENT_DATE THEN
+    RAISE EXCEPTION 'Cannot reschedule to a past date';
+  END IF;
+
+  UPDATE public.orders SET expected_delivery_date = p_date, updated_at = now()
+  WHERE id = p_order_id RETURNING * INTO v_order;
+
+  RETURN v_order;
+END;
+$function$;
