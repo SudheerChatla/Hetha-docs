@@ -222,7 +222,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '030_cancel_subscription_cleanup.sql',
                  '031_drop_2arg_revert_daily_order.sql',
                  '032_claim_adhoc_user_hardening.sql',
-                 '033_route_per_address_and_delivery_dates.sql']) {
+                 '033_route_per_address_and_delivery_dates.sql',
+                 '034_reschedule_order_snaps_to_delivery_day.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -1866,6 +1867,34 @@ if (rescheduleResult.d === '2026-12-25') {
   ok('reschedule_order: admin can reschedule to a future date');
 } else {
   bad('reschedule_order', JSON.stringify(rescheduleResult));
+}
+
+// 8r2. reschedule_order snaps to the area's delivery day (migration 034).
+//      Alternate Area 033: frequency 2, reference_date 2026-10-01, so it
+//      delivers on 1, 3, 5 Oct… A request for 2026-10-02 (not a delivery day)
+//      must snap forward to 2026-10-03.
+const orderAltArea = (await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'cod', 0, $3::jsonb) AS id`,
+  [CUSTOMER, ADDR_TEST2, CART])).rows[0].id;
+await asQuery(ADMIN_CLAIMS,
+  `SELECT public.reschedule_order($1, '2026-10-02'::date)`, [orderAltArea]);
+const snapped034 = (await db.query(
+  `SELECT expected_delivery_date::text AS d FROM public.orders WHERE id = $1`, [orderAltArea])).rows[0];
+if (snapped034.d === '2026-10-03') {
+  ok('reschedule_order snaps a non-delivery day forward to the area cadence (2 Oct → 3 Oct)');
+} else {
+  bad('reschedule_order snap', JSON.stringify(snapped034));
+}
+
+// 8r3. A request that is already a delivery day is kept.
+await asQuery(ADMIN_CLAIMS,
+  `SELECT public.reschedule_order($1, '2026-10-05'::date)`, [orderAltArea]);
+const kept034 = (await db.query(
+  `SELECT expected_delivery_date::text AS d FROM public.orders WHERE id = $1`, [orderAltArea])).rows[0];
+if (kept034.d === '2026-10-05') {
+  ok('reschedule_order keeps a date that is already a delivery day (5 Oct)');
+} else {
+  bad('reschedule_order keep', JSON.stringify(kept034));
 }
 
 // 8s. create_subscription via app path now stores address_id
