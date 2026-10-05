@@ -223,7 +223,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '031_drop_2arg_revert_daily_order.sql',
                  '032_claim_adhoc_user_hardening.sql',
                  '033_route_per_address_and_delivery_dates.sql',
-                 '034_reschedule_order_snaps_to_delivery_day.sql']) {
+                 '034_reschedule_order_snaps_to_delivery_day.sql',
+                 '035_order_tracking_user_id.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -1859,11 +1860,15 @@ await expectError('reschedule_order into the past → error',
   'past date');
 
 // 8r. reschedule_order works for admin
+//     Dates in 8r–8r3 are relative to today: reschedule_order refuses past
+//     dates, so fixed calendar dates stop working once they pass.
+const futureDate = (await db.query(
+  `SELECT (internal.today_ist() + 30)::text AS d`)).rows[0].d;
 await asQuery(ADMIN_CLAIMS,
-  `SELECT public.reschedule_order($1, '2026-12-25'::date) AS o`, [orderForReschedule]);
+  `SELECT public.reschedule_order($1, $2::date) AS o`, [orderForReschedule, futureDate]);
 const rescheduleResult = (await db.query(
   `SELECT expected_delivery_date::text AS d FROM public.orders WHERE id = $1`, [orderForReschedule])).rows[0];
-if (rescheduleResult.d === '2026-12-25') {
+if (rescheduleResult.d === futureDate) {
   ok('reschedule_order: admin can reschedule to a future date');
 } else {
   bad('reschedule_order', JSON.stringify(rescheduleResult));
@@ -1871,28 +1876,34 @@ if (rescheduleResult.d === '2026-12-25') {
 
 // 8r2. reschedule_order snaps to the area's delivery day (migration 034).
 //      Alternate Area 033: frequency 2, reference_date 2026-10-01, so it
-//      delivers on 1, 3, 5 Oct… A request for 2026-10-02 (not a delivery day)
-//      must snap forward to 2026-10-03.
+//      delivers on every even day-offset from 1 Oct. Pick a future delivery
+//      day D: a request for D+1 (not a delivery day) must snap to D+2, and a
+//      request for D+4 (a delivery day) is kept.
+const cadence034 = (await db.query(`
+  WITH b AS (SELECT internal.today_ist() + 10 AS base),
+       d AS (SELECT base + ((base - DATE '2026-10-01') % 2) AS on_day FROM b)
+  SELECT (on_day + 1)::text AS off_day, (on_day + 2)::text AS snapped, (on_day + 4)::text AS kept
+  FROM d`)).rows[0];
 const orderAltArea = (await asQuery(CUST_CLAIMS,
   `SELECT public.place_order($1, $2, 'cod', 0, $3::jsonb) AS id`,
   [CUSTOMER, ADDR_TEST2, CART])).rows[0].id;
 await asQuery(ADMIN_CLAIMS,
-  `SELECT public.reschedule_order($1, '2026-10-02'::date)`, [orderAltArea]);
+  `SELECT public.reschedule_order($1, $2::date)`, [orderAltArea, cadence034.off_day]);
 const snapped034 = (await db.query(
   `SELECT expected_delivery_date::text AS d FROM public.orders WHERE id = $1`, [orderAltArea])).rows[0];
-if (snapped034.d === '2026-10-03') {
-  ok('reschedule_order snaps a non-delivery day forward to the area cadence (2 Oct → 3 Oct)');
+if (snapped034.d === cadence034.snapped) {
+  ok(`reschedule_order snaps a non-delivery day forward to the area cadence (${cadence034.off_day} → ${cadence034.snapped})`);
 } else {
   bad('reschedule_order snap', JSON.stringify(snapped034));
 }
 
 // 8r3. A request that is already a delivery day is kept.
 await asQuery(ADMIN_CLAIMS,
-  `SELECT public.reschedule_order($1, '2026-10-05'::date)`, [orderAltArea]);
+  `SELECT public.reschedule_order($1, $2::date)`, [orderAltArea, cadence034.kept]);
 const kept034 = (await db.query(
   `SELECT expected_delivery_date::text AS d FROM public.orders WHERE id = $1`, [orderAltArea])).rows[0];
-if (kept034.d === '2026-10-05') {
-  ok('reschedule_order keeps a date that is already a delivery day (5 Oct)');
+if (kept034.d === cadence034.kept) {
+  ok(`reschedule_order keeps a date that is already a delivery day (${cadence034.kept})`);
 } else {
   bad('reschedule_order keep', JSON.stringify(kept034));
 }
@@ -1970,6 +1981,138 @@ if (addrAfterPincodeChange.route_id === null) {
   ok('customer changing pincode to different area unassigns the route (app keeps working)');
 } else {
   bad('pincode change route unassign', JSON.stringify(addrAfterPincodeChange));
+}
+
+// ---------------------------------------------------------------------------
+// 9. Migration 035: order_tracking.user_id
+//    The app filters its order_tracking Realtime listener on user_id, so the
+//    column must always equal the parent order's user_id — whoever writes the
+//    row, and after the order changes owner (ad-hoc → app user conversion).
+// ---------------------------------------------------------------------------
+console.log('\n--- Migration 035: order_tracking.user_id ---');
+
+const trackingUsers = async (orderId) => (await db.query(
+  `SELECT user_id FROM public.order_tracking WHERE order_id = $1`, [orderId])).rows.map((r) => r.user_id);
+
+// 9a. place_order's own tracking row carries the customer's id.
+await db.exec(`UPDATE public.users SET wallet_balance = 100000 WHERE id = '${CUSTOMER}'`);
+const ord035 = (await asQuery(CUST_CLAIMS,
+  `SELECT public.place_order($1, $2, 'wallet', 40, '[{"variant_id":"${VAR}","quantity":1}]'::jsonb) AS id`,
+  [CUSTOMER, ADDR])).rows[0].id;
+const placedTracking = await trackingUsers(ord035);
+if (placedTracking.length === 1 && placedTracking[0] === CUSTOMER) {
+  ok('place_order: tracking row gets user_id from the order');
+} else {
+  bad('place_order tracking user_id', JSON.stringify(placedTracking));
+}
+
+// 9b. Staff insert (admin panel path) — user_id derived; a supplied value is ignored.
+await asQuery(ADMIN_CLAIMS,
+  `INSERT INTO public.order_tracking (order_id, status, courier_service, user_id)
+   VALUES ($1, 'shipped', 'DTDC', $2)`, [ord035, OTHER]);
+const afterStaffInsert = await trackingUsers(ord035);
+if (afterStaffInsert.length === 2 && afterStaffInsert.every((u) => u === CUSTOMER)) {
+  ok('staff tracking insert: user_id derived from order; spoofed value overwritten');
+} else {
+  bad('staff tracking insert user_id', JSON.stringify(afterStaffInsert));
+}
+
+// 9c. Tracking-only update (courier / message, no order change) keeps user_id;
+//     an attempt to repoint user_id is overwritten.
+await asQuery(ADMIN_CLAIMS,
+  `UPDATE public.order_tracking SET customer_message = 'Arriving by 8 AM', user_id = $2
+   WHERE order_id = $1`, [ord035, OTHER]);
+const afterUpdate = (await db.query(
+  `SELECT user_id, customer_message FROM public.order_tracking WHERE order_id = $1`, [ord035])).rows;
+if (afterUpdate.length === 2
+    && afterUpdate.every((r) => r.user_id === CUSTOMER && r.customer_message === 'Arriving by 8 AM')) {
+  ok('tracking update: message saved, user_id cannot be repointed');
+} else {
+  bad('tracking update user_id', JSON.stringify(afterUpdate));
+}
+
+// 9d. Order changes owner → its tracking rows follow (and follow back).
+await db.query(`UPDATE public.orders SET user_id = $2 WHERE id = $1`, [ord035, OTHER]);
+const followed = await trackingUsers(ord035);
+await db.query(`UPDATE public.orders SET user_id = $2 WHERE id = $1`, [ord035, CUSTOMER]);
+const followedBack = await trackingUsers(ord035);
+if (followed.every((u) => u === OTHER) && followedBack.every((u) => u === CUSTOMER)) {
+  ok('orders.user_id change carries to its tracking rows');
+} else {
+  bad('owner change sync', JSON.stringify({ followed, followedBack }));
+}
+
+// 9e. Ad-hoc → app user conversion. claim_adhoc_user rewrites users.id and the
+//     live FKs carry it to orders.user_id with ON UPDATE CASCADE. The harness
+//     strips FKs, so add that one cascade FK (NOT VALID: existing fixture rows
+//     are not checked) to reproduce the production path end to end.
+const ADHOC_035   = 'eeeeeeee-0035-4000-8000-000000000001';
+const AUTH_035    = 'eeeeeeee-0035-4000-8000-000000000002';
+const ORD_ADHOC   = 'eeeeeeee-0035-4000-8000-000000000003';
+const PHONE_035   = '9876503501';
+await db.exec(`
+  DELETE FROM public.users WHERE id IN ('${ADHOC_035}', '${AUTH_035}') OR phone = '${PHONE_035}';
+  INSERT INTO public.users (id, email, phone, wallet_balance, is_adhoc, first_name)
+  VALUES ('${ADHOC_035}', 'adhoc035@example.com', '${PHONE_035}', 0, true, 'AdHoc035');
+
+  ALTER TABLE public.orders ADD CONSTRAINT fk_order_user_035
+    FOREIGN KEY (user_id) REFERENCES public.users(id) ON UPDATE CASCADE NOT VALID;
+
+  BEGIN;
+  SET LOCAL hetha.skip_money_checks = 'on';
+  INSERT INTO public.orders (id, order_number, user_id, address_snapshot_id, status,
+                             payment_method, payment_status, subtotal, delivery_charge, total)
+  VALUES ('${ORD_ADHOC}', 'ORD-035-ADHOC', '${ADHOC_035}', '${ADDR}', 'placed', 'cod', 'pending', 0, 0, 0);
+  INSERT INTO public.order_tracking (order_id, status) VALUES ('${ORD_ADHOC}', 'placed');
+  COMMIT;
+`);
+const adhocBefore = await trackingUsers(ORD_ADHOC);
+await asQuery({ role: 'service_role' },
+  `SELECT public.claim_adhoc_user($1, 'adhoc035@example.com', $2, 'Converted', NULL, $3)`,
+  [AUTH_035, PHONE_035, ADHOC_035]);
+const adhocOrderOwner = (await db.query(
+  `SELECT user_id FROM public.orders WHERE id = $1`, [ORD_ADHOC])).rows[0].user_id;
+const adhocAfter = await trackingUsers(ORD_ADHOC);
+await db.exec(`ALTER TABLE public.orders DROP CONSTRAINT fk_order_user_035`);
+if (adhocBefore.length === 1 && adhocBefore[0] === ADHOC_035
+    && adhocOrderOwner === AUTH_035
+    && adhocAfter.length === 1 && adhocAfter[0] === AUTH_035) {
+  ok('ad-hoc conversion: tracking user_id follows the new app user id (via cascade)');
+} else {
+  bad('ad-hoc conversion tracking sync', JSON.stringify({ adhocBefore, adhocOrderOwner, adhocAfter }));
+}
+
+// 9f. Backfill + idempotency: blank user_id with the trigger off (a row written
+//     before the migration), then re-run the whole migration file.
+await db.exec(`
+  ALTER TABLE public.order_tracking DISABLE TRIGGER trg_set_order_tracking_user_id;
+  UPDATE public.order_tracking SET user_id = NULL;
+  ALTER TABLE public.order_tracking ENABLE TRIGGER trg_set_order_tracking_user_id;
+`);
+await expectOk('migration 035 re-runs cleanly (idempotent)',
+  () => db.exec(read(`${ROOT}/migrations/035_order_tracking_user_id.sql`)));
+const mismatches = Number((await db.query(`
+  SELECT count(*) AS n FROM public.order_tracking t
+  JOIN public.orders o ON o.id = t.order_id
+  WHERE t.user_id IS DISTINCT FROM o.user_id`)).rows[0].n);
+const trackingTotal = Number((await db.query(`SELECT count(*) AS n FROM public.order_tracking`)).rows[0].n);
+if (mismatches === 0 && trackingTotal > 0) {
+  ok(`backfill: all ${trackingTotal} tracking rows match their order's user_id`);
+} else {
+  bad('backfill', JSON.stringify({ mismatches, trackingTotal }));
+}
+
+// 9g. Trigger functions are not callable by clients.
+const grants035 = (await db.query(`
+  SELECT
+    has_function_privilege('anon',          'internal.set_order_tracking_user_id()',  'EXECUTE') AS anon_set,
+    has_function_privilege('authenticated', 'internal.set_order_tracking_user_id()',  'EXECUTE') AS auth_set,
+    has_function_privilege('anon',          'internal.sync_order_tracking_user_id()', 'EXECUTE') AS anon_sync,
+    has_function_privilege('authenticated', 'internal.sync_order_tracking_user_id()', 'EXECUTE') AS auth_sync`)).rows[0];
+if (!grants035.anon_set && !grants035.auth_set && !grants035.anon_sync && !grants035.auth_sync) {
+  ok('035 trigger functions: no EXECUTE for anon / authenticated');
+} else {
+  bad('035 grants', JSON.stringify(grants035));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

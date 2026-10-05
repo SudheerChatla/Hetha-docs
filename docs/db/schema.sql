@@ -230,6 +230,7 @@ CREATE TABLE public.order_tracking (
   customer_message text,
   updated_by text,
   updated_at timestamp without time zone DEFAULT now(),
+  user_id uuid,
   CONSTRAINT order_tracking_pkey PRIMARY KEY (id),
   CONSTRAINT fk_tracking_order FOREIGN KEY (order_id) REFERENCES public.orders(id)
 );

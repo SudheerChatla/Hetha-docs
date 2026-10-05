@@ -189,7 +189,14 @@ One-time purchases (distinct from subscription daily orders).
 
 ### `order_tracking`
 Per-order shipping/tracking trail: `status`, `courier_service`, `awb_number`,
-`lr_number`, `tracking_url`, `customer_message`, `updated_by`, `updated_at`.
+`lr_number`, `tracking_url`, `customer_message`, `updated_by`, `updated_at`,
+`user_id`.
+
+> **`user_id` (migration 035)** is a copy of the parent order's `user_id`, kept
+> in step by triggers — any value a writer supplies is overwritten. It exists so
+> the app's Realtime listener can filter `user_id=eq.<own id>`; without a filter,
+> Realtime ran the RLS check once per online customer for every tracking change.
+> RLS still authorises through `orders`, not through this column.
 
 ### `payment_attempts`
 Audit of payment tries per order: `attempt_number`, `razorpay_order_id`,
@@ -462,6 +469,8 @@ schema (not exposed through PostgREST) in
 | `internal.next_delivery_date(p_area_id, p_from)` | **Migration 033.** `STABLE`. Computes the next delivery day for an area: frequency ≤ 1 → `p_from`; frequency > 1 with reference_date → first date ≥ `p_from` on cadence; frequency > 1 without reference_date → NULL. |
 | `internal.guard_address_route()` | **Trigger (migration 033).** BEFORE INSERT OR UPDATE on `addresses`. Non-admin callers cannot change `route_id`; route must serve the address pincode. |
 | `internal.set_order_delivery_date()` | **Trigger (migration 033).** BEFORE INSERT on `orders`. Auto-populates `expected_delivery_date` when NULL, using the area's schedule and cutoff time. |
+| `internal.set_order_tracking_user_id()` | **Trigger (migration 035).** BEFORE INSERT OR UPDATE on `order_tracking`. Sets `user_id` from the parent order, overwriting any supplied value. |
+| `internal.sync_order_tracking_user_id()` | **Trigger (migration 035).** AFTER UPDATE on `orders` when `user_id` changes (e.g. `claim_adhoc_user` via `ON UPDATE CASCADE`). Carries the new owner to the order's tracking rows. |
 
 > Historical note: an older 4-param `place_order` and a
 > `verify_razorpay_recharge` RPC (which had the Razorpay secret hard-coded) were
@@ -607,6 +616,8 @@ none on any `public` table):
 | `subscription_daily_orders` | `trg_daily_order_total` | AFTER INSERT / UPDATE OF `total_value`, **DEFERRED** | `total_value = Σ` its items |
 | `subscription_daily_order_items` | `trg_daily_order_items_total` | AFTER INSERT/UPDATE/DELETE, **DEFERRED** | same, from the item side |
 | `subscriptions` | `trg_guard_subscription_update` | BEFORE UPDATE | non-admins cannot change `user_id` or `payment_method` |
+| `order_tracking` | `trg_set_order_tracking_user_id` | BEFORE INSERT/UPDATE | `user_id` = parent order's `user_id` (migration 035) |
+| `orders` | `trg_sync_order_tracking_user_id` | AFTER UPDATE, WHEN `user_id` changed | tracking rows follow the order's owner (migration 035) |
 
 The deferred ones run at COMMIT, after a parent row and its items are both
 written, which makes them agnostic about who did the writing — RPC, edge function,
