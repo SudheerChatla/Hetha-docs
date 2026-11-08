@@ -7,6 +7,11 @@ listed under [Already done](#already-done).
 
 Ordered by consequence, not by effort.
 
+> **See also [ORDER_FLOW_FIXES.md](./ORDER_FLOW_FIXES.md) (2026-10-15)**: the
+> plan for how orders and subscription deliveries are charged, recorded and
+> refunded. It covers 11 fixes, including the pause first-day charge, missing
+> subscription refunds and double-charge/refund paths. Not started.
+
 > **Update 2026-09-30.** Still accurate as a list of launch work, with these
 > changes since it was written (details in `CHANGES_2026-09-28_29.md` and
 > `CHANGES_2026-09-30.md`):
