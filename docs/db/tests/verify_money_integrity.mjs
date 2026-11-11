@@ -224,7 +224,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '032_claim_adhoc_user_hardening.sql',
                  '033_route_per_address_and_delivery_dates.sql',
                  '034_reschedule_order_snaps_to_delivery_day.sql',
-                 '035_order_tracking_user_id.sql']) {
+                 '035_order_tracking_user_id.sql',
+                 '036_subscription_cutoff_rule.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -2114,6 +2115,247 @@ if (!grants035.anon_set && !grants035.auth_set && !grants035.anon_sync && !grant
 } else {
   bad('035 grants', JSON.stringify(grants035));
 }
+
+// ---------------------------------------------------------------------------
+// 10. Migration 036: one cut-off rule for subscriptions
+// ---------------------------------------------------------------------------
+console.log('\n--- 10. Migration 036: subscription cut-off rule ---');
+
+// AREA_DAILY (pincode 700001) has order_cutoff_time 16:00 from section 9.
+const scalar = async (sql, params) => Object.values((await db.query(sql, params)).rows[0])[0];
+const asDate = (v) => (v instanceof Date ? v.toISOString().slice(0, 10) : String(v).slice(0, 10));
+
+// 10a. The rule at fixed moments (p_now), in India time.
+const ruleCases = [
+  ['before the cut-off → tomorrow',              AREA_DAILY, '2026-11-10 10:00+05:30', '2026-11-11'],
+  ['exactly at the cut-off → tomorrow',          AREA_DAILY, '2026-11-10 16:00+05:30', '2026-11-11'],
+  ['after the cut-off → the day after',          AREA_DAILY, '2026-11-10 17:00+05:30', '2026-11-12'],
+  ['00:30 IST (still yesterday in UTC) → uses the India date', AREA_DAILY, '2026-11-10 00:30+05:30', '2026-11-11'],
+  ['month end after the cut-off',                AREA_DAILY, '2026-11-30 20:00+05:30', '2026-12-02'],
+  ['no area → tomorrow',                         null,       '2026-11-10 23:00+05:30', '2026-11-11'],
+];
+for (const [name, area, now, want] of ruleCases) {
+  const got = asDate(await scalar(
+    `SELECT internal.earliest_change_date($1::uuid, $2::timestamptz)::text`, [area, now]));
+  if (got === want) ok(`earliest_change_date: ${name} (${want})`);
+  else bad(`earliest_change_date: ${name}`, `expected ${want}, got ${got}`);
+}
+await db.exec(`UPDATE public.delivery_areas SET order_cutoff_time = NULL WHERE id = '${AREA_DAILY}'`);
+{
+  const got = asDate(await scalar(
+    `SELECT internal.earliest_change_date($1::uuid, $2::timestamptz)::text`, [AREA_DAILY, '2026-11-10 23:00+05:30']));
+  if (got === '2026-11-11') ok('earliest_change_date: area with no cut-off time → always tomorrow');
+  else bad('earliest_change_date: no cut-off time', `got ${got}`);
+}
+
+// Dates relative to the real clock, read from the database so the test and the
+// functions agree on "today in India".
+const D0 = asDate(await scalar(`SELECT internal.today_ist()::text`));
+const D1 = asDate(await scalar(`SELECT (internal.today_ist() + 1)::text`));
+const D2 = asDate(await scalar(`SELECT (internal.today_ist() + 2)::text`));
+const D10 = asDate(await scalar(`SELECT (internal.today_ist() + 10)::text`));
+const CUTOFF_PASSED = `UPDATE public.delivery_areas SET order_cutoff_time = '00:00:00' WHERE id = '${AREA_DAILY}'`;
+const CUTOFF_NONE   = `UPDATE public.delivery_areas SET order_cutoff_time = NULL WHERE id = '${AREA_DAILY}'`;
+
+// Room under the 5-subscription limit, and a wallet that passes the buffer.
+await db.exec(`
+  UPDATE public.subscriptions SET status = 'cancelled' WHERE user_id = '${CUSTOMER}';
+  UPDATE public.users SET wallet_balance = 100000 WHERE id = '${CUSTOMER}';
+`);
+await db.query(
+  `INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'subscriptions:edit') ON CONFLICT DO NOTHING`, [roleId]);
+
+const ADDR_036 = JSON.stringify({ pincode: '700001', name: 'Cust', phoneNumber: '9000000001' });
+const ITEMS_036 = JSON.stringify([{ variantId: VAR, quantity: 1, startDate: '2026-07-28' }]);
+const newSub = async (claims, startExpr, params = []) => (await asQuery(claims,
+  `SELECT public.create_subscription($1, ${startExpr}, NULL, 'active', $2::jsonb, $3::jsonb, 'Cutoff036') AS id`,
+  [CUSTOMER, ADDR_036, ITEMS_036, ...params])).rows[0].id;
+const subDates = async (id) => {
+  const r = (await db.query(`
+    SELECT s.start_date::text AS start_date, MIN(si.item_start_date)::text AS item_start
+    FROM public.subscriptions s JOIN public.subscription_items si ON si.subscription_id = s.id
+    WHERE s.id = $1 GROUP BY s.start_date`, [id])).rows[0];
+  return { start: asDate(r.start_date), item: asDate(r.item_start) };
+};
+
+// 10b. No cut-off time: a customer's "start now" becomes tomorrow, and the
+//      item's (past) start date follows the subscription.
+await db.exec(CUTOFF_NONE);
+const subTomorrow = await newSub(CUST_CLAIMS, 'now()');
+{
+  const d = await subDates(subTomorrow);
+  if (d.start === D1 && d.item === D1) ok(`customer subscription with an early start is moved to tomorrow (${D1}); item start follows`);
+  else bad('create_subscription clamp, no cut-off', JSON.stringify({ d, D1 }));
+}
+
+// 10c. Cut-off passed: the same request starts the day after tomorrow.
+await db.exec(CUTOFF_PASSED);
+const subAfterCutoff = await newSub(CUST_CLAIMS, 'now()');
+{
+  const d = await subDates(subAfterCutoff);
+  if (d.start === D2 && d.item === D2) ok(`after the cut-off the subscription starts the day after tomorrow (${D2})`);
+  else bad('create_subscription clamp, cut-off passed', JSON.stringify({ d, D2 }));
+}
+
+// 10d. A later start date chosen by the customer is kept.
+const subLater = await newSub(CUST_CLAIMS, '$4::timestamptz', [`${D10}T00:00:00.000`]);
+{
+  const d = await subDates(subLater);
+  if (d.start === D10 && d.item === D10) ok(`a later start date is kept (${D10})`);
+  else bad('create_subscription keeps a later start', JSON.stringify({ d, D10 }));
+}
+
+// 10e. Admin callers choose the start date freely (ops backfill).
+const subAdmin = await newSub(ADMIN_CLAIMS, '$4::timestamptz', [`${D0}T00:00:00.000`]);
+{
+  const d = await subDates(subAdmin);
+  if (d.start === D0) ok(`admin-created subscription keeps today as its start (${D0})`);
+  else bad('admin create_subscription not clamped', JSON.stringify({ d, D0 }));
+}
+
+// 10f. Day edits by the customer, cut-off passed → earliest changeable day is D2.
+const ONE = JSON.stringify([{ variant_id: VAR, quantity: 1 }]);
+const modify = (claims, date) => asQuery(claims,
+  `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`, [CUSTOMER, subTomorrow, date, ONE]);
+const revert = (claims, date) => asQuery(claims,
+  `SELECT public.revert_daily_order($1, $2::date, $3::uuid)`, [CUSTOMER, date, subTomorrow]);
+const bulk = (claims, dates) => asQuery(claims,
+  `SELECT public.modify_daily_orders_bulk($1, $2, $3::jsonb)`,
+  [CUSTOMER, subTomorrow, JSON.stringify(dates.map((d) => ({ delivery_date: d, items: [{ variant_id: VAR, quantity: 1 }] })))]);
+const ordersOn = async (date) => Number(await scalar(
+  `SELECT count(*) FROM public.subscription_daily_orders WHERE subscription_id = $1 AND delivery_date = $2::date`,
+  [subTomorrow, date]));
+
+await expectError("customer cannot change today's order", () => modify(CUST_CLAIMS, D0), 'no longer be changed');
+await expectError('customer cannot change tomorrow after the cut-off', () => modify(CUST_CLAIMS, D1), 'no longer be changed');
+await expectError('past date still reports "past"', () => modify(CUST_CLAIMS, '2000-01-01'), 'past');
+await expectOk('customer can change the day after tomorrow', () => modify(CUST_CLAIMS, D2));
+await expectError('bulk edit is refused when one day is past the cut-off', () => bulk(CUST_CLAIMS, [D10, D1]), 'no longer be changed');
+if (await ordersOn(D10) === 0) ok('refused bulk edit wrote nothing');
+else bad('refused bulk edit wrote nothing', 'an order exists for the allowed day of the refused batch');
+await expectOk('bulk edit of changeable days is allowed', () => bulk(CUST_CLAIMS, [D10]));
+await expectError('customer cannot reset tomorrow after the cut-off', () => revert(CUST_CLAIMS, D1), 'no longer be changed');
+await expectOk('customer can reset the day after tomorrow', () => revert(CUST_CLAIMS, D2));
+if (await ordersOn(D2) === 0) ok('reset removed the customer edit');
+else bad('reset removed the customer edit', 'order still present');
+
+// Admins with subscriptions:edit are not bound by the cut-off.
+await expectOk('admin can still change tomorrow after the cut-off', () => modify(ADMIN_CLAIMS, D1));
+await expectOk('admin can still reset tomorrow after the cut-off', () => revert(ADMIN_CLAIMS, D1));
+
+// No cut-off time → tomorrow is changeable, today is not.
+await db.exec(CUTOFF_NONE);
+await expectOk('with no cut-off time the customer can change tomorrow', () => modify(CUST_CLAIMS, D1));
+await expectError('with no cut-off time today is still closed', () => modify(CUST_CLAIMS, D0), 'no longer be changed');
+
+// 10g. The app helper, and grants.
+await db.exec(CUTOFF_PASSED);
+{
+  const serviceable = asDate(await scalar(`SELECT public.get_earliest_subscription_start('700001')::text`));
+  const unknown = asDate(await scalar(`SELECT public.get_earliest_subscription_start('999999')::text`));
+  if (serviceable === D2 && unknown === D1) ok(`get_earliest_subscription_start: area past cut-off → ${D2}, unknown pincode → ${D1}`);
+  else bad('get_earliest_subscription_start', JSON.stringify({ serviceable, unknown, D1, D2 }));
+}
+const grants036 = (await db.query(`
+  SELECT
+    has_function_privilege('anon',          'public.get_earliest_subscription_start(text)',         'EXECUTE') AS anon_pub,
+    has_function_privilege('authenticated', 'public.get_earliest_subscription_start(text)',         'EXECUTE') AS auth_pub,
+    has_function_privilege('authenticated', 'internal.earliest_change_date(uuid, timestamptz)',     'EXECUTE') AS auth_rule,
+    has_function_privilege('anon',          'internal.assert_day_changeable(uuid, date)',           'EXECUTE') AS anon_assert,
+    has_function_privilege('authenticated', 'internal.assert_day_changeable(uuid, date)',           'EXECUTE') AS auth_assert,
+    has_function_privilege('authenticated', 'public.modify_daily_order(uuid, uuid, date, jsonb)',   'EXECUTE') AS auth_modify,
+    has_function_privilege('authenticated', 'public.modify_daily_orders_bulk(uuid, uuid, jsonb)',   'EXECUTE') AS auth_bulk,
+    has_function_privilege('authenticated', 'public.revert_daily_order(uuid, date, uuid)',          'EXECUTE') AS auth_revert,
+    has_function_privilege('anon',          'public.modify_daily_order(uuid, uuid, date, jsonb)',   'EXECUTE') AS anon_modify`)).rows[0];
+if (!grants036.anon_pub && grants036.auth_pub && !grants036.auth_rule && !grants036.anon_assert
+    && !grants036.auth_assert && grants036.auth_modify && grants036.auth_bulk && grants036.auth_revert
+    && !grants036.anon_modify) {
+  ok('036 grants: helper for authenticated only; internal functions closed; day-edit RPC grants unchanged');
+} else {
+  bad('036 grants', JSON.stringify(grants036));
+}
+
+// 10i. Pauses follow the same cut-off. subTomorrow is in AREA_DAILY.
+const D3 = asDate(await scalar(`SELECT (internal.today_ist() + 3)::text`));
+const D4 = asDate(await scalar(`SELECT (internal.today_ist() + 4)::text`));
+const DM1 = asDate(await scalar(`SELECT (internal.today_ist() - 1)::text`));
+const pause = (claims, start, end) => asQuery(claims,
+  `SELECT public.upsert_pauses($1, $2::jsonb)`, [subTomorrow, JSON.stringify([{ start, end }])]);
+const resume = (claims, dates) => asQuery(claims,
+  `SELECT public.remove_paused_dates($1, $2::jsonb)`, [subTomorrow, JSON.stringify(dates)]);
+const pauseRanges = async () => (await db.query(`
+  SELECT pause_start_date::text AS s, pause_end_date::text AS e
+  FROM public.subscription_pauses WHERE subscription_id = $1 ORDER BY pause_start_date`, [subTomorrow]))
+  .rows.map((r) => `${asDate(r.s)}..${asDate(r.e)}`).join(', ');
+const expectRanges = async (name, want) => {
+  const got = await pauseRanges();
+  if (got === want) ok(`${name} (${want || 'no pauses'})`);
+  else bad(name, `expected "${want}", got "${got}"`);
+};
+await db.query(`DELETE FROM public.subscription_pauses WHERE subscription_id = $1`, [subTomorrow]);
+
+// Cut-off passed → earliest changeable day is D2.
+await db.exec(CUTOFF_PASSED);
+await expectError('customer cannot pause today', () => pause(CUST_CLAIMS, D0, D0), 'no longer be paused');
+await expectError('customer cannot pause tomorrow after the cut-off', () => pause(CUST_CLAIMS, D1, D1), 'no longer be paused');
+await expectError('a range that starts before the cut-off day is refused whole', () => pause(CUST_CLAIMS, D1, D3), 'no longer be paused');
+await expectError('customer cannot pause a past day', () => pause(CUST_CLAIMS, DM1, DM1), 'no longer be paused');
+await expectError('pause with end before start is refused', () => pause(CUST_CLAIMS, D3, D2), 'start date and an end date');
+await expectRanges('refused pauses wrote nothing', '');
+await expectOk('customer can pause from the day after tomorrow', () => pause(CUST_CLAIMS, D2, D3));
+await expectRanges('pause stored', `${D2}..${D3}`);
+
+// Staff pause tomorrow for the customer; the customer may then extend that
+// pause (tomorrow is already paused, so it is not a change) but not undo it.
+await expectOk('admin can pause tomorrow after the cut-off', () => pause(ADMIN_CLAIMS, D1, D1));
+await expectRanges('admin pause merged with the adjacent range', `${D1}..${D3}`);
+await expectOk('customer can extend a pause that already covers tomorrow', () => pause(CUST_CLAIMS, D1, D4));
+await expectRanges('extended pause', `${D1}..${D4}`);
+await expectError('customer cannot un-pause tomorrow after the cut-off', () => resume(CUST_CLAIMS, [D1]), 'no longer be removed');
+await expectError('a resume batch with one locked day is refused whole', () => resume(CUST_CLAIMS, [D3, D1]), 'no longer be removed');
+await expectRanges('refused resume changed nothing', `${D1}..${D4}`);
+await expectOk('customer can un-pause a later day (range splits around it)', () => resume(CUST_CLAIMS, [D3]));
+await expectRanges('split keeps the locked first day paused', `${D1}..${D2}, ${D4}..${D4}`);
+await expectOk('resuming a day that is not paused is a no-op, even before the cut-off day', () => resume(CUST_CLAIMS, [D0]));
+await expectOk('admin can un-pause tomorrow after the cut-off', () => resume(ADMIN_CLAIMS, [D1]));
+await expectRanges('admin resume applied', `${D2}..${D2}, ${D4}..${D4}`);
+await expectError('another customer cannot pause this subscription', () => pause({ sub: OTHER, role: 'authenticated' }, D4, D4), 'Not authorized');
+
+// Direct insert into the table (what a hand-made request could do).
+const directPause = (claims, start, end) => asQuery(claims,
+  `INSERT INTO public.subscription_pauses (subscription_id, pause_start_date, pause_end_date, created_by)
+   VALUES ($1, $2::date, $3::date, 'user')`, [subTomorrow, start, end]);
+await expectError('direct insert of a pause for tomorrow is refused after the cut-off',
+  () => directPause(CUST_CLAIMS, D1, D1), 'no longer be paused');
+await expectOk('direct insert of a later pause is allowed', () => directPause(CUST_CLAIMS, D10, D10));
+await expectOk('service role can insert any pause directly', () => directPause({ role: 'service_role' }, D0, D0));
+
+// No cut-off time → tomorrow can be paused and resumed, today cannot.
+await db.exec(CUTOFF_NONE);
+await db.query(`DELETE FROM public.subscription_pauses WHERE subscription_id = $1`, [subTomorrow]);
+await expectOk('with no cut-off time the customer can pause tomorrow', () => pause(CUST_CLAIMS, D1, D1));
+await expectOk('with no cut-off time the customer can resume tomorrow', () => resume(CUST_CLAIMS, [D1]));
+await expectError('with no cut-off time today still cannot be paused', () => pause(CUST_CLAIMS, D0, D0), 'no longer be paused');
+await expectRanges('pauses clean at the end', '');
+
+const grants036p = (await db.query(`
+  SELECT
+    has_function_privilege('authenticated', 'public.upsert_pauses(uuid, jsonb)',                 'EXECUTE') AS auth_upsert,
+    has_function_privilege('authenticated', 'public.remove_paused_dates(uuid, jsonb)',           'EXECUTE') AS auth_remove,
+    has_function_privilege('anon',          'public.upsert_pauses(uuid, jsonb)',                 'EXECUTE') AS anon_upsert,
+    has_function_privilege('authenticated', 'internal.subscription_earliest_change_date(uuid)',  'EXECUTE') AS auth_lookup,
+    has_function_privilege('authenticated', 'internal.guard_direct_pause_insert()',              'EXECUTE') AS auth_guard,
+    (SELECT count(*) FROM pg_trigger WHERE tgname = 'trg_guard_direct_pause_insert')::int                  AS triggers`)).rows[0];
+if (grants036p.auth_upsert && grants036p.auth_remove && !grants036p.anon_upsert
+    && !grants036p.auth_lookup && !grants036p.auth_guard && grants036p.triggers === 1) {
+  ok('036 pause grants unchanged; internal helpers closed; one insert trigger');
+} else {
+  bad('036 pause grants', JSON.stringify(grants036p));
+}
+
+// 10h. Idempotent.
+await expectOk('migration 036 re-runs cleanly (idempotent)',
+  () => db.exec(read(`${ROOT}/migrations/036_subscription_cutoff_rule.sql`)));
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);
