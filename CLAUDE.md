@@ -54,7 +54,7 @@ Env files: `Hetha_app/.env` holds `PROJECT_URL` and `PUBLISHABLE_KEY`. `Hetha_ad
 - Customers cannot write `orders`, `order_items`, or `subscription_items` directly. `authenticated` has no UPDATE grant on `users.wallet_balance`.
 - Deferred constraint triggers enforce totals (`subtotal = Σ items`, `total = subtotal + delivery_charge`). The deliberate escape hatch is `SET LOCAL hetha.skip_money_checks = 'on'`.
 - Delivery charge is ₹0 for pincodes in an active delivery area. Otherwise it comes from `delivery_charge_tiers` by weight. A client-supplied charge is honoured only for admin callers.
-- **3-day buffer rule:** wallet purchases and new subscriptions must leave 3 days of daily subscription commitment in the wallet. The DB enforces it; both UIs mirror it for friendlier messages.
+- **Wallet reserve (migration 039, D-1):** wallet purchases, new subscriptions and day edits must leave **one upcoming delivery of each active subscription** in the wallet. Defined only in `internal.wallet_reserve`; apps read it with `get_wallet_reserve` and never compute it. "How far the wallet reaches" comes only from `get_wallet_forecast`.
 - Orders and subscriptions copy customer, address, and product data into `snapshot_*` columns, so history stays fixed.
 - Run-sheet generation rules (cutoffs, pauses, frequency, route per address): `Hetha_admin/docs/daily_ops.md`.
 

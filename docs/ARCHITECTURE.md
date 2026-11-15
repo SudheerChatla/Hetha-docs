@@ -171,16 +171,21 @@ participate.
   `get_user_daily_commitment(user_id)` returns the total daily cost across **all**
   of a user's active subscriptions.
 
-### The 3-day buffer rule
+### The wallet reserve (migration 039)
 
-To stop a one-time purchase from starving upcoming daily deliveries, three days
-of total daily commitment are reserved. **Enforced in the database** (and mirrored
-in the UI for a friendlier message):
+To stop a one-time purchase from starving the next subscription delivery, the
+wallet keeps **one upcoming delivery of each active subscription** (owner
+decision D-1). Defined only in `internal.wallet_reserve`; enforced in the
+database; the apps read the number with `get_wallet_reserve`:
 
-- **Creating a subscription:** require
-  `wallet_balance ≥ (existing_daily_commitment + new_sub_daily_cost) × 3`.
-- **Paying for a one-time order from the wallet:** require
-  `wallet_balance ≥ (daily_commitment × 3) + order_total`.
+- **Creating a subscription:** `wallet_balance ≥ reserve + new_sub_per_delivery`.
+- **Paying for a one-time order from the wallet:** `wallet_balance ≥ reserve + order_total`.
+- **Raising a day's order:** `wallet_balance ≥ reserve + that day's extra`.
+
+A wallet that cannot cover a delivery at finalize skips that delivery (nothing
+is charged, migration 037). Customers are kept topped up by a low-balance
+notice after finalize and a configurable evening reminder, both based on
+`get_wallet_forecast` (the real schedule, pauses and day edits).
 
 Admin-placed orders skip the reserve deliberately, so ops can still fulfil edge
 cases.
@@ -274,7 +279,7 @@ decides money.**
 | Amount payable online | `payment_intents.amount_paise`, set server-side |
 | Amount credited | Razorpay's `payments.fetch` response |
 | Wallet balance | `internal.apply_wallet_delta()` only; `authenticated` has no UPDATE grant on the column |
-| 3-day buffer | Enforced in `place_order` and `create_subscription` (was UI-only) |
+| Wallet reserve | One delivery of each subscription, `internal.wallet_reserve`, enforced in `place_order`, `create_subscription` and day edits (migration 039) |
 
 Enforcement layers, outermost first:
 
