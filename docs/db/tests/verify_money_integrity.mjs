@@ -103,7 +103,7 @@ await db.exec(`
     status text NOT NULL DEFAULT 'draft',
     generated_by uuid, generated_at timestamptz,
     finalized_by uuid, finalized_at timestamptz,
-    reconciled_at timestamptz,
+    reconciled_at timestamptz, reconciled_by uuid,
     total_orders integer, total_value numeric,
     wallet_deduction_completed_at timestamptz,
     updated_at timestamptz DEFAULT now()
@@ -225,7 +225,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '033_route_per_address_and_delivery_dates.sql',
                  '034_reschedule_order_snaps_to_delivery_day.sql',
                  '035_order_tracking_user_id.sql',
-                 '036_subscription_cutoff_rule.sql']) {
+                 '036_subscription_cutoff_rule.sql',
+                 '037_daily_order_settlement.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -2356,6 +2357,477 @@ if (grants036p.auth_upsert && grants036p.auth_remove && !grants036p.anon_upsert
 // 10h. Idempotent.
 await expectOk('migration 036 re-runs cleanly (idempotent)',
   () => db.exec(read(`${ROOT}/migrations/036_subscription_cutoff_rule.sql`)));
+
+// ---------------------------------------------------------------------------
+// 11. Migration 037: one settlement function for subscription daily orders
+// ---------------------------------------------------------------------------
+console.log('\n--- 11. Migration 037: daily order settlement ---');
+{
+  const { randomUUID } = await import('node:crypto');
+  const U1 = 'a0370000-0000-4000-8000-000000000001';
+  const U2 = 'a0370000-0000-4000-8000-000000000002';
+  const SERVICE = { role: 'service_role' };
+  const num = (v) => Number(v);
+  const eq = (name, got, want) => {
+    const g = JSON.stringify(got), w = JSON.stringify(want);
+    if (g === w) ok(`${name} (${w})`); else bad(name, `expected ${w}, got ${g}`);
+  };
+  const rpc = async (claims, call, params) => {
+    const r = (await asQuery(claims, `SELECT ${call} AS r`, params)).rows[0].r;
+    return typeof r === 'string' ? JSON.parse(r) : r;
+  };
+
+  await db.exec(`
+    INSERT INTO public.users (id, email, phone, first_name, wallet_balance)
+    VALUES ('${U1}', 'u1-037@example.com', '9037000001', 'U1', 0),
+           ('${U2}', 'u2-037@example.com', '9037000002', 'U2', 0);
+  `);
+  await db.query(
+    `INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'daily_ops:edit') ON CONFLICT DO NOTHING`, [roleId]);
+
+  const setBalance = (user, amount) =>
+    db.query(`UPDATE public.users SET wallet_balance = $2 WHERE id = $1`, [user, amount]);
+  const balance = async (user) =>
+    num((await db.query(`SELECT wallet_balance FROM public.users WHERE id = $1`, [user])).rows[0].wallet_balance);
+
+  // A subscription row (only what the settlement functions read).
+  const mkSub = async (user, createdAt, method = 'wallet') => {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO public.subscriptions (id, user_id, status, payment_method, created_at, snapshot_pincode)
+       VALUES ($1, $2, 'active', $3, $4::timestamp, '700001')`, [id, user, method, createdAt]);
+    return id;
+  };
+  // A daily order with its items, written in one transaction (deferred total check).
+  const mkOrder = async (sub, user, date, lines, extra = {}) => {
+    const id = randomUUID();
+    const items = lines.map((l) => ({ id: randomUUID(), qty: l.qty, price: l.price ?? 100 }));
+    const total = items.reduce((s, i) => s + i.qty * i.price, 0);
+    const itemRows = items.map((i) =>
+      `('${i.id}', '${id}', '${VAR}', 'Cow Milk', '1 L', ${i.price}, ${i.qty}, ${i.qty * i.price})`).join(', ');
+    await db.exec(`
+      BEGIN;
+      INSERT INTO public.subscription_daily_orders
+        (id, delivery_date, subscription_id, user_id, status, total_value, payment_status, is_finalized)
+      VALUES ('${id}', '${date}', '${sub}', '${user}', '${extra.status ?? 'pending'}', ${total},
+              '${extra.payment_status ?? 'pending'}', ${extra.is_finalized ?? false});
+      INSERT INTO public.subscription_daily_order_items
+        (id, daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+      VALUES ${itemRows};
+      COMMIT;`);
+    return { id, items: items.map((i) => i.id), total };
+  };
+  const order = async (id) => {
+    const r = (await db.query(`
+      SELECT status, payment_status, paid_amount, skip_reason, is_finalized,
+             settlement_hold_reason IS NOT NULL AS on_hold
+      FROM public.subscription_daily_orders WHERE id = $1`, [id])).rows[0];
+    return { status: r.status, payment: r.payment_status, paid: num(r.paid_amount),
+             skip: r.skip_reason, finalized: r.is_finalized, hold: r.on_hold };
+  };
+  const ledgerNet = async (id) => num((await db.query(`
+    SELECT COALESCE(SUM(CASE WHEN type = 'debit' THEN amount ELSE -amount END), 0) AS n
+    FROM public.wallet_transactions WHERE reference_type = 'subscription' AND reference_id = $1`, [id])).rows[0].n);
+  const run = async (date) => {
+    const r = (await db.query(
+      `SELECT status, total_orders, total_value FROM public.daily_ops_runs WHERE delivery_date = $1`, [date])).rows[0];
+    return r ? { status: r.status, orders: num(r.total_orders), value: num(r.total_value) } : null;
+  };
+  const deliveredQty = async (orderId) => (await db.query(`
+    SELECT delivered_qty FROM public.subscription_daily_order_items
+    WHERE daily_order_id = $1 ORDER BY quantity DESC, id`, [orderId])).rows.map((r) => r.delivered_qty);
+
+  const finalize  = (claims, date) => rpc(claims, `public.finalize_daily_run($1::date, $2)`, [date, ADMIN]);
+  const unlock    = (claims, date) => rpc(claims, `public.unlock_daily_run($1::date)`, [date]);
+  const reconcile = (claims, date) => rpc(claims, `public.reconcile_daily_run($1::date, $2)`, [date, ADMIN]);
+  const retry     = (claims, id)   => rpc(claims, `public.retry_daily_order_payment($1)`, [id]);
+  const setStatus = (claims, ids, status) =>
+    rpc(claims, `public.set_daily_order_status($1::uuid[], $2)`, [`{${ids.join(',')}}`, status]);
+  const deliver = (claims, o, qtys, note = null) => rpc(claims,
+    `public.record_subscription_delivery($1, $2::jsonb, $3)`,
+    [o.id, JSON.stringify(qtys.map((q, i) => ({ item_id: o.items[i], delivered_qty: q })).filter((x) => x.delivered_qty !== null)), note]);
+
+  const allOrders = [];   // every order this section creates, for the ledger check at the end
+  const track = (o) => { allOrders.push(o.id); return o; };
+
+  // ── 11a. Backfill from the wallet ledger ──────────────────────────────────
+  // Legacy rows (settled_at NULL), then the migration is run again.
+  const subL = [];
+  for (let i = 0; i < 7; i++) subL.push(await mkSub(U1, `2019-01-0${i + 1}`));
+  const BF = '2097-01-01';
+  const L1 = await mkOrder(subL[0], U1, BF, [{ qty: 2 }], { payment_status: 'paid', is_finalized: true });
+  const L2 = await mkOrder(subL[1], U1, BF, [{ qty: 2 }], { payment_status: 'paid', is_finalized: true });
+  const L3 = await mkOrder(subL[2], U1, BF, [{ qty: 2 }], { payment_status: 'paid', is_finalized: true });
+  const L4 = await mkOrder(subL[3], U1, BF, [{ qty: 2 }]);
+  const L5 = await mkOrder(subL[4], U1, BF, [{ qty: 2 }], { payment_status: 'failed', is_finalized: true });
+  const L6 = await mkOrder(subL[5], U1, BF, [{ qty: 2 }], { payment_status: 'paid', is_finalized: true });
+  const L7 = await mkOrder(subL[6], U1, BF, [{ qty: 2 }], { payment_status: 'failed', is_finalized: true });
+  const legacyTxn = (orderId, type, amount) => db.query(`
+    INSERT INTO public.wallet_transactions (user_id, type, amount, balance_after, description, reference_type, reference_id)
+    VALUES ($1, $2, $3, 0, 'legacy', 'subscription', $4)`, [U1, type, amount, orderId]);
+  await legacyTxn(L1.id, 'debit', 200);
+  await legacyTxn(L3.id, 'debit', 150);
+  await legacyTxn(L5.id, 'debit', 100);
+  await legacyTxn(L6.id, 'debit', 200);
+  await legacyTxn(L6.id, 'credit', 200);
+
+  await expectOk('migration 037 re-runs cleanly and backfills legacy rows',
+    () => db.exec(read(`${ROOT}/migrations/037_daily_order_settlement.sql`)));
+  const bf = async (o) => { const r = await order(o.id); return { paid: r.paid, hold: r.hold }; };
+  eq('backfill: paid + matching debit → paid_amount from the ledger, no hold', await bf(L1), { paid: 200, hold: false });
+  eq('backfill: paid but no wallet transaction → 0 and on hold (not guessed from the total)', await bf(L2), { paid: 0, hold: true });
+  eq('backfill: paid but ledger (150) ≠ total (200) → ledger amount, on hold', await bf(L3), { paid: 150, hold: true });
+  eq('backfill: pending with no ledger → 0, no hold', await bf(L4), { paid: 0, hold: false });
+  eq('backfill: failed but ledger shows a debit → on hold', await bf(L5), { paid: 100, hold: true });
+  eq('backfill: paid but already refunded by hand (net 0) → on hold', await bf(L6), { paid: 0, hold: true });
+  eq('backfill: went out with a failed debit under the old system → on hold, not charged later', await bf(L7), { paid: 0, hold: true });
+  await expectError('an order on payment hold cannot be settled',
+    () => setStatus(ADMIN_CLAIMS, [L2.id], 'cancelled'), 'needs review');
+  eq('refused change left the held order untouched', (await order(L2.id)).status, 'pending');
+
+  // ── 11b. Finalize, and a second finalize ──────────────────────────────────
+  const D1 = '2097-02-01';
+  const sub1a = await mkSub(U1, '2020-01-01');
+  await setBalance(U1, 1000);
+  const O1 = track(await mkOrder(sub1a, U1, D1, [{ qty: 2 }, { qty: 1 }]));   // 300
+  await expectError('a customer cannot finalize', () => finalize({ sub: U1, role: 'authenticated' }, D1), 'not authorized');
+  const f1 = await finalize(ADMIN_CLAIMS, D1);
+  eq('finalize result', { finalized: f1.finalized, deducted: f1.total_deducted, charged: f1.charged.length, skipped: f1.skipped.length, errors: f1.deduction_errors.length },
+    { finalized: 1, deducted: 300, charged: 1, skipped: 0, errors: 0 });
+  eq('finalize: order paid in full', await order(O1.id),
+    { status: 'pending', payment: 'paid', paid: 300, skip: null, finalized: true, hold: false });
+  eq('finalize: wallet debited once', await balance(U1), 700);
+  await expectError('second finalize of the same day is refused', () => finalize(ADMIN_CLAIMS, D1), 'already finalized');
+  eq('second finalize took nothing', { balance: await balance(U1), ledger: await ledgerNet(O1.id) }, { balance: 700, ledger: 300 });
+
+  // ── 11c. Partial delivery, repeats and corrections ────────────────────────
+  await expectError('a customer cannot record a delivery', () => deliver({ sub: U1, role: 'authenticated' }, O1, [2, 1]), 'Not authorized');
+  await expectError('every item needs a delivered quantity', () => deliver(ADMIN_CLAIMS, O1, [1, null]), 'every item');
+  await expectError('delivered quantity above the ordered one is refused', () => deliver(ADMIN_CLAIMS, O1, [3, 1]), 'exceeds');
+  eq('refused recordings moved no money', { balance: await balance(U1), qty: await deliveredQty(O1.id) }, { balance: 700, qty: [null, null] });
+
+  const d1 = await deliver(ADMIN_CLAIMS, O1, [1, 1]);
+  eq('partial delivery: 1 of 2 short → refund ₹100', { status: d1.status, refunded: d1.refunded, charged: d1.charged, short: d1.short },
+    { status: 'delivered', refunded: 100, charged: 0, short: true });
+  eq('partial delivery: wallet and order', { balance: await balance(U1), ...(await order(O1.id)) },
+    { balance: 800, status: 'delivered', payment: 'paid', paid: 200, skip: null, finalized: true, hold: false });
+
+  const d2 = await deliver(ADMIN_CLAIMS, O1, [1, 1]);
+  eq('recording the same delivery again moves nothing', { refunded: d2.refunded, charged: d2.charged, balance: await balance(U1) },
+    { refunded: 0, charged: 0, balance: 800 });
+
+  const d3 = await deliver(ADMIN_CLAIMS, O1, [2, 1]);
+  eq('correcting the quantity upward charges only the difference', { charged: d3.charged, refunded: d3.refunded, short: d3.short, balance: await balance(U1) },
+    { charged: 100, refunded: 0, short: false, balance: 700 });
+
+  const d4 = await deliver(ADMIN_CLAIMS, O1, [0, 0]);
+  eq('nothing delivered → cancelled and fully refunded', { status: d4.status, refunded: d4.refunded, balance: await balance(U1), ...(await order(O1.id)) },
+    { status: 'cancelled', refunded: 300, balance: 1000, payment: 'refunded', paid: 0, skip: null, finalized: true, hold: false });
+
+  await setBalance(U1, 50);
+  await expectError('a correction the wallet cannot cover is refused', () => deliver(ADMIN_CLAIMS, O1, [2, 1]), 'too low');
+  eq('refused correction changed nothing', { balance: await balance(U1), qty: await deliveredQty(O1.id), status: (await order(O1.id)).status },
+    { balance: 50, qty: [0, 0], status: 'cancelled' });
+  await setBalance(U1, 1000);
+  const d5 = await deliver(ADMIN_CLAIMS, O1, [2, 1]);
+  eq('after a recharge the correction goes through', { status: d5.status, charged: d5.charged, balance: await balance(U1), paid: (await order(O1.id)).paid },
+    { status: 'delivered', charged: 300, balance: 700, paid: 300 });
+
+  // ── 11d. Insufficient balance: deterministic priority, skip, retry ────────
+  const D2 = '2097-02-02';
+  const subNew = await mkSub(U2, '2021-06-01');   // newer subscription, order inserted FIRST
+  const subOld = await mkSub(U2, '2020-06-01');   // older subscription
+  const sub1b = await mkSub(U1, '2020-01-02');
+  const ONew = track(await mkOrder(subNew, U2, D2, [{ qty: 2 }]));   // 200
+  const OOld = track(await mkOrder(subOld, U2, D2, [{ qty: 2 }]));   // 200
+  const OU1  = track(await mkOrder(sub1b, U1, D2, [{ qty: 1 }]));    // 100
+  await setBalance(U2, 250);                                          // covers one, not both
+  const u1Before = await balance(U1);
+  const f2 = await finalize(ADMIN_CLAIMS, D2);
+  eq('wallet short: older subscription charged, newer one skipped',
+    { old: (await order(OOld.id)).payment, oldPaid: (await order(OOld.id)).paid, ...(await order(ONew.id)) },
+    { old: 'paid', oldPaid: 200, status: 'skipped', payment: 'failed', paid: 0, skip: 'insufficient_balance', finalized: true, hold: false });
+  eq('wallet short: finalize reports who was skipped',
+    { skipped: f2.skipped.map((s) => [s.order_id, s.user_id, s.amount, s.reason]), charged: f2.charged.length, deducted: f2.total_deducted },
+    { skipped: [[ONew.id, U2, 200, 'insufficient_balance']], charged: 2, deducted: 300 });
+  eq('wallet short: nothing taken for the skipped order', { u2: await balance(U2), ledger: await ledgerNet(ONew.id) }, { u2: 50, ledger: 0 });
+  eq('another customer on the same day is charged normally', { u1: u1Before - (await balance(U1)), paid: (await order(OU1.id)).paid }, { u1: 100, paid: 100 });
+  eq('run totals leave the skipped order out', await run(D2), { status: 'finalized', orders: 2, value: 300 });
+
+  await expectError('a skipped-for-payment order cannot be delivered', () => deliver(ADMIN_CLAIMS, ONew, [2]), 'Retry payment');
+  await expectError('a skipped-for-payment order cannot be set back by a status change', () => setStatus(ADMIN_CLAIMS, [ONew.id], 'pending'), 'Retry payment');
+  await expectError('retry while the wallet is still short is refused', () => retry(ADMIN_CLAIMS, ONew.id), 'too low');
+  eq('refused retry left the order skipped', { ...(await order(ONew.id)), u2: await balance(U2) },
+    { status: 'skipped', payment: 'failed', paid: 0, skip: 'insufficient_balance', finalized: true, hold: false, u2: 50 });
+  await expectError('a customer cannot retry a payment', () => retry({ sub: U2, role: 'authenticated' }, ONew.id), 'Not authorized');
+
+  await setBalance(U2, 300);
+  const r1 = await retry(ADMIN_CLAIMS, ONew.id);
+  eq('retry after a recharge charges the order and puts it back', { charged: r1.charged, u2: await balance(U2), ...(await order(ONew.id)) },
+    { charged: 200, u2: 100, status: 'pending', payment: 'paid', paid: 200, skip: null, finalized: true, hold: false });
+  eq('run totals include the retried order', await run(D2), { status: 'finalized', orders: 3, value: 500 });
+  await expectError('retrying an order that is no longer skipped is refused', () => retry(ADMIN_CLAIMS, ONew.id), 'Only an order skipped');
+  eq('second retry took nothing', await balance(U2), 100);
+
+  // ── 11e. Status changes on a finalized day ────────────────────────────────
+  await expectError('invalid status is refused', () => setStatus(ADMIN_CLAIMS, [OU1.id], 'lost'), 'Invalid status');
+  await expectError('a customer cannot change order status', () => setStatus({ sub: U1, role: 'authenticated' }, [OU1.id], 'skipped'), 'Not authorized');
+  let u1 = await balance(U1);
+  const s1 = await setStatus(ADMIN_CLAIMS, [OU1.id], 'skipped');
+  eq('staff skip after finalize → full refund', { refunded: s1.refunded, updated: s1.updated, gain: (await balance(U1)) - u1, ...(await order(OU1.id)) },
+    { refunded: 100, updated: 1, gain: 100, status: 'skipped', payment: 'refunded', paid: 0, skip: null, finalized: true, hold: false });
+  const s1b = await setStatus(ADMIN_CLAIMS, [OU1.id], 'skipped');
+  eq('same status again is a no-op', { updated: s1b.updated, refunded: s1b.refunded, balance: (await balance(U1)) - u1 }, { updated: 0, refunded: 0, balance: 100 });
+  const s2 = await setStatus(ADMIN_CLAIMS, [OU1.id], 'pending');
+  eq('undo the skip → charged again', { charged: s2.charged, balance: (await balance(U1)) - u1, paid: (await order(OU1.id)).paid }, { charged: 100, balance: 0, paid: 100 });
+  const s3 = await setStatus(ADMIN_CLAIMS, [OU1.id, OOld.id], 'delivered');
+  eq('bulk mark delivered records full quantities and moves no money',
+    { updated: s3.updated, refunded: s3.refunded, charged: s3.charged, q1: await deliveredQty(OU1.id), q2: await deliveredQty(OOld.id) },
+    { updated: 2, refunded: 0, charged: 0, q1: [1], q2: [2] });
+  const s4 = await setStatus(ADMIN_CLAIMS, [OOld.id], 'cancelled');
+  eq('cancel a delivered order → full refund', { refunded: s4.refunded, u2: await balance(U2), payment: (await order(OOld.id)).payment }, { refunded: 200, u2: 300, payment: 'refunded' });
+
+  const s5 = await setStatus(ADMIN_CLAIMS, [OOld.id], 'pending');
+  eq('undo a cancel → quantities cleared and charged in full again',
+    { charged: s5.charged, u2: await balance(U2), qty: await deliveredQty(OOld.id), paid: (await order(OOld.id)).paid },
+    { charged: 200, u2: 100, qty: [null], paid: 200 });
+
+  const D2b = '2097-02-03';
+  const sub1c = await mkSub(U1, '2020-01-03');
+  const ODraft = track(await mkOrder(sub1c, U1, D2b, [{ qty: 1 }]));
+  u1 = await balance(U1);
+  await setStatus(ADMIN_CLAIMS, [ODraft.id], 'skipped');
+  eq('status change before finalize moves no money', { balance: await balance(U1), ...(await order(ODraft.id)) },
+    { balance: u1, status: 'skipped', payment: 'pending', paid: 0, skip: null, finalized: false, hold: false });
+  await expectError('an order cannot be marked delivered before the day is finalized', () => setStatus(ADMIN_CLAIMS, [ODraft.id], 'delivered'), 'Finalize the day');
+  await setStatus(ADMIN_CLAIMS, [ODraft.id], 'pending');
+  await expectError('a delivery cannot be recorded before the day is finalized', () => deliver(ADMIN_CLAIMS, ODraft, [1]), 'Finalize the day');
+
+  // ── 11f. Unlock → edit → finalize again ───────────────────────────────────
+  const D3 = '2097-02-04';
+  const sub1d = await mkSub(U1, '2020-01-04');
+  await setBalance(U1, 1000);
+  const OE = track(await mkOrder(sub1d, U1, D3, [{ qty: 2 }]));   // 200
+  await finalize(ADMIN_CLAIMS, D3);
+  eq('before unlock', { balance: await balance(U1), paid: (await order(OE.id)).paid }, { balance: 800, paid: 200 });
+
+  await expectError('an ordinary admin cannot unlock', () => unlock(ADMIN_CLAIMS, D3), 'super admin');
+  await expectError('a customer cannot unlock', () => unlock({ sub: U1, role: 'authenticated' }, D3), 'super admin');
+  const ul = await unlock(SERVICE, D3);
+  eq('unlock reopens the order and keeps what was paid', { reopened: ul.reopened, run: (await run(D3)).status, balance: await balance(U1), ...(await order(OE.id)) },
+    { reopened: 1, run: 'draft', balance: 800, status: 'pending', payment: 'paid', paid: 200, skip: null, finalized: false, hold: false });
+  await expectError('a day that is not finalized cannot be unlocked', () => unlock(SERVICE, D3), 'not finalized');
+
+  const extraItem = randomUUID();
+  await db.exec(`
+    BEGIN;
+    INSERT INTO public.subscription_daily_order_items
+      (id, daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price, is_adhoc_addition)
+    VALUES ('${extraItem}', '${OE.id}', '${VAR}', 'Cow Milk', '1 L', 100, 1, 100, true);
+    UPDATE public.subscription_daily_orders SET total_value = 300 WHERE id = '${OE.id}';
+    COMMIT;`);
+  const f3 = await finalize(ADMIN_CLAIMS, D3);
+  eq('re-finalize after adding an item charges only the ₹100 difference',
+    { deducted: f3.total_deducted, refunded: f3.total_refunded, balance: await balance(U1), paid: (await order(OE.id)).paid, ledger: await ledgerNet(OE.id) },
+    { deducted: 100, refunded: 0, balance: 700, paid: 300, ledger: 300 });
+
+  await unlock(SERVICE, D3);
+  await db.exec(`
+    BEGIN;
+    DELETE FROM public.subscription_daily_order_items WHERE id = '${extraItem}';
+    UPDATE public.subscription_daily_orders SET total_value = 200 WHERE id = '${OE.id}';
+    COMMIT;`);
+  const f4 = await finalize(ADMIN_CLAIMS, D3);
+  eq('re-finalize after removing an item refunds the ₹100 difference',
+    { deducted: f4.total_deducted, refunded: f4.total_refunded, balance: await balance(U1), paid: (await order(OE.id)).paid },
+    { deducted: 0, refunded: 100, balance: 800, paid: 200 });
+
+  await unlock(SERVICE, D3);
+  const f5 = await finalize(ADMIN_CLAIMS, D3);
+  eq('re-finalize with no edit moves nothing', { deducted: f5.total_deducted, refunded: f5.total_refunded, balance: await balance(U1) },
+    { deducted: 0, refunded: 0, balance: 800 });
+
+  await unlock(SERVICE, D3);
+  await db.exec(`
+    BEGIN;
+    UPDATE public.subscription_daily_order_items SET quantity = 60, total_price = 6000 WHERE daily_order_id = '${OE.id}';
+    UPDATE public.subscription_daily_orders SET total_value = 6000 WHERE id = '${OE.id}';
+    COMMIT;`);
+  const f6 = await finalize(ADMIN_CLAIMS, D3);
+  eq('re-finalize the wallet cannot cover → skipped, and the earlier ₹200 is given back',
+    { skipped: f6.skipped.length, refunded: f6.total_refunded, balance: await balance(U1), ...(await order(OE.id)) },
+    { skipped: 1, refunded: 200, balance: 1000, status: 'skipped', payment: 'failed', paid: 0, skip: 'insufficient_balance', finalized: true, hold: false });
+
+  // Cancelled while the day is unlocked: the money goes back at once, and a
+  // charged order can never simply be deleted.
+  const D3b = '2097-02-08';
+  const sub1f = await mkSub(U1, '2020-01-07');
+  const sub1g = await mkSub(U1, '2020-01-08');
+  const OC = track(await mkOrder(sub1f, U1, D3b, [{ qty: 2 }]));   // 200
+  const OK2 = track(await mkOrder(sub1g, U1, D3b, [{ qty: 1 }]));  // 100
+  await finalize(ADMIN_CLAIMS, D3b);
+  await unlock(SERVICE, D3b);
+  u1 = await balance(U1);
+  await expectError('a charged order cannot be deleted',
+    () => db.query(`DELETE FROM public.subscription_daily_orders WHERE id = $1`, [OC.id]), 'cannot be deleted');
+  const sc = await setStatus(ADMIN_CLAIMS, [OC.id], 'cancelled');
+  eq('cancel on an unlocked day refunds the paid order immediately',
+    { refunded: sc.refunded, gain: (await balance(U1)) - u1, ...(await order(OC.id)) },
+    { refunded: 200, gain: 200, status: 'cancelled', payment: 'refunded', paid: 0, skip: null, finalized: false, hold: false });
+  // The other order is skipped by a direct table update (the old panel's way):
+  // finalize's refund sweep still gives the money back.
+  await db.query(`UPDATE public.subscription_daily_orders SET status = 'skipped' WHERE id = $1`, [OK2.id]);
+  const fs = await finalize(ADMIN_CLAIMS, D3b);
+  eq('finalize refunds a skipped order that still held money',
+    { refunded: fs.total_refunded, deducted: fs.total_deducted, gain: (await balance(U1)) - u1, paid: (await order(OK2.id)).paid, run: await run(D3b) },
+    { refunded: 100, deducted: 0, gain: 300, paid: 0, run: { status: 'finalized', orders: 0, value: 0 } });
+  await db.exec(`BEGIN;
+    DELETE FROM public.subscription_daily_order_items WHERE daily_order_id = '${OC.id}';
+    DELETE FROM public.subscription_daily_orders WHERE id = '${OC.id}';
+    COMMIT;`);
+  allOrders.splice(allOrders.indexOf(OC.id), 1);
+  ok('an order with nothing charged can be deleted');
+
+  // ── 11g. An unexpected settlement error does not let the order go out unpaid
+  const D5 = '2097-02-05';
+  const sub1e = await mkSub(U1, '2020-01-05');
+  const OErr = await mkOrder(sub1e, U1, D5, [{ qty: 1 }]);
+  await db.query(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = 'test hold' WHERE id = $1`, [OErr.id]);
+  u1 = await balance(U1);
+  const f7 = await finalize(ADMIN_CLAIMS, D5);
+  eq('held order at finalize → reported, skipped (payment_error), nothing taken',
+    { errors: f7.deduction_errors.length, balance: await balance(U1), status: (await order(OErr.id)).status, skip: (await order(OErr.id)).skip },
+    { errors: 1, balance: u1, status: 'skipped', skip: 'payment_error' });
+  await expectError('retrying a held order is refused until it is reviewed', () => retry(ADMIN_CLAIMS, OErr.id), 'needs review');
+
+  // ── 11h. Cash on delivery: the wallet is never touched ────────────────────
+  const subCod = await mkSub(U1, '2020-01-06', 'cod');
+  const D6 = '2097-02-06';
+  const OCod = await mkOrder(subCod, U1, D6, [{ qty: 2 }]);
+  u1 = await balance(U1);
+  await finalize(ADMIN_CLAIMS, D6);
+  const dc = await deliver(ADMIN_CLAIMS, OCod, [1]);
+  eq('cash-on-delivery order: finalized and delivered with no wallet movement',
+    { balance: await balance(U1), refunded: dc.refunded, ...(await order(OCod.id)) },
+    { balance: u1, refunded: 0, status: 'delivered', payment: 'pending', paid: 0, skip: null, finalized: true, hold: false });
+
+  // ── 11i. Reconcile needs every quantity, then settles and closes the day ──
+  const D4 = '2097-02-07';
+  const subs4 = [];
+  for (let i = 0; i < 5; i++) subs4.push(await mkSub(U1, `2020-02-0${i + 1}`));
+  await setBalance(U1, 1000);
+  const R1 = track(await mkOrder(subs4[0], U1, D4, [{ qty: 2 }, { qty: 1 }]));  // 300: staff entered 1 of 2, other blank at first
+  const R2 = track(await mkOrder(subs4[1], U1, D4, [{ qty: 1 }]));              // 100: nothing entered at first
+  const R3 = track(await mkOrder(subs4[2], U1, D4, [{ qty: 1 }]));              // 100: staff entered 0
+  const R4 = track(await mkOrder(subs4[3], U1, D4, [{ qty: 1 }]));              // 100: already marked delivered
+  const R5 = track(await mkOrder(subs4[4], U1, D4, [{ qty: 3 }]));              // 300: skipped for low balance
+  await setBalance(U1, 600);                                                     // covers R1..R4, not R5
+  const f8 = await finalize(ADMIN_CLAIMS, D4);
+  eq('reconcile setup: four charged, the fifth skipped', { deducted: f8.total_deducted, skipped: f8.skipped.map((s) => s.order_id), balance: await balance(U1) },
+    { deducted: 600, skipped: [R5.id], balance: 0 });
+  await expectError('reconcile needs daily_ops:edit', () => reconcile({ sub: U1, role: 'authenticated' }, D4), 'Not authorized');
+  await expectError('a draft day cannot be reconciled', () => reconcile(ADMIN_CLAIMS, D2b), 'No run exists|Cannot reconcile');
+
+  // Quantities typed in by staff but not settled yet (the autosave path).
+  await db.query(`UPDATE public.subscription_daily_order_items SET delivered_qty = 1 WHERE id = $1`, [R1.items[0]]);
+  await db.query(`UPDATE public.subscription_daily_order_items SET delivered_qty = 0 WHERE id = $1`, [R3.items[0]]);
+  await setStatus(ADMIN_CLAIMS, [R4.id], 'delivered');
+
+  // Two pending orders (R1, R2) still have an item with no delivered quantity.
+  const beforeRefuse = { balance: await balance(U1), r1: await deliveredQty(R1.id), r2: await deliveredQty(R2.id) };
+  await expectError('reconcile is refused while a pending order has an item with no delivered quantity',
+    () => reconcile(ADMIN_CLAIMS, D4), '2 pending order\\(s\\) still have items with no delivered quantity');
+  eq('refused reconcile assumed nothing and changed nothing',
+    { balance: await balance(U1), r1: await deliveredQty(R1.id), r2: await deliveredQty(R2.id),
+      run: (await run(D4)).status, r1status: (await order(R1.id)).status, r2status: (await order(R2.id)).status },
+    { ...beforeRefuse, run: 'finalized', r1status: 'pending', r2status: 'pending' });
+
+  // Staff enter the missing quantities; one order still incomplete → still refused.
+  await db.query(`UPDATE public.subscription_daily_order_items SET delivered_qty = 1 WHERE id = $1`, [R1.items[1]]);
+  await expectError('reconcile is still refused with one order incomplete',
+    () => reconcile(ADMIN_CLAIMS, D4), '1 pending order\\(s\\) still have items with no delivered quantity');
+  await db.query(`UPDATE public.subscription_daily_order_items SET delivered_qty = 1 WHERE id = $1`, [R2.items[0]]);
+
+  const rec = await reconcile(ADMIN_CLAIMS, D4);
+  eq('reconcile result once every quantity is entered',
+    { reconciled: rec.reconciled, refunded: rec.total_refunded, charged: rec.total_charged,
+      refunds: rec.refunds.map((r) => [r.order_id, r.amount]).sort(), errors: rec.settlement_errors.length,
+      notify: rec.delivered_user_ids.length, noDefaulting: !('defaulted_orders' in rec) },
+    { reconciled: 3, refunded: 200, charged: 0,
+      refunds: [[R1.id, 100], [R3.id, 100]].sort(), errors: 0, notify: 2, noDefaulting: true });
+  eq('reconcile: quantities are exactly what staff entered', await deliveredQty(R1.id), [1, 1]);
+  eq('reconcile: short order delivered and refunded the shortfall', await order(R1.id),
+    { status: 'delivered', payment: 'paid', paid: 200, skip: null, finalized: true, hold: false });
+  eq('reconcile: order entered as fully delivered, no refund', { qty: await deliveredQty(R2.id), ...(await order(R2.id)) },
+    { qty: [1], status: 'delivered', payment: 'paid', paid: 100, skip: null, finalized: true, hold: false });
+  eq('reconcile: nothing delivered → cancelled and refunded', await order(R3.id),
+    { status: 'cancelled', payment: 'refunded', paid: 0, skip: null, finalized: true, hold: false });
+  eq('reconcile: skipped order stays skipped and unpaid', await order(R5.id),
+    { status: 'skipped', payment: 'failed', paid: 0, skip: 'insufficient_balance', finalized: true, hold: false });
+  eq('reconcile: wallet got the two refunds', await balance(U1), 200);
+  const blank = num((await db.query(`
+    SELECT count(*) AS n FROM public.subscription_daily_order_items i
+    JOIN public.subscription_daily_orders o ON o.id = i.daily_order_id
+    WHERE o.delivery_date = $1 AND o.status IN ('delivered', 'cancelled') AND i.delivered_qty IS NULL`, [D4])).rows[0].n);
+  eq('reconcile: every delivered or cancelled order has a quantity for every item', blank, 0);
+  eq('reconcile: run closed', (await run(D4)).status, 'reconciled');
+
+  // A reconciled day is closed for every money action.
+  await expectError('second reconcile is refused', () => reconcile(ADMIN_CLAIMS, D4), 'Cannot reconcile');
+  await expectError('finalize of a reconciled day is refused', () => finalize(ADMIN_CLAIMS, D4), 'already reconciled');
+  await expectError('unlock of a reconciled day is refused', () => unlock(SERVICE, D4), 'reconciled');
+  await expectError('delivery on a reconciled day is refused', () => deliver(ADMIN_CLAIMS, R1, [2, 1]), 'reconciled');
+  await expectError('status change on a reconciled day is refused', () => setStatus(ADMIN_CLAIMS, [R2.id], 'cancelled'), 'reconciled');
+  await expectError('payment retry on a reconciled day is refused', () => retry(ADMIN_CLAIMS, R5.id), 'finalized');
+  eq('nothing moved on the closed day', await balance(U1), 200);
+
+  // ── 11j. The ledger and paid_amount agree for every order ─────────────────
+  let mismatches = 0;
+  for (const id of allOrders) {
+    const o = await order(id);
+    const net = await ledgerNet(id);
+    if (Math.round(net * 100) !== Math.round(o.paid * 100)) {
+      mismatches++;
+      console.log(`        ledger ${net} ≠ paid_amount ${o.paid} for ${id}`);
+    }
+  }
+  eq(`wallet ledger net equals paid_amount for all ${allOrders.length} settled orders`, mismatches, 0);
+  const negative = num((await db.query(
+    `SELECT count(*) AS n FROM public.users WHERE id IN ($1, $2) AND wallet_balance < 0`, [U1, U2])).rows[0].n);
+  eq('no wallet went negative', negative, 0);
+
+  // ── 11k. Re-running the migration leaves settled orders alone ─────────────
+  await expectOk('migration 037 re-runs cleanly after orders were settled',
+    () => db.exec(read(`${ROOT}/migrations/037_daily_order_settlement.sql`)));
+  eq('re-run did not put a partly refunded (settled) order on hold', await order(R1.id),
+    { status: 'delivered', payment: 'paid', paid: 200, skip: null, finalized: true, hold: false });
+  eq('re-run kept the legacy holds', { l2: (await order(L2.id)).hold, l7: (await order(L7.id)).hold, l1: (await order(L1.id)).hold }, { l2: true, l7: true, l1: false });
+  eq('delete guard trigger installed once', num((await db.query(
+    `SELECT count(*) AS n FROM pg_trigger WHERE tgname = 'trg_guard_paid_daily_order_delete'`)).rows[0].n), 1);
+
+  // ── 11l. Grants ───────────────────────────────────────────────────────────
+  const g = (await db.query(`
+    SELECT
+      has_function_privilege('authenticated', 'public.finalize_daily_run(date, uuid)', 'EXECUTE')                  AS a1,
+      has_function_privilege('authenticated', 'public.unlock_daily_run(date)', 'EXECUTE')                          AS a2,
+      has_function_privilege('authenticated', 'public.record_subscription_delivery(uuid, jsonb, text)', 'EXECUTE') AS a3,
+      has_function_privilege('authenticated', 'public.set_daily_order_status(uuid[], text)', 'EXECUTE')            AS a4,
+      has_function_privilege('authenticated', 'public.retry_daily_order_payment(uuid)', 'EXECUTE')                 AS a5,
+      has_function_privilege('authenticated', 'public.reconcile_daily_run(date, uuid)', 'EXECUTE')                 AS a6,
+      has_function_privilege('anon', 'public.finalize_daily_run(date, uuid)', 'EXECUTE')                           AS n1,
+      has_function_privilege('anon', 'public.record_subscription_delivery(uuid, jsonb, text)', 'EXECUTE')          AS n2,
+      has_function_privilege('anon', 'public.set_daily_order_status(uuid[], text)', 'EXECUTE')                     AS n3,
+      has_function_privilege('anon', 'public.retry_daily_order_payment(uuid)', 'EXECUTE')                          AS n4,
+      has_function_privilege('anon', 'public.reconcile_daily_run(date, uuid)', 'EXECUTE')                          AS n5,
+      has_function_privilege('anon', 'public.unlock_daily_run(date)', 'EXECUTE')                                   AS n6,
+      has_function_privilege('authenticated', 'internal.settle_daily_order(uuid, text, text)', 'EXECUTE')          AS i1,
+      has_function_privilege('authenticated', 'internal.daily_order_amount_owed(uuid)', 'EXECUTE')                 AS i2`)).rows[0];
+  if (g.a1 && g.a2 && g.a3 && g.a4 && g.a5 && g.a6 && !g.n1 && !g.n2 && !g.n3 && !g.n4 && !g.n5 && !g.n6 && !g.i1 && !g.i2) {
+    ok('037 grants: staff functions for authenticated/service_role only; settle internals closed');
+  } else {
+    bad('037 grants', JSON.stringify(g));
+  }
+}
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 process.exit(fail ? 1 : 0);

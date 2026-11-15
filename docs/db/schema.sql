@@ -401,7 +401,7 @@ CREATE TABLE public.subscription_daily_orders (
   status text NOT NULL CHECK (status = ANY (ARRAY['pending'::text, 'skipped'::text, 'delivered'::text, 'cancelled'::text])),
   total_value numeric NOT NULL,
   created_at timestamp without time zone DEFAULT now(),
-  payment_status text NOT NULL DEFAULT 'pending'::text CHECK (payment_status = ANY (ARRAY['pending'::text, 'paid'::text, 'refunded'::text])),
+  payment_status text NOT NULL DEFAULT 'pending'::text CHECK (payment_status = ANY (ARRAY['pending'::text, 'paid'::text, 'failed'::text, 'refunded'::text])), -- 'failed' added by migration 005
   wallet_deducted_at timestamp without time zone,
   is_finalized boolean DEFAULT false,
   finalized_at timestamp without time zone,
@@ -409,6 +409,12 @@ CREATE TABLE public.subscription_daily_orders (
   tracking_info text,
   custom_route text,
   is_customer_modified boolean NOT NULL DEFAULT false, -- migration 022: customer hand-edited this day; run-sheet generator preserves it
+  paid_amount numeric NOT NULL DEFAULT 0, -- migration 037: net amount taken from the wallet for this order (debits minus refunds)
+  skip_reason text, -- migration 037: why the system skipped it (insufficient_balance | payment_error)
+  settled_at timestamp without time zone, -- migration 037: last run of internal.settle_daily_order
+  settlement_hold_reason text, -- migration 037: set by the backfill when ledger and payment_status disagree; blocks settlement
+  CONSTRAINT sdo_paid_amount_not_negative CHECK (paid_amount >= 0::numeric),
+  CONSTRAINT sdo_skip_reason_check CHECK (skip_reason IS NULL OR (skip_reason = ANY (ARRAY['insufficient_balance'::text, 'payment_error'::text]))),
   CONSTRAINT subscription_daily_orders_pkey PRIMARY KEY (id),
   CONSTRAINT fk_sdo_subscription FOREIGN KEY (subscription_id) REFERENCES public.subscriptions(id),
   CONSTRAINT fk_sdo_user FOREIGN KEY (user_id) REFERENCES public.users(id)
