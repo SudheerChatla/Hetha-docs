@@ -2805,6 +2805,46 @@ console.log('\n--- 11. Migration 037: daily order settlement ---');
   eq('delete guard trigger installed once', num((await db.query(
     `SELECT count(*) AS n FROM pg_trigger WHERE tgname = 'trg_guard_paid_daily_order_delete'`)).rows[0].n), 1);
 
+  // ── 11m. A held order: no Daily Ops function moves money for it (D-9, P1-03)
+  // HA: not finalized yet (finalize meets it). HB: went out under the old
+  // system with a failed debit (finalized, pending). After each call the
+  // wallet, paid_amount, hold reason and wallet transactions are unchanged,
+  // whether the call refused or carried on without it.
+  {
+    const DH = '2097-03-01';
+    const subHA = await mkSub(U2, '2021-01-01');
+    const subHB = await mkSub(U2, '2021-01-02');
+    await setBalance(U2, 500);
+    const HA = await mkOrder(subHA, U2, DH, [{ qty: 1 }]);
+    const HB = await mkOrder(subHB, U2, DH, [{ qty: 2 }], { payment_status: 'failed', is_finalized: true });
+    await db.query(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = 'test hold A' WHERE id = $1`, [HA.id]);
+    await db.query(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = 'test hold B' WHERE id = $1`, [HB.id]);
+
+    const snapshot = async () => {
+      const rows = (await db.query(`
+        SELECT id, paid_amount, settlement_hold_reason FROM public.subscription_daily_orders
+        WHERE id IN ($1, $2) ORDER BY id`, [HA.id, HB.id])).rows;
+      const txns = num((await db.query(`
+        SELECT count(*) AS n FROM public.wallet_transactions WHERE reference_id IN ($1, $2)`, [HA.id, HB.id])).rows[0].n);
+      return { balance: await balance(U2), txns,
+               orders: rows.map((r) => ({ paid: num(r.paid_amount), hold: r.settlement_hold_reason })) };
+    };
+    const before = await snapshot();
+    const attempt = async (fn) => { try { await fn(); } catch { /* a refusal is fine; money must not move */ } };
+    const held = async (name, fn) => { await attempt(fn); eq(`held orders untouched by ${name}`, await snapshot(), before); };
+
+    await held('finalize_daily_run', () => finalize(ADMIN_CLAIMS, DH));
+    await held('record_subscription_delivery', () => deliver(ADMIN_CLAIMS, HB, [1]));
+    await held('set_daily_order_status (delivered)', () => setStatus(ADMIN_CLAIMS, [HB.id], 'delivered'));
+    await held('set_daily_order_status (cancelled)', () => setStatus(ADMIN_CLAIMS, [HB.id], 'cancelled'));
+    await held('retry_daily_order_payment', () => retry(ADMIN_CLAIMS, HA.id));
+    await held('retry_daily_order_payment (legacy order)', () => retry(ADMIN_CLAIMS, HB.id));
+    // Give every item a quantity so reconcile reaches settlement instead of
+    // stopping at the missing-quantity check.
+    await db.query(`UPDATE public.subscription_daily_order_items SET delivered_qty = quantity WHERE daily_order_id IN ($1, $2)`, [HA.id, HB.id]);
+    await held('reconcile_daily_run', () => reconcile(ADMIN_CLAIMS, DH));
+  }
+
   // ── 11l. Grants ───────────────────────────────────────────────────────────
   const g = (await db.query(`
     SELECT
