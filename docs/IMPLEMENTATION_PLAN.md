@@ -49,6 +49,9 @@ These are not optional. A task is not done until all of them hold.
 3. **Staging first (D-6).** Once the staging project exists (O-04), every
    migration and every admin/app change is applied and tried in staging
    before production. Until it exists, say so in the change log.
+   **Owner decision 2026-11-15:** staging is deferred to a later phase; build
+   now and apply migrations to production after the DB suite passes. O-04
+   must still be done before real customers are onboarded.
 4. **Three git repos.** `Hetha/` (docs + SQL), `Hetha_admin/`, `Hetha_app/`
    are separate repositories. Run git commands inside the right one.
 5. **Database changes:**
