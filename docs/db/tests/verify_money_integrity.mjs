@@ -234,7 +234,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '037_daily_order_settlement.sql',
                  '038_daily_ops_structure.sql',
                  '039_wallet_simplification.sql',
-                 '040_indexes.sql']) {
+                 '040_indexes.sql',
+                 '041_dashboard_stats.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -3542,6 +3543,39 @@ await expectOk('migration 040 re-runs cleanly', () => db.exec(read(`${ROOT}/migr
     'idx_users_created_at', 'idx_addresses_created_at', 'idx_reviews_created_at',
     'idx_sdo_user_date', 'idx_wallet_tx_user_created')`)).rows[0].n);
   if (n === 10) ok('all 10 indexes from 040 exist'); else bad('040 indexes', `found ${n} of 10`);
+}
+
+// ---------------------------------------------------------------------------
+// 15. Migration 041: dashboard numbers
+// ---------------------------------------------------------------------------
+console.log('\n--- 15. Migration 041: dashboard stats ---');
+{
+  await expectOk('migration 041 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/041_dashboard_stats.sql`)));
+  const stats = async (claims) => {
+    const r = (await asQuery(claims, `SELECT public.get_dashboard_stats() AS r`)).rows[0].r;
+    return typeof r === 'string' ? JSON.parse(r) : r;
+  };
+  const expected = (await db.query(`
+    SELECT
+      (SELECT count(*) FROM public.subscriptions WHERE status = 'active')::int AS subs,
+      (SELECT count(*) FROM public.users WHERE is_adhoc = false)::int AS customers,
+      (SELECT COALESCE(round(SUM(amount), 2), 0) FROM public.wallet_transactions
+        WHERE type = 'credit' AND created_at >= (internal.today_ist()::timestamp AT TIME ZONE 'Asia/Kolkata'))::numeric AS credits`)).rows[0];
+  const s = await stats({ role: 'service_role' });
+  const got = { subs: Number(s.active_subscriptions), customers: Number(s.total_customers), credits: Number(s.today_wallet_credits) };
+  const want = { subs: Number(expected.subs), customers: Number(expected.customers), credits: Number(expected.credits) };
+  if (JSON.stringify(got) === JSON.stringify(want)) ok(`dashboard numbers match direct counts (${JSON.stringify(want)})`);
+  else bad('dashboard numbers', `expected ${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+  // A credit created just before India midnight belongs to yesterday.
+  const U = '0a410000-0000-4000-8000-000000000001';
+  await db.query(`INSERT INTO public.users (id, email, phone, first_name, wallet_balance) VALUES ($1, 'd041@example.com', '9041000001', 'D', 0)`, [U]);
+  await db.query(`INSERT INTO public.wallet_transactions (user_id, type, amount, balance_after, description, created_at)
+                  VALUES ($1, 'credit', 777, 0, 'before IST midnight', (internal.today_ist()::timestamp AT TIME ZONE 'Asia/Kolkata') - interval '1 minute'),
+                         ($1, 'credit', 23, 0, 'after IST midnight',  (internal.today_ist()::timestamp AT TIME ZONE 'Asia/Kolkata') + interval '1 minute')`, [U]);
+  const s2 = await stats({ role: 'service_role' });
+  if (Number(s2.today_wallet_credits) === Number(expected.credits) + 23) ok('wallet credits count from midnight India time (777 before it excluded, 23 after it included)');
+  else bad('IST day boundary', `credits ${s2.today_wallet_credits}, base ${expected.credits}`);
+  await expectError('a customer cannot read the dashboard', () => stats({ sub: CUSTOMER, role: 'authenticated' }), 'not authorized');
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
