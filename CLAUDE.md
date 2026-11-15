@@ -27,10 +27,10 @@ flutter test                        # single file: flutter test test/<path>_test
 
 # Admin panel (in Hetha_admin/)
 npm run dev                         # localhost:3000
-npx tsc --noEmit && npm run lint && npm run build
+npx tsc --noEmit && npm run lint && npm test && npm run build
 ```
 
-Before calling work done, run the gates for whatever you touched: the DB suite, `flutter analyze` and `flutter test`, and the admin `tsc`, lint, and build.
+Before calling work done, run the gates for whatever you touched: the DB suite, `flutter analyze` and `flutter test`, and the admin `tsc`, lint, `npm test` (vitest, pure-logic tests), and build.
 
 Env files: `Hetha_app/.env` holds `PROJECT_URL` and `PUBLISHABLE_KEY`. `Hetha_admin/.env.local` holds `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY`. The Razorpay secret lives only in the Supabase Edge Function env.
 
