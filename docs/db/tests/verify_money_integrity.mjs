@@ -71,16 +71,21 @@ await db.exec(`
   $$;
 `);
 
-// Act as a given caller for the duration of `fn`.
+// Act as a given caller for one statement. The claims are cleared afterwards,
+// so plain db.query / db.exec setup writes run as the SQL Editor (no claims,
+// jwt role 'internal'), never as whoever was called last. Migration 038's
+// finalized-day lock refuses direct writes from any other caller.
 async function as(claims, sql) {
   const json = claims === null ? '' : JSON.stringify(claims);
   await db.exec(`SELECT set_config('request.jwt.claims', '${json.replace(/'/g, "''")}', false);`);
-  return db.exec(sql);
+  try { return await db.exec(sql); }
+  finally { await db.exec(`SELECT set_config('request.jwt.claims', '', false);`); }
 }
 async function asQuery(claims, sql, params) {
   const json = claims === null ? '' : JSON.stringify(claims);
   await db.query(`SELECT set_config('request.jwt.claims', $1, false)`, [json]);
-  return db.query(sql, params);
+  try { return await db.query(sql, params); }
+  finally { await db.query(`SELECT set_config('request.jwt.claims', '', false)`); }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +231,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '034_reschedule_order_snaps_to_delivery_day.sql',
                  '035_order_tracking_user_id.sql',
                  '036_subscription_cutoff_rule.sql',
-                 '037_daily_order_settlement.sql']) {
+                 '037_daily_order_settlement.sql',
+                 '038_daily_ops_structure.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -2473,6 +2479,9 @@ console.log('\n--- 11. Migration 037: daily order settlement ---');
 
   await expectOk('migration 037 re-runs cleanly and backfills legacy rows',
     () => db.exec(read(`${ROOT}/migrations/037_daily_order_settlement.sql`)));
+  // 037 re-declares its functions, which drops the trusted flag 038 attaches
+  // to them; re-apply 038 as the owner would after re-running 037.
+  await db.exec(read(`${ROOT}/migrations/038_daily_ops_structure.sql`));
   const bf = async (o) => { const r = await order(o.id); return { paid: r.paid, hold: r.hold }; };
   eq('backfill: paid + matching debit → paid_amount from the ledger, no hold', await bf(L1), { paid: 200, hold: false });
   eq('backfill: paid but no wallet transaction → 0 and on hold (not guessed from the total)', await bf(L2), { paid: 0, hold: true });
@@ -2799,6 +2808,9 @@ console.log('\n--- 11. Migration 037: daily order settlement ---');
   // ── 11k. Re-running the migration leaves settled orders alone ─────────────
   await expectOk('migration 037 re-runs cleanly after orders were settled',
     () => db.exec(read(`${ROOT}/migrations/037_daily_order_settlement.sql`)));
+  // 037 re-declares its functions, which drops the trusted flag 038 attaches
+  // to them; re-apply 038 as the owner would after re-running 037.
+  await db.exec(read(`${ROOT}/migrations/038_daily_ops_structure.sql`));
   eq('re-run did not put a partly refunded (settled) order on hold', await order(R1.id),
     { status: 'delivered', payment: 'paid', paid: 200, skip: null, finalized: true, hold: false });
   eq('re-run kept the legacy holds', { l2: (await order(L2.id)).hold, l7: (await order(L7.id)).hold, l1: (await order(L1.id)).hold }, { l2: true, l7: true, l1: false });
@@ -2866,6 +2878,357 @@ console.log('\n--- 11. Migration 037: daily order settlement ---');
     ok('037 grants: staff functions for authenticated/service_role only; settle internals closed');
   } else {
     bad('037 grants', JSON.stringify(g));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 12. Migration 038: Daily Ops structure
+// ---------------------------------------------------------------------------
+console.log('\n--- 12. Migration 038: Daily Ops structure ---');
+{
+  const { randomUUID } = await import('node:crypto');
+  const num = (v) => Number(v);
+  const eq = (name, got, want) => {
+    const g = JSON.stringify(got), w = JSON.stringify(want);
+    if (g === w) ok(`${name} (${w})`); else bad(name, `expected ${w}, got ${g}`);
+  };
+  const rpc = async (claims, call, params) => {
+    const r = (await asQuery(claims, `SELECT ${call} AS r`, params)).rows[0].r;
+    return typeof r === 'string' ? JSON.parse(r) : r;
+  };
+  const CUST = { sub: CUSTOMER, role: 'authenticated' };
+  const SERVICE = { role: 'service_role' };
+  const addDays = (ymd, n) => {
+    const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  };
+  await db.query(
+    `INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'daily_ops:edit') ON CONFLICT DO NOTHING`, [roleId]);
+
+  const U = 'a0380000-0000-4000-8000-000000000001';
+  await db.exec(`INSERT INTO public.users (id, email, phone, first_name, wallet_balance)
+                 VALUES ('${U}', 'u-038@example.com', '9038000001', 'U38', 0)`);
+  const setBalance = (amount) => db.query(`UPDATE public.users SET wallet_balance = $2 WHERE id = $1`, [U, amount]);
+  const balance = async () => num((await db.query(`SELECT wallet_balance FROM public.users WHERE id = $1`, [U])).rows[0].wallet_balance);
+
+  const AREA_D = 'a0380000-0000-4000-8000-0000000000a1';
+  const AREA_2 = 'a0380000-0000-4000-8000-0000000000a2';
+  const D0 = '2098-01-10';
+  await db.exec(`INSERT INTO public.delivery_areas (id, display_name, is_active, delivary_frequency, reference_date)
+                 VALUES ('${AREA_D}', 'Daily 038', true, 1, NULL), ('${AREA_2}', 'Alternate 038', true, 2, '${D0}')`);
+
+  // A subscription with items. items: [{ qty, price, start, end, active }]
+  let created = 0;
+  const mkSub = async ({ area = 'Daily 038', start = D0, end = null, status = 'active', freq = null,
+                         items = [{ qty: 1 }] } = {}) => {
+    const id = randomUUID();
+    created++;
+    await db.query(
+      `INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date, end_date,
+                                         delivary_area, delivary_frequency, created_at, snapshot_pincode)
+       VALUES ($1, $2, $3, 'wallet', $4, $5, $6, $7, $8::timestamp, '700001')`,
+      [id, U, status, start, end, area, freq, `2030-01-01 00:${String(Math.floor(created / 60) % 60).padStart(2, '0')}:${String(created % 60).padStart(2, '0')}`]);
+    for (const it of items) {
+      await db.query(
+        `INSERT INTO public.subscription_items (subscription_id, variant_id, product_name_snapshot, variant_label_snapshot,
+                                                unit_price, quantity, item_start_date, item_end_date, is_active)
+         VALUES ($1, $2, 'Cow Milk', '1 L', $3, $4, $5, $6, $7)`,
+        [id, VAR, it.price ?? 100, it.qty, it.start ?? start ?? D0, it.end ?? null, it.active ?? true]);
+    }
+    return id;
+  };
+  const delivers = async (sub, date) =>
+    (await db.query(`SELECT internal.subscription_delivers_on($1, $2::date) AS r`, [sub, date])).rows[0].r;
+  const override = async (kind, subId, { date = null, from = null, to = null, area = AREA_D } = {}) => {
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO public.delivery_day_overrides (id, override_date, swapped_with_area_id, selection_type, override_kind, from_date, to_date)
+       VALUES ($1, $2, $3, 'customer', $4, $5, $6)`, [id, date ?? to ?? from, area, kind, from, to]);
+    await db.query(`INSERT INTO public.delivery_day_override_subscriptions (override_id, subscription_id) VALUES ($1, $2)`, [id, subId]);
+  };
+
+  // ── 12a. The delivery-day rule ────────────────────────────────────────────
+  const S = await mkSub({ start: D0, end: addDays(D0, 10) });
+  await db.query(`INSERT INTO public.subscription_pauses (subscription_id, pause_start_date, pause_end_date, created_by)
+                  VALUES ($1, $2, $3, 'admin')`, [S, addDays(D0, 3), addDays(D0, 5)]);
+  eq('delivers on its start date', await delivers(S, D0), true);
+  eq('not the day before the start date', await delivers(S, addDays(D0, -1)), false);
+  eq('delivers on its end date', await delivers(S, addDays(D0, 10)), true);
+  eq('not the day after the end date', await delivers(S, addDays(D0, 11)), false);
+  eq('pause: first, middle and last day are paused',
+    [await delivers(S, addDays(D0, 3)), await delivers(S, addDays(D0, 4)), await delivers(S, addDays(D0, 5))], [false, false, false]);
+  eq('delivers the day after a pause', await delivers(S, addDays(D0, 6)), true);
+
+  const S2 = await mkSub({ area: 'Alternate 038', start: D0 });
+  eq('every-2-days area: on day, off day, on day',
+    [await delivers(S2, D0), await delivers(S2, addDays(D0, 1)), await delivers(S2, addDays(D0, 2))], [true, false, true]);
+  await override('swap', S2, { date: addDays(D0, 1), area: AREA_D });
+  eq('swap override: borrowed daily area delivers on its off day', await delivers(S2, addDays(D0, 1)), true);
+  await override('move', S2, { from: addDays(D0, 4), to: addDays(D0, 5) });
+  eq('move: not on the from-date', await delivers(S2, addDays(D0, 4)), false);
+  eq('move: delivers on the to-date even off-cadence', await delivers(S2, addDays(D0, 5)), true);
+  await override('move', S, { from: addDays(D0, 7), to: addDays(D0, 4) });
+  eq('move onto a paused day: no delivery', await delivers(S, addDays(D0, 4)), false);
+  const S3 = await mkSub({ items: [{ qty: 1, active: false }] });
+  eq('only an inactive item: no delivery', await delivers(S3, D0), false);
+  const S4 = await mkSub({ items: [{ qty: 1, start: addDays(D0, 1) }] });
+  eq('item starting tomorrow: not today, yes tomorrow', [await delivers(S4, D0), await delivers(S4, addDays(D0, 1))], [false, true]);
+  const S5 = await mkSub({ status: 'cancelled' });
+  eq('cancelled subscription: no delivery', await delivers(S5, D0), false);
+  const S6 = await mkSub({ area: 'No such area', start: D0, freq: 3 });
+  eq('own every-3-days frequency from the start date',
+    [await delivers(S6, D0), await delivers(S6, addDays(D0, 1)), await delivers(S6, addDays(D0, 3))], [true, false, true]);
+
+  // ── 12b. generate_daily_run ───────────────────────────────────────────────
+  // Subscription item prices come from the catalog (migration 012 trigger):
+  // VAR costs 100. VAR_30 (30) is used for ad-hoc additions.
+  const VAR_OFF = 'a0380000-0000-4000-8000-0000000000b1';
+  const VAR_30  = 'a0380000-0000-4000-8000-0000000000b2';
+  await db.exec(`INSERT INTO public.product_variants (id, product_id, label, price, weight_grams, is_active, free_delivery)
+                 VALUES ('${VAR_OFF}', '${PROD}', '2 L', 180, 2000, false, false),
+                        ('${VAR_30}',  '${PROD}', '250 ml', 30, 250, true, false)`);
+  const G1 = '2098-03-01';
+  const generate = (claims, date) => rpc(claims, `public.generate_daily_run($1::date, $2)`, [date, ADMIN]);
+  const orderOf = async (sub, date) => (await db.query(`
+    SELECT o.id, o.total_value, o.paid_amount, o.status,
+           (SELECT json_agg(json_build_object('qty', i.quantity, 'adhoc', i.is_adhoc_addition) ORDER BY i.quantity)
+            FROM public.subscription_daily_order_items i WHERE i.daily_order_id = o.id) AS items
+    FROM public.subscription_daily_orders o WHERE o.subscription_id = $1 AND o.delivery_date = $2`, [sub, date])).rows[0] ?? null;
+
+  await expectError('a customer cannot generate a run', () => generate(CUST, G1), 'not authorized');
+  const GA = await mkSub({ start: G1, items: [{ qty: 2, price: 100 }, { qty: 1, price: 50 }] });
+  const GB = await mkSub({ start: G1 });  // clean: regenerated from the subscription
+  const GM = await mkSub({ start: G1 });  // customer-modified
+  const GC = await mkSub({ start: G1 });  // paid, then unlocked
+  const GD = await mkSub({ start: G1 });  // on payment hold
+  const GE = await mkSub({ start: G1 });  // staff route
+  const GF = await mkSub({ start: G1 });  // ad-hoc item
+  const GG = await mkSub({ start: G1 });  // delivered quantity entered
+  const GP = await mkSub({ start: G1 });  // paused on G1
+  await db.query(`INSERT INTO public.subscription_pauses (subscription_id, pause_start_date, pause_end_date, created_by)
+                  VALUES ($1, $2, $2, 'admin')`, [GP, G1]);
+  const GS = await mkSub({ start: addDays(G1, 1) });  // starts tomorrow
+  const g1 = await generate(ADMIN_CLAIMS, G1);
+  const oa = await orderOf(GA, G1);
+  eq('generated order total = Σ items', { total: num(oa.total_value), items: oa.items.length }, { total: 300, items: 2 });
+  eq('paused and not-yet-started subscriptions get no order', [await orderOf(GP, G1), await orderOf(GS, G1)], [null, null]);
+  eq('first run created the orders', g1.generated >= 8, true);
+  // Clean orders are deleted and rebuilt on every run (that is how a changed
+  // subscription reaches the run sheet), so a second run reports them again.
+  // What must hold: never two orders for one subscription and date.
+  await generate(ADMIN_CLAIMS, G1);
+  eq('second run: no duplicate orders', num((await db.query(`
+    SELECT count(*) AS n FROM (SELECT subscription_id FROM public.subscription_daily_orders
+      WHERE delivery_date = $1 GROUP BY subscription_id HAVING count(*) > 1) d`, [G1])).rows[0].n), 0);
+
+  const before = {};
+  for (const [k, s] of Object.entries({ GM, GC, GD, GE, GF, GG })) before[k] = (await orderOf(s, G1)).id;
+  await db.query(`UPDATE public.subscription_daily_orders SET is_customer_modified = true WHERE id = $1`, [before.GM]);
+  await db.query(`UPDATE public.subscription_daily_orders SET paid_amount = 100, payment_status = 'paid' WHERE id = $1`, [before.GC]);
+  await db.query(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = 'test hold 038' WHERE id = $1`, [before.GD]);
+  await db.query(`UPDATE public.subscription_daily_orders SET custom_route = 'Van 9' WHERE id = $1`, [before.GE]);
+  await rpc(ADMIN_CLAIMS, `public.add_daily_order_item($1, $2, 1)`, [before.GF, VAR_30]);
+  await db.query(`UPDATE public.subscription_daily_order_items SET delivered_qty = 1 WHERE daily_order_id = $1`, [before.GG]);
+  // Every subscription's quantity changes; only the clean order should follow.
+  await db.query(`UPDATE public.subscription_items SET quantity = 3 WHERE subscription_id = ANY ($1::uuid[])`,
+    [`{${[GB, GM, GC, GD, GE, GF, GG].join(',')}}`]);
+  const g3 = await generate(ADMIN_CLAIMS, G1);
+  const after = {};
+  for (const [k, s] of Object.entries({ GM, GC, GD, GE, GF, GG })) after[k] = (await orderOf(s, G1)).id;
+  eq('customer-modified, paid, held, routed, ad-hoc and delivered-qty orders survive regeneration', after, before);
+  eq('a paid order keeps its paid_amount', num((await orderOf(GC, G1)).paid_amount), 100);
+  eq('a clean order is rebuilt with the new quantity', (await orderOf(GB, G1)).items, [{ qty: 3, adhoc: false }]);
+  eq('regeneration reports the rebuilt order', { deleted: g3.deleted >= 1, generated: g3.generated >= 1 }, { deleted: true, generated: true });
+
+  // ── 12c. 1,200 subscriptions (no 1000-row cap) ────────────────────────────
+  const G2 = '2098-04-01';
+  await db.exec(`
+    INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date, delivary_area, created_at, label)
+    SELECT gen_random_uuid(), '${U}', 'active', 'wallet', '${G2}', 'Daily 038', '2031-01-01', 'bulk038'
+    FROM generate_series(1, 1200);
+    INSERT INTO public.subscription_items (subscription_id, variant_id, product_name_snapshot, variant_label_snapshot,
+                                           unit_price, quantity, item_start_date, is_active)
+    SELECT id, '${VAR}', 'Cow Milk', '1 L', 100, 1, '${G2}', true FROM public.subscriptions WHERE label = 'bulk038';`);
+  await generate(ADMIN_CLAIMS, G2);
+  eq('1,200 subscriptions → 1,200 orders', num((await db.query(`
+    SELECT count(*) AS n FROM public.subscription_daily_orders o JOIN public.subscriptions s ON s.id = o.subscription_id
+    WHERE s.label = 'bulk038' AND o.delivery_date = $1`, [G2])).rows[0].n), 1200);
+  await db.exec(`UPDATE public.subscriptions SET status = 'cancelled' WHERE label = 'bulk038'`);
+
+  // ── 12d. Item edits ───────────────────────────────────────────────────────
+  const G3 = '2098-05-01';
+  const I1 = await mkSub({ start: G3, items: [{ qty: 2, price: 100 }, { qty: 1, price: 50 }] });
+  await generate(ADMIN_CLAIMS, G3);
+  const o3 = (await orderOf(I1, G3)).id;
+  const add = (claims, order, variant, qty) => rpc(claims, `public.add_daily_order_item($1, $2, $3)`, [order, variant, qty]);
+  const items = async (order) => (await db.query(`
+    SELECT id, variant_id, quantity, unit_price, total_price, is_adhoc_addition FROM public.subscription_daily_order_items
+    WHERE daily_order_id = $1 ORDER BY quantity DESC, unit_price DESC`, [order])).rows;
+  const total = async (order) => num((await db.query(`SELECT total_value FROM public.subscription_daily_orders WHERE id = $1`, [order])).rows[0]?.total_value);
+
+  await expectError('a customer cannot add an item', () => add(CUST, o3, VAR_30, 1), 'not authorized');
+  await expectError('quantity 0 is refused', () => add(ADMIN_CLAIMS, o3, VAR_30, 0), '1 to 99');
+  await expectError('quantity 100 is refused', () => add(ADMIN_CLAIMS, o3, VAR_30, 100), '1 to 99');
+  await expectError('an inactive variant is refused', () => add(ADMIN_CLAIMS, o3, VAR_OFF, 1), 'not available');
+  await add(ADMIN_CLAIMS, o3, VAR_30, 1);
+  const adhoc = (await items(o3)).find((i) => i.variant_id === VAR_30);
+  eq('new variant → ad-hoc item at the catalog price; order total = Σ items',
+    { price: num(adhoc.unit_price), adhoc: adhoc.is_adhoc_addition, total: await total(o3) }, { price: 30, adhoc: true, total: 330 });
+  await add(ADMIN_CLAIMS, o3, VAR_30, 2);
+  const same = (await items(o3)).filter((i) => i.variant_id === VAR_30);
+  eq('same variant again → quantity raised on one row', { rows: same.length, qty: same[0].quantity, total: await total(o3) }, { rows: 1, qty: 3, total: 390 });
+
+  const setQty = (claims, item, q) => rpc(claims, `public.set_daily_order_item_quantity($1, $2)`, [item, q]);
+  const remove = (claims, item) => rpc(claims, `public.remove_daily_order_item($1)`, [item]);
+  const its = await items(o3);
+  await setQty(ADMIN_CLAIMS, its[0].id, 4);
+  eq('quantity change updates item and order totals',
+    { item: num((await items(o3)).find((i) => i.id === its[0].id).total_price), total: await total(o3) }, { item: 120, total: 420 });
+  await expectError('quantity change to 0 is refused', () => setQty(ADMIN_CLAIMS, its[0].id, 0), '1 to 99');
+
+  const I2 = await mkSub({ start: G3, items: [{ qty: 2, price: 100 }, { qty: 1, price: 50 }] });
+  await generate(ADMIN_CLAIMS, G3);
+  const o4 = (await orderOf(I2, G3)).id;
+  const i4 = await items(o4);
+  const r1 = await remove(ADMIN_CLAIMS, i4[1].id);
+  eq('removing one of two items: total = remaining item', { r: r1.deleted_order, total: await total(o4) }, { r: false, total: 200 });
+  const r2 = await remove(ADMIN_CLAIMS, i4[0].id);
+  eq('removing the last item of an unpaid order deletes the order',
+    { deleted: r2.deleted_order, exists: (await orderOf(I2, G3)) !== null }, { deleted: true, exists: false });
+
+  // Paid, then unlocked: removing the last item cancels and refunds exactly paid_amount.
+  const G4 = '2098-05-02';
+  const I3 = await mkSub({ start: G4, items: [{ qty: 1, price: 100 }, { qty: 1, price: 50 }] });
+  await generate(ADMIN_CLAIMS, G4);
+  await setBalance(100000);
+  await rpc(ADMIN_CLAIMS, `public.finalize_daily_run($1::date, $2)`, [G4, ADMIN]);
+  const o5 = await orderOf(I3, G4);
+  eq('finalized order charged', num(o5.paid_amount), 200);
+  await expectError('item edits are refused on a finalized order', () => add(ADMIN_CLAIMS, o5.id, VAR_30, 1), 'finalized');
+  await rpc(SERVICE, `public.unlock_daily_run($1::date)`, [G4]);
+  const i5 = await items(o5.id);
+  const balBefore = await balance();
+  await remove(ADMIN_CLAIMS, i5[0].id);
+  const r3 = await remove(ADMIN_CLAIMS, i5[1].id);
+  const o5b = await orderOf(I3, G4);
+  eq('removing the last item of a paid order: cancelled, row kept, refunds paid_amount',
+    { cancelled: r3.cancelled, refunded: num(r3.refunded), status: o5b.status, paid: num(o5b.paid_amount), gain: (await balance()) - balBefore },
+    { cancelled: true, refunded: 200, status: 'cancelled', paid: 0, gain: 200 });
+
+  const I4 = await mkSub({ start: G3 });
+  await generate(ADMIN_CLAIMS, G3);
+  const o6 = (await orderOf(I4, G3)).id;
+  await db.query(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = 'test hold 038' WHERE id = $1`, [o6]);
+  await expectError('item edits are refused on a held order', () => add(ADMIN_CLAIMS, o6, VAR_30, 1), 'payment hold');
+  await expectError('removing an item of a held order is refused', async () => remove(ADMIN_CLAIMS, (await items(o6))[0].id), 'payment hold');
+  await expectError('a customer cannot remove an item', async () => remove(CUST, (await items(o3))[0].id), 'not authorized');
+
+  // ── 12e. The finalized-day lock ───────────────────────────────────────────
+  const G5 = '2098-06-01';
+  const L1 = await mkSub({ start: G5, items: [{ qty: 2, price: 100 }] });
+  const L2 = await mkSub({ start: G5, items: [{ qty: 1, price: 100 }] });
+  await generate(ADMIN_CLAIMS, G5);
+  const ol1 = (await orderOf(L1, G5)).id;
+  const ol2 = (await orderOf(L2, G5)).id;
+  const asAdmin = (sql, params) => asQuery(ADMIN_CLAIMS, sql, params);
+  await expectError('draft order: direct payment_status = paid is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET payment_status = 'paid' WHERE id = $1`, [ol1]), 'Daily Ops functions');
+  await expectError('direct insert of an already-paid order is refused',
+    () => asAdmin(`INSERT INTO public.subscription_daily_orders (delivery_date, subscription_id, user_id, status, total_value, payment_status, paid_amount)
+                   VALUES ($1, $2, $3, 'pending', 0, 'paid', 100)`, [addDays(G5, 9), L1, U]), 'Daily Ops functions');
+  await setBalance(100000);
+  await rpc(ADMIN_CLAIMS, `public.finalize_daily_run($1::date, $2)`, [G5, ADMIN]);
+  await expectError('direct is_finalized = false is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET is_finalized = false WHERE id = $1`, [ol1]), 'Daily Ops functions');
+  await expectError('direct paid_amount = 0 is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET paid_amount = 0 WHERE id = $1`, [ol1]), 'Daily Ops functions');
+  await expectError('direct status change on a finalized order is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET status = 'cancelled' WHERE id = $1`, [ol1]), 'finalized');
+  await expectError('direct user change on a finalized order is refused while the user exists',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET user_id = $2 WHERE id = $1`, [ol1, CUSTOMER]), 'finalized');
+  await expectError('deleting a finalized order is refused',
+    () => asAdmin(`DELETE FROM public.subscription_daily_orders WHERE id = $1`, [ol2]), 'finalized');
+  await expectError('a new order on a finalized day is refused',
+    () => asAdmin(`INSERT INTO public.subscription_daily_orders (delivery_date, subscription_id, user_id, status, total_value)
+                   VALUES ($1, $2, $3, 'pending', 0)`, [G5, S, U]), 'finalized');
+  await expectOk('direct tracking_info / custom_route change on a finalized order is allowed',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET tracking_info = 'gate 2', custom_route = 'Van 1' WHERE id = $1`, [ol1]));
+  const li = (await items(ol1))[0].id;
+  await expectOk('direct delivered_qty = 0 on a finalized order is allowed',
+    () => asAdmin(`UPDATE public.subscription_daily_order_items SET delivered_qty = 0 WHERE id = $1`, [li]));
+  await expectOk('direct delivered_qty = ordered quantity is allowed',
+    () => asAdmin(`UPDATE public.subscription_daily_order_items SET delivered_qty = 2 WHERE id = $1`, [li]));
+  await expectError('delivered_qty above the ordered quantity is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_order_items SET delivered_qty = 3 WHERE id = $1`, [li]), 'between 0 and');
+  await expectError('changing an item price on a finalized order is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_order_items SET unit_price = 1 WHERE id = $1`, [li]), 'finalized');
+  await expectError('adding an item to a finalized order is refused',
+    () => asAdmin(`INSERT INTO public.subscription_daily_order_items (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+                   VALUES ($1, $2, 'x', 'y', 1, 1, 1)`, [ol1, VAR]), 'finalized');
+  await expectError('deleting an item of a finalized order is refused',
+    () => asAdmin(`DELETE FROM public.subscription_daily_order_items WHERE id = $1`, [li]), 'finalized');
+  await expectError('a customer cannot change a finalized order either',
+    () => asQuery(CUST, `UPDATE public.subscription_daily_orders SET paid_amount = 0 WHERE id = $1`, [ol1]), 'Daily Ops functions');
+  await expectOk('bulk Mark Delivered through set_daily_order_status still works (D-2)',
+    () => rpc(ADMIN_CLAIMS, `public.set_daily_order_status($1::uuid[], 'delivered')`, [`{${ol2}}`]));
+  // The test user's other daily subscriptions also have orders this day.
+  const restG5 = (await db.query(`SELECT id FROM public.subscription_daily_orders
+    WHERE delivery_date = $1 AND status = 'pending'`, [G5])).rows.map((r) => r.id);
+  await rpc(ADMIN_CLAIMS, `public.set_daily_order_status($1::uuid[], 'delivered')`, [`{${restG5.join(',')}}`]);
+  await expectOk('reconcile still works', () => rpc(ADMIN_CLAIMS, `public.reconcile_daily_run($1::date, $2)`, [G5, ADMIN]));
+  await expectError('reconciled day: even a note change is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET tracking_info = 'late' WHERE id = $1`, [ol1]), 'reconciled');
+  await expectError('reconciled day: delivered_qty change is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_order_items SET delivered_qty = 1 WHERE id = $1`, [li]), 'reconciled');
+  await expectError('regenerating a reconciled date is refused', () => generate(ADMIN_CLAIMS, G5), 'Unlock it before regenerating');
+
+  // A held order: the hold cannot be cleared by a direct write (D-9) but can
+  // from the SQL Editor (no claims), which is the owner's release step.
+  await expectError('direct settlement_hold_reason = NULL is refused',
+    () => asAdmin(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = NULL WHERE id = $1`, [o6]), 'Daily Ops functions');
+  await expectOk('the SQL Editor (owner) can release a hold',
+    () => db.query(`UPDATE public.subscription_daily_orders SET settlement_hold_reason = NULL WHERE id = $1`, [o6]));
+
+  // ── 12f. get_earliest_change_date (M-01) ──────────────────────────────────
+  const ymd = (d) => (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10));
+  const today = ymd((await db.query(`SELECT internal.today_ist()::text AS d`)).rows[0].d);
+  const custSub = randomUUID();
+  await db.query(`INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date, snapshot_pincode)
+                  VALUES ($1, $2, 'active', 'wallet', $3, '700001')`, [custSub, CUSTOMER, today]);
+  const earliest = async (claims) =>
+    ymd((await asQuery(claims, `SELECT public.get_earliest_change_date($1)::text AS d`, [custSub])).rows[0].d);
+  await db.exec(`UPDATE public.delivery_areas SET order_cutoff_time = NULL WHERE id = '${AREA_DAILY}'`);
+  eq('earliest change date with no cut-off = tomorrow', await earliest(CUST), addDays(today, 1));
+  await db.exec(`UPDATE public.delivery_areas SET order_cutoff_time = '00:00:00' WHERE id = '${AREA_DAILY}'`);
+  eq('earliest change date after the cut-off = the day after tomorrow', await earliest(CUST), addDays(today, 2));
+  await db.exec(`UPDATE public.delivery_areas SET order_cutoff_time = NULL WHERE id = '${AREA_DAILY}'`);
+  await expectError('another customer cannot read it', () => earliest({ sub: OTHER, role: 'authenticated' }), 'not authorized');
+
+  // ── 12g. Re-run, flags and grants ─────────────────────────────────────────
+  await expectOk('migration 038 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/038_daily_ops_structure.sql`)));
+  eq('11 trusted functions carry the flag', num((await db.query(
+    `SELECT count(*) AS n FROM pg_proc WHERE 'hetha.daily_ops_rpc=on' = ANY (proconfig)`)).rows[0].n), 11);
+  eq('each lock trigger installed once', num((await db.query(`SELECT count(*) AS n FROM pg_trigger
+     WHERE tgname IN ('trg_guard_daily_order_write', 'trg_guard_daily_order_item_write')`)).rows[0].n), 2);
+  eq('the flag does not outlive a function call',
+    (await db.query(`SELECT COALESCE(current_setting('hetha.daily_ops_rpc', true), '') AS v`)).rows[0].v, '');
+  const g = (await db.query(`
+    SELECT
+      has_function_privilege('authenticated', 'public.generate_daily_run(date, uuid)', 'EXECUTE')               AS a1,
+      has_function_privilege('authenticated', 'public.add_daily_order_item(uuid, uuid, integer)', 'EXECUTE')    AS a2,
+      has_function_privilege('authenticated', 'public.remove_daily_order_item(uuid)', 'EXECUTE')                AS a3,
+      has_function_privilege('authenticated', 'public.set_daily_order_item_quantity(uuid, integer)', 'EXECUTE') AS a4,
+      has_function_privilege('authenticated', 'public.get_earliest_change_date(uuid)', 'EXECUTE')               AS a5,
+      has_function_privilege('anon', 'public.generate_daily_run(date, uuid)', 'EXECUTE')                        AS n1,
+      has_function_privilege('anon', 'public.add_daily_order_item(uuid, uuid, integer)', 'EXECUTE')             AS n2,
+      has_function_privilege('anon', 'public.get_earliest_change_date(uuid)', 'EXECUTE')                        AS n3,
+      has_function_privilege('authenticated', 'internal.subscription_delivers_on(uuid, date)', 'EXECUTE')       AS i1,
+      has_function_privilege('authenticated', 'internal.subscription_items_on(uuid, date)', 'EXECUTE')          AS i2,
+      has_function_privilege('authenticated', 'internal.lock_editable_daily_order(uuid)', 'EXECUTE')            AS i3`)).rows[0];
+  if (g.a1 && g.a2 && g.a3 && g.a4 && g.a5 && !g.n1 && !g.n2 && !g.n3 && !g.i1 && !g.i2 && !g.i3) {
+    ok('038 grants: staff functions for authenticated/service_role only; internals closed');
+  } else {
+    bad('038 grants', JSON.stringify(g));
   }
 }
 
