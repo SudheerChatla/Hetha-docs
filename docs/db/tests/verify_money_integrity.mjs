@@ -233,7 +233,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '036_subscription_cutoff_rule.sql',
                  '037_daily_order_settlement.sql',
                  '038_daily_ops_structure.sql',
-                 '039_wallet_simplification.sql']) {
+                 '039_wallet_simplification.sql',
+                 '040_indexes.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -3527,6 +3528,20 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   } else {
     bad('039 grants', JSON.stringify(g));
   }
+}
+
+// ---------------------------------------------------------------------------
+// 14. Migration 040: indexes only
+// ---------------------------------------------------------------------------
+console.log('\n--- 14. Migration 040: indexes ---');
+await expectOk('migration 040 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/040_indexes.sql`)));
+{
+  const n = Number((await db.query(`SELECT count(*) AS n FROM pg_indexes WHERE schemaname = 'public' AND indexname IN (
+    'idx_orders_expected_delivery_open', 'idx_orders_expected_delivery_delivered',
+    'idx_subscriptions_address_id', 'idx_subscriptions_created_at', 'idx_subscriptions_user_status',
+    'idx_users_created_at', 'idx_addresses_created_at', 'idx_reviews_created_at',
+    'idx_sdo_user_date', 'idx_wallet_tx_user_created')`)).rows[0].n);
+  if (n === 10) ok('all 10 indexes from 040 exist'); else bad('040 indexes', `found ${n} of 10`);
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);

@@ -164,3 +164,15 @@ CREATE INDEX idx_wallet_created_at ON public.wallet_transactions USING btree (cr
 CREATE INDEX idx_wallet_reference ON public.wallet_transactions USING btree (reference_type, reference_id);
 CREATE INDEX idx_wallet_user_id ON public.wallet_transactions USING btree (user_id);
 CREATE UNIQUE INDEX wallet_transactions_pkey ON public.wallet_transactions USING btree (id);
+
+-- migration 040 (task A-06)
+CREATE INDEX idx_orders_expected_delivery_open ON public.orders USING btree (expected_delivery_date) WHERE (status <> ALL (ARRAY['cancelled'::text, 'payment_pending'::text, 'delivered'::text]));
+CREATE INDEX idx_orders_expected_delivery_delivered ON public.orders USING btree (expected_delivery_date) WHERE (status = 'delivered'::text);
+CREATE INDEX idx_subscriptions_address_id ON public.subscriptions USING btree (address_id);
+CREATE INDEX idx_subscriptions_created_at ON public.subscriptions USING btree (created_at DESC);
+CREATE INDEX idx_subscriptions_user_status ON public.subscriptions USING btree (user_id, status);
+CREATE INDEX idx_users_created_at ON public.users USING btree (created_at DESC);
+CREATE INDEX idx_addresses_created_at ON public.addresses USING btree (created_at DESC);
+CREATE INDEX idx_reviews_created_at ON public.reviews USING btree (created_at DESC);
+CREATE INDEX idx_sdo_user_date ON public.subscription_daily_orders USING btree (user_id, delivery_date);
+CREATE INDEX idx_wallet_tx_user_created ON public.wallet_transactions USING btree (user_id, created_at DESC);
