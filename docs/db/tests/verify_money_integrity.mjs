@@ -232,7 +232,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '035_order_tracking_user_id.sql',
                  '036_subscription_cutoff_rule.sql',
                  '037_daily_order_settlement.sql',
-                 '038_daily_ops_structure.sql']) {
+                 '038_daily_ops_structure.sql',
+                 '039_wallet_simplification.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -338,11 +339,12 @@ if (Number(subItems.rows[0].unit_price) === 100) {
   bad('subscription price tampering', JSON.stringify(subItems.rows[0]));
 }
 
-// 6i. 3-day wallet buffer enforced server-side (daily commitment is now 100/day
-//     → 300 reserved; drop the balance below order+reserve and expect refusal).
+// 6i. Wallet reserve enforced server-side (migration 039: the next delivery of
+//     each subscription; commitment 100/day → 100 kept; order 140 + 100 = 240
+//     needed, balance 200 → refused).
 await db.exec(`UPDATE public.users SET wallet_balance = 200 WHERE id = '${CUSTOMER}'`);
-await expectError('3-day subscription buffer enforced', () => asQuery({ sub: CUSTOMER, role: 'authenticated' },
-  `SELECT public.place_order($1,$2,'wallet',40,$3::jsonb)`, [CUSTOMER, ADDR, CART]), 'reserved for 3 days');
+await expectError('next-delivery subscription reserve enforced', () => asQuery({ sub: CUSTOMER, role: 'authenticated' },
+  `SELECT public.place_order($1,$2,'wallet',40,$3::jsonb)`, [CUSTOMER, ADDR, CART]), 'next delivery');
 await db.exec(`UPDATE public.users SET wallet_balance = 5000 WHERE id = '${CUSTOMER}'`);
 
 // 6j. Online-payment orders cannot be self-declared as placed.
@@ -986,7 +988,7 @@ if (quoteSigs.length === 1 && quoteSigs[0] === 'quote_cart(jsonb,uuid)') {
 
 // ---------------------------------------------------------------------------
 // 6x. Day-edit wallet rule + per-subscription scope (migration 025).
-//     required = 3 × normal commitment (all subs) + this day's one-off extra,
+//     required = next-delivery reserve (all subs, migration 039) + this day's one-off extra,
 //     checked only when the edit raises THIS subscription's cost; and saving
 //     one subscription's day never deletes another subscription's order.
 // ---------------------------------------------------------------------------
@@ -995,15 +997,15 @@ const commitment = Number((await db.query(
   `SELECT public.get_user_daily_commitment($1) AS c`, [CUSTOMER])).rows[0].c);
 // modSub (6u) is 1 × VAR = ₹100/day; editing to 5 × VAR = ₹500 → extra ₹400.
 const EDIT_ITEMS = JSON.stringify([{ variant_id: VAR, quantity: 5 }]);
-const editRequired = Math.round((commitment * 3 + 400) * 100) / 100;
+const editRequired = Math.round((commitment + 400) * 100) / 100;
 
 await db.exec(`UPDATE public.users SET wallet_balance = ${editRequired - 1} WHERE id = '${CUSTOMER}'`);
-await expectError('day edit refused when wallet < 3-day commitment + one-off extra',
+await expectError('day edit refused when wallet < next-delivery reserve + one-off extra',
   () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
     [CUSTOMER, modSub, EDIT_DATE, EDIT_ITEMS]), 'Insufficient wallet balance');
 
 await db.exec(`UPDATE public.users SET wallet_balance = ${editRequired} WHERE id = '${CUSTOMER}'`);
-await expectOk(`day edit allowed at exactly 3 × commitment (${commitment}) + extra 400 = ${editRequired} (022 would have needed ${Math.round((commitment + 400) * 3)})`,
+await expectOk(`day edit allowed at exactly the next-delivery reserve (${commitment}) + extra 400 = ${editRequired}`,
   () => asQuery(CUST_CLAIMS, `SELECT public.modify_daily_order($1, $2, $3::date, $4::jsonb)`,
     [CUSTOMER, modSub, EDIT_DATE, EDIT_ITEMS]));
 
@@ -1105,11 +1107,12 @@ const bulkDaysPayload = (extraDays) => JSON.stringify(
   BULK_DATES.slice(0, extraDays).map((d) => ({ delivery_date: d, items: [{ variant_id: VAR, quantity: 5 }] })));
 
 const totalExtraFor3 = 400 * 3;
-const bulkRequired3 = Math.round((bulkCommitment * 3 + totalExtraFor3) * 100) / 100;
+const bulkRequired3 = Math.round((bulkCommitment + totalExtraFor3) * 100) / 100;
 // A per-day-only check (022/025's OLD behaviour re-applied 3 times) would have
-// passed at (commitment*3 + 400) for each call; this must refuse below the
+// passed at (reserve + 400) for each call; this must refuse below the
 // AGGREGATE requirement even though it's above any single day's requirement.
-const perDayOnlyRequired = Math.round((bulkCommitment * 3 + 400) * 100) / 100;
+// (Reserve = next delivery of all subscriptions, migration 039.)
+const perDayOnlyRequired = Math.round((bulkCommitment + 400) * 100) / 100;
 
 await db.exec(`UPDATE public.users SET wallet_balance = ${perDayOnlyRequired} WHERE id = '${CUSTOMER}'`);
 await expectError(
@@ -2363,6 +2366,9 @@ if (grants036p.auth_upsert && grants036p.auth_remove && !grants036p.anon_upsert
 // 10h. Idempotent.
 await expectOk('migration 036 re-runs cleanly (idempotent)',
   () => db.exec(read(`${ROOT}/migrations/036_subscription_cutoff_rule.sql`)));
+// 036 re-declares create_subscription_core with its 3-day wallet rule; 039
+// replaced that rule. Re-apply 039 as the owner would after re-running 036.
+await db.exec(read(`${ROOT}/migrations/039_wallet_simplification.sql`));
 
 // ---------------------------------------------------------------------------
 // 11. Migration 037: one settlement function for subscription daily orders
@@ -3243,6 +3249,283 @@ console.log('\n--- 12. Migration 038: Daily Ops structure ---');
     ok('038 grants: staff functions for authenticated/service_role only; internals closed');
   } else {
     bad('038 grants', JSON.stringify(g));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 13. Migration 039: wallet reserve, forecast, low-balance notices, reminder
+// ---------------------------------------------------------------------------
+console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
+{
+  const { randomUUID } = await import('node:crypto');
+  const num = (v) => Number(v);
+  const eq = (name, got, want) => {
+    const g = JSON.stringify(got), w = JSON.stringify(want);
+    if (g === w) ok(`${name} (${w})`); else bad(name, `expected ${w}, got ${g}`);
+  };
+  const val = async (claims, sql, params) => (await asQuery(claims, sql, params)).rows[0].r;
+  const json = async (claims, sql, params) => { const r = await val(claims, sql, params); return typeof r === 'string' ? JSON.parse(r) : r; };
+  const CUST = { sub: CUSTOMER, role: 'authenticated' };
+  const SERVICE = { role: 'service_role' };
+  const addDays = (ymd, n) => { const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+  const today = (await db.query(`SELECT internal.today_ist()::text AS d`)).rows[0].d;
+
+  await db.query(`INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'customers:view'), ($1, 'daily_ops:edit') ON CONFLICT DO NOTHING`, [roleId]);
+
+  // Variants at the prices the plan's example uses.
+  const V50 = 'a0390000-0000-4000-8000-0000000000c1';
+  const V60 = 'a0390000-0000-4000-8000-0000000000c2';
+  await db.exec(`INSERT INTO public.product_variants (id, product_id, label, price, weight_grams, is_active, free_delivery)
+                 VALUES ('${V50}', '${PROD}', '500 ml', 50, 500, true, false), ('${V60}', '${PROD}', '600 ml', 60, 600, true, false)`);
+
+  let n = 0;
+  const mkUser = async (balance) => {
+    const id = randomUUID(); n++;
+    await db.query(`INSERT INTO public.users (id, email, phone, first_name, wallet_balance) VALUES ($1, $2, $3, 'W', $4)`,
+      [id, `w${n}-039@example.com`, `9039${String(n).padStart(6, '0')}`, balance]);
+    return id;
+  };
+  const setBalance = (u, b) => db.query(`UPDATE public.users SET wallet_balance = $2 WHERE id = $1`, [u, b]);
+  const mkArea = async (name, freq, ref) => {
+    const id = randomUUID();
+    await db.query(`INSERT INTO public.delivery_areas (id, display_name, is_active, delivary_frequency, reference_date) VALUES ($1, $2, true, $3, $4)`, [id, name, freq, ref]);
+    return id;
+  };
+  const mkSub = async (user, { area = 'Daily 039', start, variant = VAR, qty = 1, label = null } = {}) => {
+    const id = randomUUID();
+    await db.query(`INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date, delivary_area, created_at, label, snapshot_pincode)
+                    VALUES ($1, $2, 'active', 'wallet', $3, $4, now(), $5, '700001')`, [id, user, start, area, label]);
+    await db.query(`INSERT INTO public.subscription_items (subscription_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, item_start_date, is_active)
+                    VALUES ($1, $2, 'Milk', 'x', 1, $3, $4, true)`, [id, variant, qty, start]);
+    return id;
+  };
+  const pause = (sub, from, to) => db.query(`INSERT INTO public.subscription_pauses (subscription_id, pause_start_date, pause_end_date, created_by) VALUES ($1, $2, $3, 'admin')`, [sub, from, to ?? from]);
+  const move = async (sub, from, to, areaId) => {
+    const id = randomUUID();
+    await db.query(`INSERT INTO public.delivery_day_overrides (id, override_date, swapped_with_area_id, selection_type, override_kind, from_date, to_date)
+                    VALUES ($1, $2, $3, 'customer', 'move', $4, $2)`, [id, to, areaId, from]);
+    await db.query(`INSERT INTO public.delivery_day_override_subscriptions (override_id, subscription_id) VALUES ($1, $2)`, [id, sub]);
+  };
+  const forecast = async (u, days, from) => {
+    const r = (await db.query(`SELECT internal.wallet_forecast($1, $2, $3::date) AS f`, [u, days, from])).rows[0].f;
+    return typeof r === 'string' ? JSON.parse(r) : r;
+  };
+  const AREA_DAILY_039 = await mkArea('Daily 039', 1, null);
+
+  // ── 13a. The reserve (W-01, D-1) ──────────────────────────────────────────
+  const R = await mkUser(0);
+  eq('no subscriptions → reserve 0', num(await val(null, `SELECT internal.wallet_reserve($1) AS r`, [R])), 0);
+  await mkSub(R, { start: '2099-01-01' });
+  eq('one ₹100 subscription → reserve 100 (one delivery, not three)', num(await val(null, `SELECT internal.wallet_reserve($1) AS r`, [R])), 100);
+  eq('get_wallet_reserve: own id', num(await val({ sub: R, role: 'authenticated' }, `SELECT public.get_wallet_reserve($1) AS r`, [R])), 100);
+  await expectError('get_wallet_reserve: another customer is refused',
+    () => val(CUST, `SELECT public.get_wallet_reserve($1) AS r`, [R]), 'not authorized');
+  eq('get_wallet_reserve: admin with customers:view', num(await val(ADMIN_CLAIMS, `SELECT public.get_wallet_reserve($1) AS r`, [R])), 100);
+
+  // create_subscription: wallet must cover the next delivery of existing + new.
+  const createSub = (user, label) => asQuery({ sub: user, role: 'authenticated' },
+    `SELECT public.create_subscription($1, $2::timestamptz, NULL, 'active', $3::jsonb, $4::jsonb, $5) AS id`,
+    [user, '2099-02-01T00:00:00Z', JSON.stringify({ pincode: '700001', name: 'W' }),
+     JSON.stringify([{ variantId: VAR, name: 'Cow Milk', variant: '1 L', price: 100, quantity: 1, startDate: '2099-02-01' }]), label]);
+  await setBalance(R, 199);
+  await expectError('create subscription: one rupee short of existing (100) + new (100) is refused',
+    () => createSub(R, 'Second'), 'next delivery of all your subscriptions');
+  await setBalance(R, 200);
+  await expectOk('create subscription: exactly existing (100) + new (100) is enough', () => createSub(R, 'Second'));
+
+  // place_order: order + reserve.
+  const reserveC = num(await val(null, `SELECT internal.wallet_reserve($1) AS r`, [CUSTOMER]));
+  const ORDER_TOTAL = 140;  // 1 × VAR + ₹40 delivery (see 6i)
+  await setBalance(CUSTOMER, ORDER_TOTAL + reserveC - 1);
+  await expectError(`wallet order: one rupee short of order (${ORDER_TOTAL}) + reserve (${reserveC}) is refused`,
+    () => asQuery(CUST, `SELECT public.place_order($1,$2,'wallet',40,$3::jsonb)`, [CUSTOMER, ADDR, CART]), 'next delivery');
+  await setBalance(CUSTOMER, ORDER_TOTAL + reserveC);
+  await expectOk('wallet order: exactly order + reserve succeeds',
+    () => asQuery(CUST, `SELECT public.place_order($1,$2,'wallet',40,$3::jsonb)`, [CUSTOMER, ADDR, CART]));
+  eq('…and leaves exactly the reserve', num((await db.query(`SELECT wallet_balance FROM public.users WHERE id = $1`, [CUSTOMER])).rows[0].wallet_balance), reserveC);
+  await setBalance(CUSTOMER, ORDER_TOTAL);
+  await expectOk('an admin placing the order is not bound by the reserve',
+    () => asQuery(ADMIN_CLAIMS, `SELECT public.place_order($1,$2,'wallet',40,$3::jsonb)`, [CUSTOMER, ADDR, CART]));
+  await setBalance(CUSTOMER, 5000);
+
+  // ── 13b. The forecast (W-02) ──────────────────────────────────────────────
+  const T = '2098-08-01';
+  const NOSUB = await mkUser(500);
+  const f0 = await forecast(NOSUB, 14, T);
+  eq('no subscriptions: no days, nothing covered-until, next delivery covered',
+    { days: f0.days.length, until: f0.covered_until, covered: f0.next_delivery_covered }, { days: 0, until: null, covered: true });
+
+  await mkArea('Alt odd 039', 2, addDays(T, 1));
+  await mkArea('Alt even 039', 2, addDays(T, 2));
+  const M = await mkUser(300);
+  await mkSub(M, { start: T, variant: V50 });
+  await mkSub(M, { area: 'Alt odd 039', start: T, variant: VAR });
+  await mkSub(M, { area: 'Alt even 039', start: T, variant: V60 });
+  const fm = await forecast(M, 3, T);
+  eq('mixed customer: day amounts 150, 110, 150', fm.days.map((d) => d.amount), [150, 110, 150]);
+  eq('mixed customer: covered until day 2, first uncovered day 3, 2 deliveries',
+    { until: fm.covered_until, first: fm.first_uncovered_date, n: fm.covered_deliveries }, { until: addDays(T, 2), first: addDays(T, 3), n: 2 });
+  eq('mixed customer: reserve 210 (one delivery of each), available 90',
+    { reserve: num(fm.reserve), available: num(fm.available) }, { reserve: 210, available: 90 });
+  eq('alternate-day subscription only on its days', fm.days.map((d) => d.subscriptions.length), [2, 2, 2]);
+  eq('today is never included', fm.days.some((d) => d.date === T), false);
+
+  const P = await mkUser(1000);
+  const ps = await mkSub(P, { start: T });
+  await pause(ps, addDays(T, 2));
+  eq('a paused day is absent', (await forecast(P, 3, T)).days.map((d) => d.date), [addDays(T, 1), addDays(T, 3)]);
+
+  const MV = await mkUser(1000);
+  const mvs = await mkSub(MV, { area: 'Alt even 039', start: T });
+  await move(mvs, addDays(T, 2), addDays(T, 3), AREA_DAILY_039);
+  eq('moved delivery: on its new date, not the old one', (await forecast(MV, 4, T)).days.map((d) => d.date), [addDays(T, 3), addDays(T, 4)]);
+
+  const E = await mkUser(1000);
+  const es = await mkSub(E, { start: T });
+  const editOrder = async (sub, user, date, qty, extra = '') => {
+    const id = randomUUID();
+    await db.exec(`BEGIN;
+      INSERT INTO public.subscription_daily_orders (id, delivery_date, subscription_id, user_id, status, total_value, payment_status, paid_amount, is_customer_modified)
+      VALUES ('${id}', '${date}', '${sub}', '${user}', 'pending', ${qty * 100}, ${extra ? `'paid', ${qty * 100}` : `'pending', 0`}, true);
+      INSERT INTO public.subscription_daily_order_items (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+      VALUES ('${id}', '${VAR}', 'Milk', '1 L', 100, ${qty}, ${qty * 100});
+      COMMIT;`);
+  };
+  await editOrder(es, E, addDays(T, 1), 3);
+  await editOrder(es, E, addDays(T, 2), 1, 'paid');
+  const fe = await forecast(E, 3, T);
+  eq('customer-edited day shows the edited total; an already-paid day contributes 0',
+    fe.days.map((d) => [d.date, d.amount]), [[addDays(T, 1), 300], [addDays(T, 3), 100]]);
+
+  const L8 = await mkUser(1000);
+  await mkSub(L8, { start: addDays(T, 4) });
+  eq('a subscription starting later first appears on its start date', (await forecast(L8, 6, T)).days[0].date, addDays(T, 4));
+
+  await expectError('get_wallet_forecast: another customer is refused',
+    () => json(CUST, `SELECT public.get_wallet_forecast($1, 14) AS r`, [M]), 'not authorized');
+  await expectOk('get_wallet_forecast: admin with customers:view', () => json(ADMIN_CLAIMS, `SELECT public.get_wallet_forecast($1, 14) AS r`, [M]));
+  await expectOk('get_wallet_forecast: own id', () => json({ sub: M, role: 'authenticated' }, `SELECT public.get_wallet_forecast($1, 14) AS r`, [M]));
+
+  // ── 13c. Notice after finalize (W-07) — real "today" ─────────────────────
+  const claimLow = async (claims, ids) => (await asQuery(claims,
+    `SELECT user_id, delivery_date::text AS d, balance, amount FROM public.claim_low_balance_notices($1::uuid[])`, [`{${ids.join(',')}}`])).rows;
+  const COV = await mkUser(500);  await mkSub(COV, { start: today });
+  const SHORT = await mkUser(99); await mkSub(SHORT, { start: today });
+  const r1 = await claimLow(ADMIN_CLAIMS, [COV, SHORT]);
+  eq('covered customer not returned; ₹1 short returned with tomorrow and ₹100',
+    r1.map((x) => [x.user_id === SHORT, x.d, num(x.amount)]), [[true, addDays(today, 1), 100]]);
+  eq('second call: nothing for that customer and date', (await claimLow(ADMIN_CLAIMS, [SHORT])).length, 0);
+  await mkArea('Alt 039 notice', 2, addDays(today, 2));
+  const ALT = await mkUser(0); await mkSub(ALT, { area: 'Alt 039 notice', start: today });
+  eq('alternate-day customer: evaluated on the real next delivery', (await claimLow(ADMIN_CLAIMS, [ALT])).map((x) => x.d), [addDays(today, 2)]);
+  const PZ = await mkUser(0); const pzs = await mkSub(PZ, { start: today }); await pause(pzs, addDays(today, 1));
+  eq('paused next day: the following delivery is used', (await claimLow(ADMIN_CLAIMS, [PZ])).map((x) => x.d), [addDays(today, 2)]);
+  await expectError('a customer cannot claim notices', () => claimLow(CUST, [SHORT]), 'not authorized');
+  await asQuery(SERVICE, `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [SHORT, addDays(today, 1)]);
+  eq('mark_wallet_notice_result marks it sent', (await db.query(`SELECT status FROM public.wallet_notice_log WHERE user_id = $1`, [SHORT])).rows[0].status, 'sent');
+  await expectError('a customer cannot mark a notice', () => asQuery(CUST, `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [SHORT, addDays(today, 1)]), 'not authorized');
+
+  // ── 13d. Reminder settings (W-08a) ────────────────────────────────────────
+  const settings = (claims) => json(claims, `SELECT public.get_wallet_reminder_settings() AS r`);
+  const setSettings = (claims, enabled, time) => json(claims, `SELECT public.set_wallet_reminder_settings($1, $2::time) AS r`, [enabled, time]);
+  const s0 = await settings(SERVICE);
+  eq('fresh: enabled, 18:00, Asia/Kolkata, 120-minute window',
+    [s0.enabled, s0.reminder_time, s0.timezone, s0.send_window_minutes], [true, '18:00', 'Asia/Kolkata', 120]);
+  await expectError('a customer cannot read the settings', () => settings(CUST), 'not authorized');
+  await db.query(`DELETE FROM public.admin_role_permissions WHERE role_id = $1 AND permission = 'notifications:send'`, [roleId]);
+  await expectError('an admin without notifications:send cannot read them', () => settings(ADMIN_CLAIMS), 'not authorized');
+  await expectError('…or change them', () => setSettings(ADMIN_CLAIMS, true, '19:00'), 'not authorized');
+  await db.query(`INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'notifications:send') ON CONFLICT DO NOTHING`, [roleId]);
+  eq('an admin with notifications:send can change the time', (await setSettings(ADMIN_CLAIMS, true, '19:30')).reminder_time, '19:30');
+  await expectError('time is required', () => setSettings(ADMIN_CLAIMS, true, null), 'Choose a reminder time');
+  await expectOk('migration 039 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/039_wallet_simplification.sql`)));
+  eq('re-running the migration keeps the admin\'s 19:30', (await settings(SERVICE)).reminder_time, '19:30');
+  await setSettings(SERVICE, true, '18:00');
+
+  // ── 13e. claim_wallet_reminders (W-08a) ───────────────────────────────────
+  const claimAt = async (date, time, claims = SERVICE) => (await asQuery(claims,
+    `SELECT user_id, delivery_date::text AS d, amount FROM public.claim_wallet_reminders($1::timestamptz)`,
+    [`${date}T${time}:00+05:30`])).rows;
+  const has = (rows, u) => rows.some((x) => x.user_id === u);
+  const reminderUser = async (balance, start) => { const u = await mkUser(balance); const s = await mkSub(u, { start }); return [u, s]; };
+
+  const F1 = '2098-10-01';
+  const [A1] = await reminderUser(0, F1);
+  eq('17:59 India time: nothing', has(await claimAt(F1, '17:59'), A1), false);
+  const at18 = await claimAt(F1, '18:00');
+  eq('18:00: the uncovered customer, for tomorrow, ₹100', at18.filter((x) => x.user_id === A1).map((x) => [x.d, num(x.amount)]), [[addDays(F1, 1), 100]]);
+  eq('a call a minute later: no duplicate', has(await claimAt(F1, '18:01'), A1), false);
+  const F2 = '2098-10-03'; const [A2] = await reminderUser(0, F2);
+  eq('19:59: still inside the window', has(await claimAt(F2, '19:59'), A2), true);
+  const F3 = '2098-10-05'; const [A3] = await reminderUser(0, F3);
+  eq('20:00: window passed', has(await claimAt(F3, '20:00'), A3), false);
+
+  await setSettings(SERVICE, true, '20:30');
+  const F4 = '2098-10-07'; const [A4] = await reminderUser(0, F4);
+  eq('time changed to 20:30: nothing at 18:10', has(await claimAt(F4, '18:10'), A4), false);
+  eq('…sent at 20:35', has(await claimAt(F4, '20:35'), A4), true);
+  await setSettings(SERVICE, false, '18:00');
+  const F5 = '2098-10-09'; const [A5] = await reminderUser(0, F5);
+  eq('turned off: nothing at 18:30', has(await claimAt(F5, '18:30'), A5), false);
+  await setSettings(SERVICE, true, '18:00');
+
+  const F6 = '2098-10-11'; const [B6] = await reminderUser(0, F6);
+  await setBalance(B6, 500);  // recharged before the reminder time
+  eq('recharged before the reminder: not reminded', has(await claimAt(F6, '18:00'), B6), false);
+
+  const F7 = '2098-10-13';
+  await mkArea('Alt 039 reminder', 2, addDays(F7, 2));
+  const C7 = await mkUser(0); await mkSub(C7, { area: 'Alt 039 reminder', start: F7 });
+  eq('alternate day: no delivery tomorrow → not reminded today', has(await claimAt(F7, '18:00'), C7), false);
+  eq('…reminded the next evening', has(await claimAt(addDays(F7, 1), '18:00'), C7), true);
+
+  const F8 = '2098-10-17'; const [D8, d8s] = await reminderUser(0, F8);
+  await pause(d8s, addDays(F8, 1));
+  eq('paused tomorrow: not reminded', has(await claimAt(F8, '18:00'), D8), false);
+
+  const F9 = '2098-10-19'; const [E9, e9s] = await reminderUser(0, F9);
+  await move(e9s, addDays(F9, 1), addDays(F9, 5), AREA_DAILY_039);
+  eq('delivery moved away from tomorrow: not reminded', has(await claimAt(F9, '18:00'), E9), false);
+
+  const F10 = '2098-10-21'; const [N10] = await reminderUser(0, F10);
+  await db.query(`INSERT INTO public.wallet_notice_log (user_id, delivery_date, source, balance, amount, status, sent_at)
+                  VALUES ($1, $2, 'finalize', 0, 100, 'sent', now())`, [N10, addDays(F10, 1)]);
+  eq('already told by the finalize notice: not reminded', has(await claimAt(F10, '18:00'), N10), false);
+
+  const F11 = '2098-10-23'; const [G11] = await reminderUser(0, F11);
+  const markG = (ok) => asQuery(SERVICE, `SELECT public.mark_wallet_notice_result($1, $2::date, $3, 'push failed')`, [G11, addDays(F11, 1), ok]);
+  eq('failed retry: attempt 1', has(await claimAt(F11, '18:00'), G11), true);
+  await markG(false);
+  eq('failed retry: attempt 2', has(await claimAt(F11, '18:10'), G11), true);
+  await markG(false);
+  eq('failed retry: attempt 3', has(await claimAt(F11, '18:20'), G11), true);
+  await markG(false);
+  eq('failed retry: no 4th attempt', has(await claimAt(F11, '18:30'), G11), false);
+  const F12 = '2098-10-25'; const [S12] = await reminderUser(0, F12);
+  await claimAt(F12, '18:00');
+  await asQuery(SERVICE, `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [S12, addDays(F12, 1)]);
+  eq('a sent reminder is never returned again', has(await claimAt(F12, '19:00'), S12), false);
+
+  await expectError('a customer cannot claim reminders', () => claimAt(F12, '18:00', CUST), 'not authorized');
+  await expectError('an admin cannot claim reminders (service role only)', () => claimAt(F12, '18:00', ADMIN_CLAIMS), 'not authorized');
+
+  // ── 13f. Grants ───────────────────────────────────────────────────────────
+  const g = (await db.query(`
+    SELECT
+      has_function_privilege('authenticated', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE')          AS a1,
+      has_function_privilege('authenticated', 'public.get_wallet_reserve(uuid)', 'EXECUTE')                   AS a2,
+      has_function_privilege('authenticated', 'public.get_wallet_reminder_settings()', 'EXECUTE')              AS a3,
+      has_function_privilege('anon', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE')                   AS n1,
+      has_function_privilege('anon', 'public.claim_wallet_reminders(timestamptz)', 'EXECUTE')                  AS n2,
+      has_function_privilege('anon', 'public.set_wallet_reminder_settings(boolean, time)', 'EXECUTE')          AS n3,
+      has_function_privilege('authenticated', 'internal.wallet_forecast(uuid, integer, date)', 'EXECUTE')      AS i1,
+      has_function_privilege('authenticated', 'internal.wallet_reserve(uuid)', 'EXECUTE')                      AS i2,
+      has_table_privilege('authenticated', 'public.wallet_notice_log', 'SELECT')                               AS t1,
+      has_table_privilege('authenticated', 'public.wallet_reminder_settings', 'UPDATE')                        AS t2`)).rows[0];
+  if (g.a1 && g.a2 && g.a3 && !g.n1 && !g.n2 && !g.n3 && !g.i1 && !g.i2 && !g.t1 && !g.t2) {
+    ok('039 grants: RPCs for authenticated/service_role only; internals and the two tables closed');
+  } else {
+    bad('039 grants', JSON.stringify(g));
   }
 }
 
