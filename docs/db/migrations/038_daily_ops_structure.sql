@@ -42,17 +42,22 @@
 --     • A new order is inserted unpaid and unfinalized, and not onto a day
 --       that is already finalized or reconciled.
 --
---   HOW THE TRIGGERS KNOW THE CALLER IS TRUSTED. Each trusted function is
---   declared with   SET hetha.daily_ops_rpc = 'on'.   Postgres applies that
---   setting only while the function runs and restores it when it returns, so
---   nothing outside the function can use it. The 037 functions get it with
---   ALTER FUNCTION (their bodies are unchanged). Also trusted: the SQL Editor
---   (jwt role 'internal', for the owner's manual hold review, D-9) and the
---   documented escape hatch SET LOCAL hetha.skip_money_checks = 'on'.
+--   HOW THE TRIGGERS KNOW THE CALLER IS TRUSTED. The first statement of each
+--   trusted function is
+--       PERFORM set_config('hetha.daily_ops_rpc', 'on', true);
+--   (transaction-local). The seven 037 functions are re-declared below with
+--   their bodies copied unchanged plus that one line. A PostgREST request is
+--   one transaction that runs one function, so the flag never reaches a
+--   caller's own statements. Also trusted: the SQL Editor (jwt role
+--   'internal', for the owner's manual hold review, D-9) and the documented
+--   escape hatch SET LOCAL hetha.skip_money_checks = 'on'.
+--   (A function-level  SET hetha.daily_ops_rpc = 'on'  would be tidier, but
+--   the Supabase postgres role is not allowed to attach a custom setting to a
+--   function: "permission denied to set parameter".)
 --
 --   !! Any later migration that re-declares one of these functions with
---   !! CREATE OR REPLACE must keep the line   SET hetha.daily_ops_rpc TO 'on'
---   !! or the function will be refused by the triggers.
+--   !! CREATE OR REPLACE must keep the PERFORM set_config(...) line, or the
+--   !! function will be refused by the triggers.
 --
 --   A user_id change on a finalized order is allowed only when the old user
 --   no longer exists: that is the ON UPDATE CASCADE from claim_adhoc_user
@@ -229,7 +234,6 @@ CREATE OR REPLACE FUNCTION public.generate_daily_run(p_delivery_date date, p_adm
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path TO 'public', 'internal'
-  SET hetha.daily_ops_rpc TO 'on'
 AS $function$
 DECLARE
   v_run_id     uuid;
@@ -243,6 +247,7 @@ DECLARE
   v_sub        record;
   v_clean      uuid[];
 BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
   IF NOT internal.is_admin_actor('daily_ops:edit') THEN
     RAISE EXCEPTION 'Not authorized to generate a delivery run';
   END IF;
@@ -368,7 +373,6 @@ CREATE OR REPLACE FUNCTION public.add_daily_order_item(p_order_id uuid, p_varian
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path TO 'public', 'internal'
-  SET hetha.daily_ops_rpc TO 'on'
 AS $function$
 DECLARE
   v_order   public.subscription_daily_orders;
@@ -378,6 +382,7 @@ DECLARE
   v_item_id uuid;
   v_total   numeric;
 BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
   IF NOT internal.is_admin_actor('daily_ops:edit') THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
@@ -430,7 +435,6 @@ CREATE OR REPLACE FUNCTION public.remove_daily_order_item(p_item_id uuid)
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path TO 'public', 'internal'
-  SET hetha.daily_ops_rpc TO 'on'
 AS $function$
 DECLARE
   v_order_id  uuid;
@@ -439,6 +443,7 @@ DECLARE
   v_total     numeric;
   v_res       jsonb;
 BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
   IF NOT internal.is_admin_actor('daily_ops:edit') THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
@@ -482,12 +487,12 @@ CREATE OR REPLACE FUNCTION public.set_daily_order_item_quantity(p_item_id uuid, 
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path TO 'public', 'internal'
-  SET hetha.daily_ops_rpc TO 'on'
 AS $function$
 DECLARE
   v_order_id uuid;
   v_total    numeric;
 BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
   IF NOT internal.is_admin_actor('daily_ops:edit') THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
@@ -518,15 +523,707 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------------
--- 4. Mark the migration 037 functions as trusted (bodies unchanged)
+-- 4. Mark the migration 037 functions as trusted
 -- ---------------------------------------------------------------------------
-ALTER FUNCTION internal.settle_daily_order(uuid, text, text)          SET hetha.daily_ops_rpc TO 'on';
-ALTER FUNCTION public.finalize_daily_run(date, uuid)                  SET hetha.daily_ops_rpc TO 'on';
-ALTER FUNCTION public.unlock_daily_run(date)                          SET hetha.daily_ops_rpc TO 'on';
-ALTER FUNCTION public.record_subscription_delivery(uuid, jsonb, text) SET hetha.daily_ops_rpc TO 'on';
-ALTER FUNCTION public.set_daily_order_status(uuid[], text)            SET hetha.daily_ops_rpc TO 'on';
-ALTER FUNCTION public.retry_daily_order_payment(uuid)                 SET hetha.daily_ops_rpc TO 'on';
-ALTER FUNCTION public.reconcile_daily_run(date, uuid)                 SET hetha.daily_ops_rpc TO 'on';
+-- Bodies copied UNCHANGED from migration 037; the only added line is the
+-- PERFORM set_config(...) flag at the top. Grants are unchanged (CREATE OR
+-- REPLACE keeps them).
+
+CREATE OR REPLACE FUNCTION internal.settle_daily_order(
+  p_order_id      uuid,
+  p_on_short      text DEFAULT 'raise',
+  p_refund_reason text DEFAULT NULL
+)
+  RETURNS jsonb
+  LANGUAGE plpgsql
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_order    public.subscription_daily_orders;
+  v_method   text;
+  v_owed     numeric;
+  v_diff     numeric;
+  v_balance  numeric;
+  v_charged  numeric := 0;
+  v_refunded numeric := 0;
+  v_refund_text text;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF p_on_short NOT IN ('skip', 'raise') THEN
+    RAISE EXCEPTION 'settle_daily_order: p_on_short must be skip or raise';
+  END IF;
+
+  SELECT * INTO v_order
+  FROM public.subscription_daily_orders WHERE id = p_order_id FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Daily order not found';
+  END IF;
+
+  IF v_order.settlement_hold_reason IS NOT NULL THEN
+    RAISE EXCEPTION 'This order''s payment history needs review before money can move: %',
+      v_order.settlement_hold_reason;
+  END IF;
+
+  SELECT payment_method INTO v_method
+  FROM public.subscriptions WHERE id = v_order.subscription_id;
+
+  -- Cash on delivery: nothing moves through the wallet.
+  IF COALESCE(v_method, 'wallet') <> 'wallet' THEN
+    RETURN jsonb_build_object(
+      'charged', 0, 'refunded', 0, 'skipped', false, 'wallet', false,
+      'owed', internal.daily_order_amount_owed(p_order_id),
+      'paid_amount', v_order.paid_amount, 'user_id', v_order.user_id);
+  END IF;
+
+  v_owed := internal.daily_order_amount_owed(p_order_id);
+  v_diff := round(v_owed - v_order.paid_amount, 2);
+  v_refund_text := 'Refund: ' || COALESCE(p_refund_reason, 'subscription delivery')
+                   || ' ' || v_order.delivery_date::text;
+
+  IF v_diff > 0 THEN
+    SELECT COALESCE(wallet_balance, 0) INTO v_balance
+    FROM public.users WHERE id = v_order.user_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'User not found';
+    END IF;
+
+    IF v_balance < v_diff THEN
+      IF p_on_short = 'raise' THEN
+        RAISE EXCEPTION
+          'Wallet balance (%) is too low to charge % for this order. Ask the customer to recharge.',
+          v_balance, v_diff;
+      END IF;
+
+      -- Skip the order for the day and give back anything already taken
+      -- (only possible when the order was paid, then unlocked and enlarged).
+      IF v_order.paid_amount > 0 THEN
+        PERFORM internal.apply_wallet_delta(
+          v_order.user_id, v_order.paid_amount, 'credit',
+          'Refund: delivery skipped (low wallet balance) ' || v_order.delivery_date::text,
+          'admin', 'subscription', v_order.id::text);
+        v_refunded := v_order.paid_amount;
+      END IF;
+
+      UPDATE public.subscription_daily_orders
+      SET status         = 'skipped',
+          skip_reason    = 'insufficient_balance',
+          paid_amount    = 0,
+          payment_status = 'failed',
+          settled_at     = now()
+      WHERE id = p_order_id;
+
+      RETURN jsonb_build_object(
+        'charged', 0, 'refunded', v_refunded, 'skipped', true, 'wallet', true,
+        'owed', v_owed, 'paid_amount', 0, 'user_id', v_order.user_id,
+        'shortfall', round(v_diff - v_balance, 2));
+    END IF;
+
+    PERFORM internal.apply_wallet_delta(
+      v_order.user_id, v_diff, 'debit',
+      'Subscription delivery ' || v_order.delivery_date::text,
+      'admin', 'subscription', v_order.id::text);
+    v_charged := v_diff;
+
+  ELSIF v_diff < 0 THEN
+    PERFORM internal.apply_wallet_delta(
+      v_order.user_id, -v_diff, 'credit', v_refund_text,
+      'admin', 'subscription', v_order.id::text);
+    v_refunded := -v_diff;
+  END IF;
+
+  UPDATE public.subscription_daily_orders
+  SET paid_amount    = v_owed,
+      payment_status = CASE
+                         WHEN v_owed > 0 THEN 'paid'
+                         WHEN v_order.paid_amount > 0 THEN 'refunded'
+                         ELSE payment_status
+                       END,
+      wallet_deducted_at = CASE WHEN v_charged > 0 THEN now() ELSE wallet_deducted_at END,
+      settled_at     = now()
+  WHERE id = p_order_id;
+
+  RETURN jsonb_build_object(
+    'charged', v_charged, 'refunded', v_refunded, 'skipped', false, 'wallet', true,
+    'owed', v_owed, 'paid_amount', v_owed, 'user_id', v_order.user_id);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.finalize_daily_run(p_delivery_date date, p_admin_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_run_id      uuid;
+  v_run_status  text;
+  v_order       record;
+  v_res         jsonb;
+  v_charged     jsonb := '[]'::jsonb;
+  v_skipped     jsonb := '[]'::jsonb;
+  v_errors      jsonb := '[]'::jsonb;
+  v_total_deducted numeric := 0;
+  v_total_refunded numeric := 0;
+  v_total_value    numeric := 0;
+  v_total_orders   integer := 0;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF NOT internal.is_admin_actor('daily_ops:edit') THEN
+    RAISE EXCEPTION 'Not authorized to finalize a delivery run';
+  END IF;
+
+  INSERT INTO public.daily_ops_runs (delivery_date, status, generated_by, generated_at)
+  VALUES (p_delivery_date, 'draft', p_admin_id, now())
+  ON CONFLICT (delivery_date) DO NOTHING;
+
+  -- The row lock makes a second, simultaneous finalize wait here and then
+  -- fail the status check below, so a day can never be charged twice.
+  SELECT id, status INTO v_run_id, v_run_status
+  FROM public.daily_ops_runs
+  WHERE delivery_date = p_delivery_date
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Run record not found for %', p_delivery_date;
+  END IF;
+
+  IF v_run_status <> 'draft' THEN
+    RAISE EXCEPTION 'Cannot finalize: date is already %', v_run_status;
+  END IF;
+
+  UPDATE public.subscription_daily_orders
+  SET is_finalized = true,
+      finalized_at = now(),
+      finalized_by = p_admin_id
+  WHERE delivery_date = p_delivery_date
+    AND status = 'pending'
+    AND is_finalized = false;
+
+  -- Charging order: per customer, oldest subscription first. When a wallet
+  -- cannot cover every order, the older subscription is the one delivered.
+  FOR v_order IN
+    SELECT sdo.id, sdo.user_id, sdo.total_value
+    FROM public.subscription_daily_orders sdo
+    JOIN public.subscriptions s ON s.id = sdo.subscription_id
+    WHERE sdo.delivery_date = p_delivery_date
+      AND sdo.is_finalized = true
+      AND sdo.status = 'pending'
+      AND s.payment_method = 'wallet'
+    ORDER BY sdo.user_id, s.created_at, s.id, sdo.id
+  LOOP
+    BEGIN
+      v_res := internal.settle_daily_order(v_order.id, 'skip', 'order changed');
+
+      IF (v_res->>'skipped')::boolean THEN
+        v_skipped := v_skipped || jsonb_build_object(
+          'order_id', v_order.id, 'user_id', v_order.user_id,
+          'amount', (v_res->>'owed')::numeric, 'reason', 'insufficient_balance');
+      ELSIF (v_res->>'charged')::numeric > 0 THEN
+        v_charged := v_charged || jsonb_build_object(
+          'order_id', v_order.id, 'user_id', v_order.user_id,
+          'amount', (v_res->>'charged')::numeric);
+      END IF;
+
+      v_total_deducted := v_total_deducted + (v_res->>'charged')::numeric;
+      v_total_refunded := v_total_refunded + (v_res->>'refunded')::numeric;
+
+    EXCEPTION WHEN OTHERS THEN
+      -- Anything unexpected (for example an order on payment hold): the order
+      -- must not go out unpaid, so it is skipped and reported, not delivered.
+      v_errors := v_errors || jsonb_build_object(
+        'order_id', v_order.id, 'user_id', v_order.user_id,
+        'amount', v_order.total_value, 'error', SQLERRM);
+
+      UPDATE public.subscription_daily_orders
+      SET status = 'skipped', skip_reason = 'payment_error', payment_status = 'failed'
+      WHERE id = v_order.id;
+    END;
+  END LOOP;
+
+  -- Refund sweep: a skipped or cancelled order of this day that still holds
+  -- money (cancelled while the day was unlocked, or by a direct table update)
+  -- owes nothing, so settle gives the money back.
+  FOR v_order IN
+    SELECT id, user_id, total_value
+    FROM public.subscription_daily_orders
+    WHERE delivery_date = p_delivery_date
+      AND status IN ('skipped', 'cancelled')
+      AND paid_amount > 0
+      AND settlement_hold_reason IS NULL
+    ORDER BY user_id, id
+  LOOP
+    v_res := internal.settle_daily_order(
+      v_order.id, 'raise', 'delivery skipped');
+    v_total_refunded := v_total_refunded + (v_res->>'refunded')::numeric;
+  END LOOP;
+
+  SELECT COUNT(*), COALESCE(SUM(total_value), 0)
+  INTO v_total_orders, v_total_value
+  FROM public.subscription_daily_orders
+  WHERE delivery_date = p_delivery_date
+    AND is_finalized = true
+    AND status NOT IN ('skipped', 'cancelled');
+
+  UPDATE public.daily_ops_runs
+  SET status = 'finalized',
+      finalized_at = now(),
+      finalized_by = p_admin_id,
+      total_orders = v_total_orders,
+      total_value = v_total_value,
+      wallet_deduction_completed_at = now(),
+      updated_at = now()
+  WHERE id = v_run_id;
+
+  RETURN jsonb_build_object(
+    'finalized',        v_total_orders,
+    'total_deducted',   v_total_deducted,
+    'total_refunded',   v_total_refunded,
+    'total_value',      v_total_value,
+    'charged',          v_charged,
+    'skipped',          v_skipped,
+    'deduction_errors', v_errors
+  );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.unlock_daily_run(p_delivery_date date)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_run_id     uuid;
+  v_run_status text;
+  v_reopened   integer := 0;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF NOT (internal.is_service_actor() OR public.is_super_admin()) THEN
+    RAISE EXCEPTION 'Only a super admin can unlock a finalized day';
+  END IF;
+
+  SELECT id, status INTO v_run_id, v_run_status
+  FROM public.daily_ops_runs
+  WHERE delivery_date = p_delivery_date
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No run exists for %', p_delivery_date;
+  END IF;
+  IF v_run_status = 'reconciled' THEN
+    RAISE EXCEPTION 'This day is reconciled and cannot be unlocked';
+  END IF;
+  IF v_run_status <> 'finalized' THEN
+    RAISE EXCEPTION 'This day is not finalized';
+  END IF;
+
+  UPDATE public.daily_ops_runs
+  SET status = 'draft', finalized_at = NULL, finalized_by = NULL, updated_at = now()
+  WHERE id = v_run_id;
+
+  UPDATE public.subscription_daily_orders
+  SET is_finalized = false, finalized_at = NULL, finalized_by = NULL
+  WHERE delivery_date = p_delivery_date
+    AND is_finalized = true
+    AND status = 'pending';
+  GET DIAGNOSTICS v_reopened = ROW_COUNT;
+
+  RETURN jsonb_build_object('reopened', v_reopened);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.record_subscription_delivery(
+  p_daily_order_id uuid,
+  p_items          jsonb,
+  p_note           text DEFAULT NULL
+)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_order         public.subscription_daily_orders;
+  v_run_status    text;
+  v_item          jsonb;
+  v_item_id       uuid;
+  v_delivered_qty integer;
+  v_quantity      integer;
+  v_all_zero      boolean;
+  v_new_status    text;
+  v_res           jsonb;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF NOT internal.is_admin_actor('daily_ops:edit') THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT * INTO v_order
+  FROM public.subscription_daily_orders WHERE id = p_daily_order_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Daily order not found';
+  END IF;
+
+  SELECT status INTO v_run_status
+  FROM public.daily_ops_runs WHERE delivery_date = v_order.delivery_date;
+
+  IF v_run_status = 'reconciled' THEN
+    RAISE EXCEPTION 'This day is reconciled; deliveries can no longer be changed';
+  END IF;
+  IF NOT COALESCE(v_order.is_finalized, false) THEN
+    RAISE EXCEPTION 'Finalize the day before recording deliveries';
+  END IF;
+  IF v_order.status = 'skipped' THEN
+    IF v_order.skip_reason IS NOT NULL THEN
+      RAISE EXCEPTION 'This order was skipped because the payment failed. Use Retry payment first.';
+    END IF;
+    RAISE EXCEPTION 'This order is skipped. Set it back to pending before recording a delivery.';
+  END IF;
+
+  IF p_items IS NULL OR jsonb_typeof(p_items) <> 'array' THEN
+    RAISE EXCEPTION 'p_items must be a JSON array';
+  END IF;
+
+  FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
+  LOOP
+    v_item_id       := (v_item->>'item_id')::uuid;
+    v_delivered_qty := (v_item->>'delivered_qty')::integer;
+
+    IF v_item_id IS NULL THEN
+      RAISE EXCEPTION 'Each item must have an item_id';
+    END IF;
+    IF v_delivered_qty IS NULL THEN
+      RAISE EXCEPTION 'Each item must have a delivered_qty';
+    END IF;
+    IF v_delivered_qty < 0 THEN
+      RAISE EXCEPTION 'delivered_qty cannot be negative';
+    END IF;
+
+    SELECT quantity INTO v_quantity
+    FROM public.subscription_daily_order_items
+    WHERE id = v_item_id AND daily_order_id = p_daily_order_id;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Item % does not belong to this order', v_item_id;
+    END IF;
+    IF v_delivered_qty > v_quantity THEN
+      RAISE EXCEPTION 'delivered_qty (%) exceeds the ordered quantity (%)', v_delivered_qty, v_quantity;
+    END IF;
+
+    UPDATE public.subscription_daily_order_items
+    SET delivered_qty = v_delivered_qty
+    WHERE id = v_item_id;
+  END LOOP;
+
+  -- Every line must be accounted for, otherwise the order would be marked
+  -- delivered with some lines never checked and their shortfall never refunded.
+  PERFORM 1 FROM public.subscription_daily_order_items
+  WHERE daily_order_id = p_daily_order_id AND delivered_qty IS NULL
+  LIMIT 1;
+  IF FOUND THEN
+    RAISE EXCEPTION 'Record a delivered quantity for every item in the order';
+  END IF;
+
+  SELECT COALESCE(bool_and(delivered_qty = 0), true) INTO v_all_zero
+  FROM public.subscription_daily_order_items
+  WHERE daily_order_id = p_daily_order_id;
+
+  v_new_status := CASE WHEN v_all_zero THEN 'cancelled' ELSE 'delivered' END;
+
+  UPDATE public.subscription_daily_orders
+  SET status        = v_new_status,
+      skip_reason   = NULL,
+      tracking_info = COALESCE(p_note, tracking_info)
+  WHERE id = p_daily_order_id;
+
+  v_res := internal.settle_daily_order(
+    p_daily_order_id, 'raise',
+    CASE WHEN v_all_zero THEN 'not delivered' ELSE 'short delivery' END);
+
+  RETURN jsonb_build_object(
+    'status',   v_new_status,
+    'refunded', (v_res->>'refunded')::numeric,
+    'charged',  (v_res->>'charged')::numeric,
+    'short',    (v_res->>'owed')::numeric < round(v_order.total_value, 2),
+    'user_id',  v_order.user_id
+  );
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.set_daily_order_status(p_order_ids uuid[], p_status text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_order      public.subscription_daily_orders;
+  v_run_status text;
+  v_res        jsonb;
+  v_results    jsonb := '[]'::jsonb;
+  v_updated    integer := 0;
+  v_refunded   numeric := 0;
+  v_charged    numeric := 0;
+  v_id         uuid;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF NOT internal.is_admin_actor('daily_ops:edit') THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+  IF p_status IS NULL OR p_status NOT IN ('pending', 'delivered', 'skipped', 'cancelled') THEN
+    RAISE EXCEPTION 'Invalid status: %', p_status;
+  END IF;
+  IF p_order_ids IS NULL OR array_length(p_order_ids, 1) IS NULL THEN
+    RAISE EXCEPTION 'At least one order is required';
+  END IF;
+
+  -- Fixed lock order (by id) so two staff changing overlapping selections
+  -- cannot deadlock.
+  FOR v_id IN SELECT DISTINCT x FROM unnest(p_order_ids) x ORDER BY x
+  LOOP
+    SELECT * INTO v_order
+    FROM public.subscription_daily_orders WHERE id = v_id FOR UPDATE;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Daily order % not found', v_id;
+    END IF;
+
+    IF v_order.status = p_status THEN
+      CONTINUE;
+    END IF;
+
+    SELECT status INTO v_run_status
+    FROM public.daily_ops_runs WHERE delivery_date = v_order.delivery_date;
+    IF v_run_status = 'reconciled' THEN
+      RAISE EXCEPTION 'The day % is reconciled; its orders can no longer be changed', v_order.delivery_date;
+    END IF;
+
+    IF v_order.status = 'skipped' AND v_order.skip_reason IS NOT NULL
+       AND p_status IN ('pending', 'delivered') THEN
+      RAISE EXCEPTION 'An order was skipped because its payment failed. Use Retry payment for it.';
+    END IF;
+
+    IF p_status = 'delivered' THEN
+      IF NOT COALESCE(v_order.is_finalized, false) THEN
+        RAISE EXCEPTION 'Finalize the day before marking deliveries';
+      END IF;
+      UPDATE public.subscription_daily_order_items
+      SET delivered_qty = quantity
+      WHERE daily_order_id = v_id AND delivered_qty IS NULL;
+    END IF;
+
+    IF p_status = 'pending' THEN
+      UPDATE public.subscription_daily_order_items
+      SET delivered_qty = NULL
+      WHERE daily_order_id = v_id AND delivered_qty IS NOT NULL;
+    END IF;
+
+    UPDATE public.subscription_daily_orders
+    SET status = p_status, skip_reason = NULL
+    WHERE id = v_id;
+    v_updated := v_updated + 1;
+
+    v_res := NULL;
+    IF COALESCE(v_order.is_finalized, false)
+       OR (p_status IN ('skipped', 'cancelled') AND v_order.paid_amount > 0) THEN
+      v_res := internal.settle_daily_order(
+        v_id, 'raise',
+        CASE p_status WHEN 'skipped' THEN 'delivery skipped'
+                      WHEN 'cancelled' THEN 'delivery cancelled'
+                      ELSE 'short delivery' END);
+      v_refunded := v_refunded + (v_res->>'refunded')::numeric;
+      v_charged  := v_charged  + (v_res->>'charged')::numeric;
+    END IF;
+
+    v_results := v_results || jsonb_build_object(
+      'order_id', v_id, 'user_id', v_order.user_id, 'status', p_status,
+      'refunded', COALESCE((v_res->>'refunded')::numeric, 0),
+      'charged',  COALESCE((v_res->>'charged')::numeric, 0));
+  END LOOP;
+
+  RETURN jsonb_build_object(
+    'updated', v_updated, 'refunded', v_refunded, 'charged', v_charged, 'orders', v_results);
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.retry_daily_order_payment(p_order_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_order      public.subscription_daily_orders;
+  v_run_status text;
+  v_res        jsonb;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF NOT internal.is_admin_actor('daily_ops:edit') THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT * INTO v_order
+  FROM public.subscription_daily_orders WHERE id = p_order_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Daily order not found';
+  END IF;
+
+  IF v_order.status <> 'skipped' OR v_order.skip_reason IS NULL THEN
+    RAISE EXCEPTION 'Only an order skipped for a failed payment can be retried';
+  END IF;
+
+  SELECT status INTO v_run_status
+  FROM public.daily_ops_runs WHERE delivery_date = v_order.delivery_date;
+  IF v_run_status IS DISTINCT FROM 'finalized' THEN
+    RAISE EXCEPTION 'Payment can only be retried while the day is finalized (it is %)',
+      COALESCE(v_run_status, 'not started');
+  END IF;
+
+  UPDATE public.subscription_daily_orders
+  SET status = 'pending', skip_reason = NULL, payment_status = 'pending',
+      is_finalized = true, finalized_at = COALESCE(finalized_at, now())
+  WHERE id = p_order_id;
+
+  -- Raises (and rolls the order back to skipped) if the wallet is still short.
+  v_res := internal.settle_daily_order(p_order_id, 'raise', NULL);
+
+  UPDATE public.daily_ops_runs r
+  SET total_orders = t.n, total_value = t.v, updated_at = now()
+  FROM (
+    SELECT COUNT(*) AS n, COALESCE(SUM(total_value), 0) AS v
+    FROM public.subscription_daily_orders
+    WHERE delivery_date = v_order.delivery_date
+      AND is_finalized = true
+      AND status NOT IN ('skipped', 'cancelled')
+  ) t
+  WHERE r.delivery_date = v_order.delivery_date;
+
+  RETURN jsonb_build_object(
+    'charged', (v_res->>'charged')::numeric, 'user_id', v_order.user_id, 'status', 'pending');
+END;
+$function$;
+
+CREATE OR REPLACE FUNCTION public.reconcile_daily_run(p_delivery_date date, p_admin_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'internal'
+AS $function$
+DECLARE
+  v_run_id     uuid;
+  v_run_status text;
+  v_order      record;
+  v_all_zero   boolean;
+  v_missing    integer;
+  v_res        jsonb;
+  v_reconciled integer := 0;
+  v_delivered_users jsonb := '[]'::jsonb;
+  v_refunds    jsonb := '[]'::jsonb;
+  v_errors     jsonb := '[]'::jsonb;
+  v_total_refunded numeric := 0;
+  v_total_charged  numeric := 0;
+BEGIN
+  PERFORM set_config('hetha.daily_ops_rpc', 'on', true);  -- trusted by the finalized-day lock
+  IF NOT internal.is_admin_actor('daily_ops:edit') THEN
+    RAISE EXCEPTION 'Not authorized to reconcile a delivery run';
+  END IF;
+
+  SELECT id, status INTO v_run_id, v_run_status
+  FROM public.daily_ops_runs
+  WHERE delivery_date = p_delivery_date
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'No run exists for %', p_delivery_date;
+  END IF;
+  IF v_run_status <> 'finalized' THEN
+    RAISE EXCEPTION 'Cannot reconcile: date is %', v_run_status;
+  END IF;
+
+  -- Step 0: every pending order must have a delivered quantity for every
+  -- item. Nothing is assumed delivered.
+  SELECT COUNT(DISTINCT o.id) INTO v_missing
+  FROM public.subscription_daily_orders o
+  JOIN public.subscription_daily_order_items i ON i.daily_order_id = o.id
+  WHERE o.delivery_date = p_delivery_date
+    AND o.is_finalized = true
+    AND o.status = 'pending'
+    AND i.delivered_qty IS NULL;
+
+  IF v_missing > 0 THEN
+    RAISE EXCEPTION
+      'Cannot reconcile: % pending order(s) still have items with no delivered quantity. Record the delivered quantities (or mark those orders delivered, skipped or cancelled) and try again.',
+      v_missing;
+  END IF;
+
+  -- Step 1: close out every order still pending, using the recorded quantities.
+  FOR v_order IN
+    SELECT id, user_id
+    FROM public.subscription_daily_orders
+    WHERE delivery_date = p_delivery_date
+      AND is_finalized = true
+      AND status = 'pending'
+    ORDER BY user_id, id
+    FOR UPDATE
+  LOOP
+    SELECT COALESCE(bool_and(delivered_qty = 0), true) INTO v_all_zero
+    FROM public.subscription_daily_order_items
+    WHERE daily_order_id = v_order.id;
+
+    UPDATE public.subscription_daily_orders
+    SET status = CASE WHEN v_all_zero THEN 'cancelled' ELSE 'delivered' END
+    WHERE id = v_order.id;
+
+    v_reconciled := v_reconciled + 1;
+    IF NOT v_all_zero THEN
+      v_delivered_users := v_delivered_users || to_jsonb(v_order.user_id);
+    END IF;
+  END LOOP;
+
+  -- Step 2: settle every finalized order of the day against what is recorded.
+  FOR v_order IN
+    SELECT id, user_id, total_value
+    FROM public.subscription_daily_orders
+    WHERE delivery_date = p_delivery_date
+      AND is_finalized = true
+    ORDER BY user_id, id
+  LOOP
+    BEGIN
+      v_res := internal.settle_daily_order(v_order.id, 'raise', 'short delivery');
+      v_total_refunded := v_total_refunded + (v_res->>'refunded')::numeric;
+      v_total_charged  := v_total_charged  + (v_res->>'charged')::numeric;
+      IF (v_res->>'refunded')::numeric > 0 THEN
+        v_refunds := v_refunds || jsonb_build_object(
+          'order_id', v_order.id, 'user_id', v_order.user_id,
+          'amount', (v_res->>'refunded')::numeric);
+      END IF;
+    EXCEPTION WHEN OTHERS THEN
+      -- The day still closes; the order is reported for manual follow-up.
+      v_errors := v_errors || jsonb_build_object(
+        'order_id', v_order.id, 'user_id', v_order.user_id,
+        'amount', v_order.total_value, 'error', SQLERRM);
+    END;
+  END LOOP;
+
+  UPDATE public.daily_ops_runs
+  SET status = 'reconciled',
+      reconciled_at = now(),
+      reconciled_by = p_admin_id,
+      updated_at = now()
+  WHERE id = v_run_id;
+
+  RETURN jsonb_build_object(
+    'reconciled',        v_reconciled,
+    'delivered_user_ids', v_delivered_users,
+    'total_refunded',    v_total_refunded,
+    'total_charged',     v_total_charged,
+    'refunds',           v_refunds,
+    'settlement_errors', v_errors
+  );
+END;
+$function$;
 
 -- ---------------------------------------------------------------------------
 -- 5. Finalized-day lock
@@ -706,10 +1403,10 @@ COMMIT;
 -- ---------------------------------------------------------------------------
 -- Verification
 -- ---------------------------------------------------------------------------
--- 1. The trusted functions carry the setting (expect 11 rows):
+-- 1. The trusted functions set the flag (expect 11 rows):
 --      SELECT p.oid::regprocedure
 --      FROM pg_proc p
---      WHERE 'hetha.daily_ops_rpc=on' = ANY (p.proconfig)
+--      WHERE p.prosrc LIKE '%set_config(''hetha.daily_ops_rpc'', ''on'', true)%'
 --      ORDER BY 1;
 --
 -- 2. Both lock triggers exist (2 rows):

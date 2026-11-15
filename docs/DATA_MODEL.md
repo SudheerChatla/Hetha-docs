@@ -273,10 +273,13 @@ change only inside them; on a finalized order only `tracking_info` and
 `custom_route` may change directly, and on its items only `delivered_qty`
 (0 … `quantity`); nothing at all on a reconciled day; a finalized order cannot
 be deleted; a new order is inserted unpaid and unfinalized and not onto a
-finalized day. Trusted functions carry `SET hetha.daily_ops_rpc = 'on'`
-(applies only while the function runs). The SQL Editor (jwt role `internal`)
-and `hetha.skip_money_checks` are also allowed. **A migration that re-declares
-one of the trusted functions must keep that `SET` line.**
+finalized day. Each trusted function starts with
+`PERFORM set_config('hetha.daily_ops_rpc', 'on', true);` (transaction-local; a
+PostgREST request runs one function per transaction). The SQL Editor (jwt role
+`internal`) and `hetha.skip_money_checks` are also allowed. **A migration that
+re-declares one of the trusted functions must keep that line.** (A
+function-level `SET hetha.…` is not possible: the Supabase `postgres` role gets
+"permission denied to set parameter".)
 
 ### `subscription_daily_order_items`
 Line items for a daily order, including `is_adhoc_addition` (one-time extras) and

@@ -3206,8 +3206,22 @@ console.log('\n--- 12. Migration 038: Daily Ops structure ---');
 
   // ── 12g. Re-run, flags and grants ─────────────────────────────────────────
   await expectOk('migration 038 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/038_daily_ops_structure.sql`)));
-  eq('11 trusted functions carry the flag', num((await db.query(
-    `SELECT count(*) AS n FROM pg_proc WHERE 'hetha.daily_ops_rpc=on' = ANY (proconfig)`)).rows[0].n), 11);
+  eq('11 trusted functions set the flag', num((await db.query(
+    `SELECT count(*) AS n FROM pg_proc
+     WHERE prosrc LIKE '%set_config(''hetha.daily_ops_rpc'', ''on'', true)%'`)).rows[0].n), 11);
+  // This harness runs as a superuser. On Supabase the SQL Editor's postgres
+  // role may not attach a custom setting to a function
+  // ("permission denied to set parameter"), so a function-level
+  // SET hetha.* / ALTER FUNCTION ... SET hetha.* must never appear.
+  {
+    const { readdirSync } = await import('node:fs');
+    const offenders = readdirSync(`${ROOT}/migrations`)
+      .filter((f) => /^\d{3}_.*\.sql$/.test(f) && Number(f.slice(0, 3)) >= 38)
+      .filter((f) => read(`${ROOT}/migrations/${f}`).split('\n')
+        .some((line) => !line.trim().startsWith('--') && /^\s*SET\s+hetha\./i.test(line)
+                     || /ALTER\s+FUNCTION[^;]*SET\s+hetha\./i.test(line)));
+    eq('no migration attaches a hetha.* setting to a function (not allowed on Supabase)', offenders, []);
+  }
   eq('each lock trigger installed once', num((await db.query(`SELECT count(*) AS n FROM pg_trigger
      WHERE tgname IN ('trg_guard_daily_order_write', 'trg_guard_daily_order_item_write')`)).rows[0].n), 2);
   eq('the flag does not outlive a function call',
