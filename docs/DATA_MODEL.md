@@ -265,6 +265,19 @@ running it twice moves nothing. Finalize, delivery recording, status changes,
 payment retry and reconcile all go through it. Cash-on-delivery subscriptions
 are never settled through the wallet.
 
+**Finalized-day lock (migration 038).** Two triggers refuse direct writes that
+the Daily Ops functions did not make: payment and finalize fields
+(`paid_amount`, `payment_status`, `is_finalized`, `finalized_at/by`,
+`skip_reason`, `settled_at`, `settlement_hold_reason`, `wallet_deducted_at`)
+change only inside them; on a finalized order only `tracking_info` and
+`custom_route` may change directly, and on its items only `delivered_qty`
+(0 … `quantity`); nothing at all on a reconciled day; a finalized order cannot
+be deleted; a new order is inserted unpaid and unfinalized and not onto a
+finalized day. Trusted functions carry `SET hetha.daily_ops_rpc = 'on'`
+(applies only while the function runs). The SQL Editor (jwt role `internal`)
+and `hetha.skip_money_checks` are also allowed. **A migration that re-declares
+one of the trusted functions must keep that `SET` line.**
+
 ### `subscription_daily_order_items`
 Line items for a daily order, including `is_adhoc_addition` (one-time extras) and
 `delivered_qty` (requested vs actually delivered).
@@ -458,6 +471,11 @@ schema (not exposed through PostgREST) in
 | `set_daily_order_status(p_order_ids, p_status)` | Admin (daily ops) | **Migration 037.** `SECURITY DEFINER`, `daily_ops:edit`. On a finalized day: `delivered` records full quantities for items without one; `skipped` / `cancelled` refunds everything taken; `pending` (undo) clears recorded quantities and charges it again, raising if the wallet is short. On a day that is not finalized nothing is charged, but skipping or cancelling an order that already holds money (paid, then unlocked) refunds it at once. Refuses a reconciled day and a system-skipped order. |
 | `retry_daily_order_payment(p_order_id)` | Admin (daily ops) | **Migration 037.** `SECURITY DEFINER`, `daily_ops:edit`. For an order with a `skip_reason`, on a finalized day: charges it and sets it back to `pending`. Raises, leaving it skipped, if the wallet is still short. |
 | `reconcile_daily_run(p_delivery_date, p_admin_id)` | Admin (daily ops) | **Migration 037.** `SECURITY DEFINER`, `daily_ops:edit`. **Refuses (changing nothing) while any finalized order still `pending` has an item with no delivered quantity**; nothing is assumed delivered. Once every quantity is entered, each pending order becomes `delivered` (`cancelled` if all 0), every finalized order of the day is settled against its recorded quantities and the run becomes `reconciled`. Returns `{reconciled, delivered_user_ids, total_refunded, total_charged, refunds[], settlement_errors[]}`. |
+| `generate_daily_run(p_delivery_date, p_admin_id)` | Admin (daily ops, Generate) | **Migration 038.** `SECURITY DEFINER`, `daily_ops:edit`. Generation in one transaction, no row cap. Refuses a finalized or reconciled date. Deletes the day's *clean* orders (pending, not finalized, unpaid, not held, not customer-modified, no staff route/note, no ad-hoc item, no delivered quantity) and creates an order for every live subscription that delivers on the date (`internal.subscription_delivers_on`) and has none yet, priced from its items. Returns `{generated, deleted, skipped, date}`; `generated` counts rebuilt clean orders too. |
+| `add_daily_order_item(p_order_id, p_variant_id, p_quantity)` | Admin (run sheet) | **Migration 038.** `daily_ops:edit`. Quantity 1–99. Pending, not finalized, not held orders only. Prices from the catalog (`product_variants.price`, active variants only); the same variant again raises that item's quantity. Item is `is_adhoc_addition`. Keeps `total_value = Σ items`. Staff only; the app has no add-to-subscription (D-4). |
+| `remove_daily_order_item(p_item_id)` | Admin (run sheet) | **Migration 038.** `daily_ops:edit`. Same checks. Last item of an unpaid order deletes the order; of a paid one (paid, then unlocked) cancels it and refunds `paid_amount`, keeping the row. Returns `{deleted_order, cancelled, refunded, total_value}`. |
+| `set_daily_order_item_quantity(p_item_id, p_quantity)` | Admin (run sheet) | **Migration 038.** `daily_ops:edit`. Same checks; 1–99; clears the item's `delivered_qty`; updates the order total. |
+| `get_earliest_change_date(p_subscription_id)` | App (M-01) | **Migration 038.** `STABLE`. Owner or `subscriptions:edit`. The first day the customer may still change, pause or resume (`internal.subscription_earliest_change_date`, the migration 036 cut-off). |
 | `update_address_as_default(p_user_id, p_address_id, p_address_data)` | App | Clears other defaults, updates + sets the target default. Fixed in migration 011: writes `phone_number` (accepts `phone` or `phone_number` in the payload), no longer writes a non-existent `updated_at`, and raises unless the address belongs to the caller. |
 | `upsert_pauses(p_subscription_id, p_ranges)` / `remove_paused_dates(p_subscription_id, p_dates)` | App | Atomically merge/split subscription pause ranges. **Cut-off (migration 036), customer callers only:** no day before `internal.earliest_change_date` may become paused or be un-paused (today is always closed; tomorrow closes at the area's `order_cutoff_time`). Days in a pause range that are already paused are ignored, so extending a pause works; un-pausing a date that is not paused is a no-op. A refused request leaves every pause unchanged. Admins with `subscriptions:edit` bypass. |
 | `claim_adhoc_user(p_auth_uid, p_email, p_phone, p_first_name, p_last_name, p_adhoc_id)` | App (sign-in), admin (convert) | `SECURITY DEFINER`. Merges an `is_adhoc` row onto a real auth account. **Migration 032:** non-service callers match ad-hoc rows ONLY by JWT claims (email/phone), ignoring body params for matching (closes phone spoofing). Service callers can pass `p_adhoc_id` to target a specific ad-hoc row, avoiding ambiguity. Phone matching normalises to 10-digit national format. Child rows follow via `ON UPDATE CASCADE`. |
@@ -491,6 +509,12 @@ schema (not exposed through PostgREST) in
 | `internal.guard_direct_pause_insert()` | **Trigger (migration 036).** BEFORE INSERT on `subscription_pauses`. A row inserted directly (not by `upsert_pauses` / `remove_paused_dates`, which set the transaction-local `hetha.pause_rpc`) cannot start before `internal.earliest_change_date`. Staff with `subscriptions:edit` and the service role are exempt. |
 | `internal.daily_order_amount_owed(p_order_id)` | **Migration 037.** `STABLE`. What the order owes now (see `subscription_daily_orders` → Settlement). |
 | `internal.settle_daily_order(p_order_id, p_on_short, p_refund_reason)` | **Migration 037.** The only place daily-order money moves. Debits or refunds `owed − paid_amount` through `internal.apply_wallet_delta` and updates `paid_amount` / `payment_status`. `p_on_short = 'skip'` (finalize) skips the order when the wallet is short and gives back anything already taken; `'raise'` (everything else) aborts the caller. Refuses an order on settlement hold. |
+| `internal.subscription_delivers_on(p_subscription_id, p_date)` | **Migration 038.** `STABLE`. The delivery-day rule, once: live status; not moved away by a move override; not paused (first and last day included); a move override onto the date skips the start/end/cadence checks; within start/end; cadence of the area (or the area borrowed by a swap override) when its frequency > 1 and it has a `reference_date`, else the subscription's own frequency from `start_date`; at least one active item that day. Used by `generate_daily_run`; the wallet forecast (039) will use it too. |
+| `internal.subscription_items_on(p_subscription_id, p_date)` | **Migration 038.** `STABLE`. The subscription's items active on that date. |
+| `internal.lock_editable_daily_order(p_order_id)` | **Migration 038.** Locks an order `FOR UPDATE` and raises unless it is pending, not finalized and not held. Shared by the three item functions. |
+| `internal.daily_ops_write_allowed()` | **Migration 038.** True inside a trusted Daily Ops function (`hetha.daily_ops_rpc = 'on'`), with `hetha.skip_money_checks`, or in the SQL Editor. |
+| `internal.guard_daily_order_write()` | **Trigger (migration 038).** BEFORE INSERT/UPDATE/DELETE on `subscription_daily_orders`: the finalized-day lock (see §5). A `user_id` change on a finalized order is allowed only when the old user no longer exists (`claim_adhoc_user` re-keying via `ON UPDATE CASCADE`). |
+| `internal.guard_daily_order_item_write()` | **Trigger (migration 038).** BEFORE INSERT/UPDATE/DELETE on `subscription_daily_order_items`: items of a finalized order cannot be added or removed; only `delivered_qty` (0 … `quantity`) may change, and not on a reconciled day. |
 | `internal.guard_paid_daily_order_delete()` | **Trigger (migration 037).** BEFORE DELETE on `subscription_daily_orders`. An order with `paid_amount > 0` cannot be deleted; cancel it instead, which refunds it. `hetha.skip_money_checks` bypasses it. |
 | `internal.guard_address_route()` | **Trigger (migration 033).** BEFORE INSERT OR UPDATE on `addresses`. Non-admin callers cannot change `route_id`; route must serve the address pincode. |
 | `internal.set_order_delivery_date()` | **Trigger (migration 033).** BEFORE INSERT on `orders`. Auto-populates `expected_delivery_date` when NULL, using the area's schedule and cutoff time. |
@@ -645,6 +669,8 @@ none on any `public` table):
 | `orders` | `trg_sync_order_tracking_user_id` | AFTER UPDATE, WHEN `user_id` changed | tracking rows follow the order's owner (migration 035) |
 | `subscription_pauses` | `trg_guard_direct_pause_insert` | BEFORE INSERT | a customer's direct pause insert cannot start before the order cut-off day (migration 036) |
 | `subscription_daily_orders` | `trg_guard_paid_daily_order_delete` | BEFORE DELETE | an order that still holds the customer's money cannot be deleted (migration 037) |
+| `subscription_daily_orders` | `trg_guard_daily_order_write` | BEFORE INSERT/UPDATE/DELETE | finalized-day lock: payment fields only via the Daily Ops functions; finalized orders only note/route; nothing on a reconciled day (migration 038) |
+| `subscription_daily_order_items` | `trg_guard_daily_order_item_write` | BEFORE INSERT/UPDATE/DELETE | finalized order: only `delivered_qty` 0 … quantity; nothing on a reconciled day (migration 038) |
 
 The deferred ones run at COMMIT, after a parent row and its items are both
 written, which makes them agnostic about who did the writing — RPC, edge function,
