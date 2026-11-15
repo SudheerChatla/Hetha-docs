@@ -52,6 +52,11 @@ await db.exec(`
   GRANT ALL ON ALL TABLES IN SCHEMA public TO anon, authenticated, service_role;
 `);
 await db.exec(read(`${ROOT}/functions.sql`));
+// functions.sql is post-032: claim_adhoc_user has a 6th arg (p_adhoc_id).
+// This harness replays migrations up to 018, which (re)create the 5-arg
+// version that existed before 032. Live never has both (032 drops the 5-arg
+// one), so drop the 6-arg one here; otherwise the 5-arg call is ambiguous.
+await db.exec(`DROP FUNCTION IF EXISTS public.claim_adhoc_user(uuid, text, text, text, text, uuid)`);
 try { await db.exec(read(`${ROOT}/policies.sql`)); } catch { /* partial */ }
 
 // The snapshots are now post-018, so the four columns are absent here. Re-add
