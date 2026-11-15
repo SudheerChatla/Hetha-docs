@@ -29,7 +29,8 @@ Three kinds of work are distinguished throughout this file:
 | Migration 036 (subscription cut-off rule) | **DONE.** Applied and verified on live. Admin `d4bafd0` deployed. |
 | App changes for 036 (`24dc71d`) | Committed and pushed. **Not released to phones.** |
 | Migration 037 (daily-order settlement, "Phase 1") | **DONE.** Approved, committed, applied on live (2026-11-15). |
-| Admin code for 037 | Committed (`Hetha_admin` `9864f09`). **Not pushed/deployed yet.** |
+| Admin code for 037 | Committed (`Hetha_admin` `9864f09`), pushed 2026-11-15. |
+| Migration 038 + Part A0/A admin code | **DONE.** 038 applied on live 2026-11-15; admin pushed. |
 | Migrations 038, 039, 040 and every task in this plan | **PENDING.** |
 
 **Dependency:** every task below assumes migration 037 is applied. Do not
