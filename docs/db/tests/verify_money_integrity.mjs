@@ -235,7 +235,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '038_daily_ops_structure.sql',
                  '039_wallet_simplification.sql',
                  '040_indexes.sql',
-                 '041_dashboard_stats.sql']) {
+                 '041_dashboard_stats.sql',
+                 '042_dashboard_overview.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -3531,6 +3532,60 @@ console.log('\n--- 15. Migration 041: dashboard stats ---');
   if (Number(s2.today_wallet_credits) === Number(expected.credits) + 23) ok('wallet credits count from midnight India time (777 before it excluded, 23 after it included)');
   else bad('IST day boundary', `credits ${s2.today_wallet_credits}, base ${expected.credits}`);
   await expectError('a customer cannot read the dashboard', () => stats({ sub: CUSTOMER, role: 'authenticated' }), 'not authorized');
+}
+
+// ---------------------------------------------------------------------------
+// 16. Migration 042: dashboard overview
+// ---------------------------------------------------------------------------
+console.log('\n--- 16. Migration 042: dashboard overview ---');
+{
+  await expectOk('migration 042 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/042_dashboard_overview.sql`)));
+  const overview = async (claims) => {
+    const r = (await asQuery(claims, `SELECT public.get_dashboard_overview() AS r`)).rows[0].r;
+    return typeof r === 'string' ? JSON.parse(r) : r;
+  };
+  const today = (await db.query(`SELECT internal.today_ist()::text AS d`)).rows[0].d;
+  const o = await overview({ role: 'service_role' });
+  const shape = {
+    recent: Array.isArray(o.recent_orders) && o.recent_orders.length <= 5,
+    week: o.week.length === 7 && o.week[6].date === today,
+    top: Array.isArray(o.top_products) && o.top_products.length <= 5,
+    run: typeof o.today_run.status === 'string' && o.today_run.date === today,
+    low: typeof o.low_balance_tomorrow.customers === 'number',
+    held: typeof o.held_orders === 'number',
+  };
+  if (Object.values(shape).every(Boolean)) ok(`overview has every part (${JSON.stringify(shape)})`);
+  else bad('overview shape', JSON.stringify({ shape, o }));
+  const sortedRecent = o.recent_orders.every((r, i, a) => i === 0 || a[i - 1].placed_at >= r.placed_at);
+  const noUnpaid = o.recent_orders.every((r) => r.status !== 'payment_pending');
+  if (sortedRecent && noUnpaid) ok('recent orders: newest first, unpaid online orders left out');
+  else bad('recent orders', JSON.stringify(o.recent_orders));
+  const direct = (await db.query(`SELECT
+      (SELECT count(*) FROM public.subscription_daily_orders WHERE settlement_hold_reason IS NOT NULL)::int AS held,
+      (SELECT count(*) FROM internal.low_balance_customers(internal.today_ist() + 1))::int AS low`)).rows[0];
+  if (o.held_orders === direct.held && o.low_balance_tomorrow.customers === direct.low) {
+    ok(`held orders (${direct.held}) and tomorrow's low-balance count (${direct.low}) match direct counts`);
+  } else bad('ops counts', JSON.stringify({ o: [o.held_orders, o.low_balance_tomorrow], direct }));
+  // A delivered subscription order today shows in the week and in top products.
+  const U = '0a420000-0000-4000-8000-000000000001';
+  const S = '0a420000-0000-4000-8000-000000000002';
+  const OID = '0a420000-0000-4000-8000-000000000003';
+  await db.query(`INSERT INTO public.users (id, email, phone, first_name, wallet_balance) VALUES ($1, 'd042@example.com', '9042000001', 'D', 0)`, [U]);
+  await db.query(`INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date) VALUES ($1, $2, 'active', 'wallet', $3)`, [S, U, today]);
+  await db.exec(`BEGIN;
+    INSERT INTO public.subscription_daily_orders (id, delivery_date, subscription_id, user_id, status, total_value, payment_status)
+    VALUES ('${OID}', '${today}', '${S}', '${U}', 'delivered', 900, 'pending');
+    INSERT INTO public.subscription_daily_order_items (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price, delivered_qty)
+    VALUES ('${OID}', '${VAR}', 'Dashboard 042 Ghee', '1 L', 100, 9, 900, 8);
+    COMMIT;`);
+  const o2 = await overview({ role: 'service_role' });
+  const beforeToday = o.week[6].subscription_deliveries;
+  if (o2.week[6].subscription_deliveries === beforeToday + 1) ok('a delivered subscription order today is counted in the week');
+  else bad('week count', JSON.stringify([beforeToday, o2.week[6]]));
+  const ghee = o2.top_products.find((p) => p.name === 'Dashboard 042 Ghee');
+  if (ghee && ghee.quantity === 8) ok('top products count the delivered quantity (8 of 9 ordered)');
+  else bad('top products', JSON.stringify(o2.top_products));
+  await expectError('a customer cannot read the overview', () => overview({ sub: CUSTOMER, role: 'authenticated' }), 'not authorized');
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
