@@ -346,21 +346,14 @@ writable by `internal.apply_wallet_delta()`, which writes both in one
 transaction. `authenticated` has **no** UPDATE grant on that column.
 
 ### `wallet_notice_log` (migration 039)
-One row per customer and delivery date for a low-balance notice, whichever sent
-it: `source` `finalize` (after finalize, `claim_low_balance_notices`) or
-`evening_reminder` (`claim_wallet_reminders`). The primary key
-`(user_id, delivery_date)` is what stops a second notice. `status`
-`claimed` → `sent` / `failed` (`mark_wallet_notice_result`); a failed or stuck
-reminder is retried up to 3 attempts. RLS on, no policies, no grants: only the
-functions touch it.
-
-### `wallet_reminder_settings` (migration 039)
-One row (`id = true`): `enabled`, `reminder_time` (India time; seeded 18:00 on a
-fresh install, changed in Admin → Settings), `timezone` (always
-`Asia/Kolkata`), `send_window_minutes` (120). Read and written only through
-`get_wallet_reminder_settings` / `set_wallet_reminder_settings`
-(super admin or `notifications:send`). Re-running the migration keeps the
-admin's values.
+Manual low-balance notices: one row per customer and delivery date, written
+only when staff press Send in Daily Ops (`claim_manual_low_balance_notices`).
+`source` is always `manual`. The primary key `(user_id, delivery_date)` is
+what stops a second notice for the same delivery. `status` `claimed` →
+`sent` / `failed` (`mark_wallet_notice_result`); a failed push may be sent
+again; `attempts` counts sends, `claimed_by` is the admin. RLS on, no
+policies, no grants: only the functions touch it. Nothing writes it
+automatically (no scheduler, no Finalize notice).
 
 ### `payment_intents`
 Server-side record of "this user must pay this much" — created before Razorpay
@@ -494,10 +487,9 @@ schema (not exposed through PostgREST) in
 | `get_dashboard_stats()` | Admin (dashboard) | **Migration 041.** `dashboard:view`. `{today_orders, active_subscriptions, today_wallet_credits, total_customers}`; counted and summed in SQL; today = India day. |
 | `get_wallet_reserve(p_user_id)` | App (checkout, create subscription), admin | **Migration 039.** Own id or `customers:view`. The wallet reserve: one upcoming delivery of each active subscription (`internal.wallet_reserve`). |
 | `get_wallet_forecast(p_user_id, p_days = 14)` | App (wallet page), admin (customer profile) | **Migration 039.** Own id or `customers:view`. `{balance, reserve, available, per_delivery_total, next_delivery_date, next_delivery_amount, next_delivery_covered, covered_until, first_uncovered_date, covered_deliveries, horizon_days, days[]}`; `days` = dates after today with a charge: existing orders (day edits; paid → only what is still owed; skipped / cancelled / held → 0) or the 038 delivery-day rule. |
-| `claim_low_balance_notices(p_user_ids)` | Admin (after finalize) | **Migration 039.** `daily_ops:edit`. For each customer whose next actual delivery the wallet cannot cover, claims a `wallet_notice_log` row (`finalize`) and returns it; already-notified customer/date pairs are not returned. |
-| `mark_wallet_notice_result(p_user_id, p_delivery_date, p_ok, p_error)` | Admin API, scheduler | **Migration 039.** Service role or `daily_ops:edit`. Marks a notice `sent` or `failed`. |
-| `get_wallet_reminder_settings()` / `set_wallet_reminder_settings(p_enabled, p_reminder_time)` | Admin (Settings → Wallet & Notifications) | **Migration 039.** Super admin or `notifications:send`. Get returns the settings plus `last_run` counts. |
-| `claim_wallet_reminders(p_now = now())` | Scheduler endpoint `/api/cron/wallet-reminder` | **Migration 039.** Service role only. Inside `[reminder_time, reminder_time + window)` India time (never past midnight) and when enabled: claims and returns customers whose wallet cannot cover tomorrow's actual delivery (`wallet_forecast(…, 1)`); one per customer and date; failed/stuck rows retried up to 3 attempts. |
+| `get_low_balance_customers(p_delivery_date)` | Admin (Daily Ops → Low wallet balance) | **Migration 039.** `daily_ops:view`. Customers whose wallet cannot cover their orders on that date: `{user_id, name, phone, balance, required, shortfall, notice_status}` (`notice_status` from `wallet_notice_log`: null, `sent`, `failed`, `claimed`). Counts pending, not-held orders of wallet subscriptions (`total_value − paid_amount`). |
+| `claim_manual_low_balance_notices(p_delivery_date, p_user_ids)` | Admin (Daily Ops Send) | **Migration 039.** `daily_ops:edit`. Claims a `wallet_notice_log` row for each chosen customer who is still short and not already notified (failed or stale-claimed rows may be claimed again) and returns `{user_id, balance, required}`. |
+| `mark_wallet_notice_result(p_user_id, p_delivery_date, p_ok, p_error)` | Admin (Daily Ops Send) | **Migration 039.** `daily_ops:edit`. Marks a notice `sent` or `failed`. |
 | `generate_daily_run(p_delivery_date, p_admin_id)` | Admin (daily ops, Generate) | **Migration 038.** `SECURITY DEFINER`, `daily_ops:edit`. Generation in one transaction, no row cap. Refuses a finalized or reconciled date. Deletes the day's *clean* orders (pending, not finalized, unpaid, not held, not customer-modified, no staff route/note, no ad-hoc item, no delivered quantity) and creates an order for every live subscription that delivers on the date (`internal.subscription_delivers_on`) and has none yet, priced from its items. Returns `{generated, deleted, skipped, date}`; `generated` counts rebuilt clean orders too. |
 | `add_daily_order_item(p_order_id, p_variant_id, p_quantity)` | Admin (run sheet) | **Migration 038.** `daily_ops:edit`. Quantity 1–99. Pending, not finalized, not held orders only. Prices from the catalog (`product_variants.price`, active variants only); the same variant again raises that item's quantity. Item is `is_adhoc_addition`. Keeps `total_value = Σ items`. Staff only; the app has no add-to-subscription (D-4). |
 | `remove_daily_order_item(p_item_id)` | Admin (run sheet) | **Migration 038.** `daily_ops:edit`. Same checks. Last item of an unpaid order deletes the order; of a paid one (paid, then unlocked) cancels it and refunds `paid_amount`, keeping the row. Returns `{deleted_order, cancelled, refunded, total_value}`. |
@@ -537,8 +529,8 @@ schema (not exposed through PostgREST) in
 | `internal.daily_order_amount_owed(p_order_id)` | **Migration 037.** `STABLE`. What the order owes now (see `subscription_daily_orders` → Settlement). |
 | `internal.settle_daily_order(p_order_id, p_on_short, p_refund_reason)` | **Migration 037.** The only place daily-order money moves. Debits or refunds `owed − paid_amount` through `internal.apply_wallet_delta` and updates `paid_amount` / `payment_status`. `p_on_short = 'skip'` (finalize) skips the order when the wallet is short and gives back anything already taken; `'raise'` (everything else) aborts the caller. Refuses an order on settlement hold. |
 | `internal.wallet_reserve(p_user_id)` / `internal.wallet_reserve_with(p_user_id, p_extra)` | **Migration 039.** The only definition of the wallet reserve (D-1): `get_user_daily_commitment` (one delivery of each live subscription), plus a subscription being created. Used by `create_subscription_core`, `place_order_core`, `modify_daily_order_core`, `modify_daily_orders_bulk_core`. |
-| `internal.wallet_forecast(p_user_id, p_days, p_today = today_ist())` | **Migration 039.** The forecast behind `get_wallet_forecast`; `p_today` lets the reminder evaluate a given India day. |
-| `internal.can_manage_wallet_reminder()` | **Migration 039.** `is_admin_actor('notifications:send')`. |
+| `internal.wallet_forecast(p_user_id, p_days, p_today = today_ist())` | **Migration 039.** The forecast behind `get_wallet_forecast`; `p_today` lets tests evaluate from a given India day. |
+| `internal.low_balance_customers(p_delivery_date)` | **Migration 039.** The list behind `get_low_balance_customers` and the re-check in `claim_manual_low_balance_notices`. |
 | `internal.subscription_delivers_on(p_subscription_id, p_date)` | **Migration 038.** `STABLE`. The delivery-day rule, once: live status; not moved away by a move override; not paused (first and last day included); a move override onto the date skips the start/end/cadence checks; within start/end; cadence of the area (or the area borrowed by a swap override) when its frequency > 1 and it has a `reference_date`, else the subscription's own frequency from `start_date`; at least one active item that day. Used by `generate_daily_run`; the wallet forecast (039) will use it too. |
 | `internal.subscription_items_on(p_subscription_id, p_date)` | **Migration 038.** `STABLE`. The subscription's items active on that date. |
 | `internal.lock_editable_daily_order(p_order_id)` | **Migration 038.** Locks an order `FOR UPDATE` and raises unless it is pending, not finalized and not held. Shared by the three item functions. |

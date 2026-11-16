@@ -492,29 +492,20 @@ CREATE TABLE public.users (
   is_adhoc boolean DEFAULT false,
   CONSTRAINT users_pkey PRIMARY KEY (id)
 );
-CREATE TABLE public.wallet_notice_log ( -- migration 039: one low-balance notice per customer and delivery date
+CREATE TABLE public.wallet_notice_log ( -- migration 039: one manual low-balance notice per customer and delivery date
   user_id uuid NOT NULL,
   delivery_date date NOT NULL,
-  source text NOT NULL CHECK (source = ANY (ARRAY['finalize'::text, 'evening_reminder'::text])),
+  source text NOT NULL DEFAULT 'manual'::text CHECK (source = 'manual'::text),
   balance numeric NOT NULL,
   amount numeric NOT NULL,
   status text NOT NULL DEFAULT 'claimed'::text CHECK (status = ANY (ARRAY['claimed'::text, 'sent'::text, 'failed'::text])),
   attempts integer NOT NULL DEFAULT 1,
   claimed_at timestamp with time zone NOT NULL DEFAULT now(),
+  claimed_by uuid,
   sent_at timestamp with time zone,
   error text,
   CONSTRAINT wallet_notice_log_pkey PRIMARY KEY (user_id, delivery_date),
   CONSTRAINT wallet_notice_log_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE CASCADE
-);
-CREATE TABLE public.wallet_reminder_settings ( -- migration 039: one row; the evening reminder (D-3)
-  id boolean NOT NULL DEFAULT true CHECK (id),
-  enabled boolean NOT NULL DEFAULT true,
-  reminder_time time without time zone NOT NULL DEFAULT '18:00:00'::time without time zone,
-  timezone text NOT NULL DEFAULT 'Asia/Kolkata'::text CHECK (timezone = 'Asia/Kolkata'::text),
-  send_window_minutes integer NOT NULL DEFAULT 120 CHECK (send_window_minutes >= 15 AND send_window_minutes <= 360),
-  updated_at timestamp with time zone NOT NULL DEFAULT now(),
-  updated_by uuid,
-  CONSTRAINT wallet_reminder_settings_pkey PRIMARY KEY (id)
 );
 CREATE TABLE public.wallet_transactions (
   id uuid NOT NULL DEFAULT gen_random_uuid(),

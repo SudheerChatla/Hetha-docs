@@ -3272,7 +3272,7 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   const addDays = (ymd, n) => { const d = new Date(`${ymd}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
   const today = (await db.query(`SELECT internal.today_ist()::text AS d`)).rows[0].d;
 
-  await db.query(`INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'customers:view'), ($1, 'daily_ops:edit') ON CONFLICT DO NOTHING`, [roleId]);
+  await db.query(`INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'customers:view'), ($1, 'daily_ops:edit'), ($1, 'daily_ops:view') ON CONFLICT DO NOTHING`, [roleId]);
 
   // Variants at the prices the plan's example uses.
   const V50 = 'a0390000-0000-4000-8000-0000000000c1';
@@ -3408,124 +3408,79 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   await expectOk('get_wallet_forecast: admin with customers:view', () => json(ADMIN_CLAIMS, `SELECT public.get_wallet_forecast($1, 14) AS r`, [M]));
   await expectOk('get_wallet_forecast: own id', () => json({ sub: M, role: 'authenticated' }, `SELECT public.get_wallet_forecast($1, 14) AS r`, [M]));
 
-  // ── 13c. Notice after finalize (W-07) — real "today" ─────────────────────
-  const claimLow = async (claims, ids) => (await asQuery(claims,
-    `SELECT user_id, delivery_date::text AS d, balance, amount FROM public.claim_low_balance_notices($1::uuid[])`, [`{${ids.join(',')}}`])).rows;
-  const COV = await mkUser(500);  await mkSub(COV, { start: today });
-  const SHORT = await mkUser(99); await mkSub(SHORT, { start: today });
-  const r1 = await claimLow(ADMIN_CLAIMS, [COV, SHORT]);
-  eq('covered customer not returned; ₹1 short returned with tomorrow and ₹100',
-    r1.map((x) => [x.user_id === SHORT, x.d, num(x.amount)]), [[true, addDays(today, 1), 100]]);
-  eq('second call: nothing for that customer and date', (await claimLow(ADMIN_CLAIMS, [SHORT])).length, 0);
-  await mkArea('Alt 039 notice', 2, addDays(today, 2));
-  const ALT = await mkUser(0); await mkSub(ALT, { area: 'Alt 039 notice', start: today });
-  eq('alternate-day customer: evaluated on the real next delivery', (await claimLow(ADMIN_CLAIMS, [ALT])).map((x) => x.d), [addDays(today, 2)]);
-  const PZ = await mkUser(0); const pzs = await mkSub(PZ, { start: today }); await pause(pzs, addDays(today, 1));
-  eq('paused next day: the following delivery is used', (await claimLow(ADMIN_CLAIMS, [PZ])).map((x) => x.d), [addDays(today, 2)]);
-  await expectError('a customer cannot claim notices', () => claimLow(CUST, [SHORT]), 'not authorized');
-  await asQuery(SERVICE, `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [SHORT, addDays(today, 1)]);
-  eq('mark_wallet_notice_result marks it sent', (await db.query(`SELECT status FROM public.wallet_notice_log WHERE user_id = $1`, [SHORT])).rows[0].status, 'sent');
-  await expectError('a customer cannot mark a notice', () => asQuery(CUST, `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [SHORT, addDays(today, 1)]), 'not authorized');
+  // ── 13c. Manual low-balance notices (Daily Ops list + Send) ──────────────
+  const MD = '2098-11-20';
+  const listFor = async (claims, date = MD) => (await asQuery(claims,
+    `SELECT user_id, balance, required, shortfall, notice_status FROM public.get_low_balance_customers($1::date)`, [date])).rows;
+  const claimManual = async (claims, ids, date = MD) => (await asQuery(claims,
+    `SELECT user_id, balance, required FROM public.claim_manual_low_balance_notices($1::date, $2::uuid[])`,
+    [date, `{${ids.join(',')}}`])).rows.map((r) => r.user_id);
+  const mark = (u, ok, date = MD) => asQuery(ADMIN_CLAIMS,
+    `SELECT public.mark_wallet_notice_result($1, $2::date, $3, 'push failed')`, [u, date, ok]);
+  const dayOrder = async (user, { method = 'wallet', qty = 1, status = 'pending', paid = 0, hold = null } = {}) => {
+    const sub = randomUUID();
+    await db.query(`INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date, delivary_area, snapshot_pincode)
+                    VALUES ($1, $2, 'active', $3, $4, 'Daily 039', '700001')`, [sub, user, method, MD]);
+    const id = randomUUID();
+    await db.exec(`BEGIN;
+      INSERT INTO public.subscription_daily_orders (id, delivery_date, subscription_id, user_id, status, total_value, payment_status, paid_amount, settlement_hold_reason)
+      VALUES ('${id}', '${MD}', '${sub}', '${user}', '${status}', ${qty * 100}, '${paid > 0 ? 'paid' : 'pending'}', ${paid}, ${hold ? `'${hold}'` : 'NULL'});
+      INSERT INTO public.subscription_daily_order_items (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+      VALUES ('${id}', '${VAR}', 'Milk', '1 L', 100, ${qty}, ${qty * 100});
+      COMMIT;`);
+  };
+  const MA = await mkUser(50);   await dayOrder(MA);                       // short by 50
+  const MB = await mkUser(500);  await dayOrder(MB);                       // covered
+  const MC = await mkUser(0);    await dayOrder(MC, { method: 'cod' });    // cash on delivery
+  const MDk = await mkUser(0);   await dayOrder(MDk, { status: 'skipped' }); await dayOrder(MDk, { hold: 'test hold 039' });
+  const ME = await mkUser(150);  await dayOrder(ME); await dayOrder(ME);   // two orders, 200 needed
+  const MF = await mkUser(0);    await dayOrder(MF, { paid: 100 });        // already charged
+  const MG = await mkUser(10);   await dayOrder(MG);                       // will recharge
 
-  // ── 13d. Reminder settings (W-08a) ────────────────────────────────────────
-  const settings = (claims) => json(claims, `SELECT public.get_wallet_reminder_settings() AS r`);
-  const setSettings = (claims, enabled, time) => json(claims, `SELECT public.set_wallet_reminder_settings($1, $2::time) AS r`, [enabled, time]);
-  const s0 = await settings(SERVICE);
-  eq('fresh: enabled, 18:00, Asia/Kolkata, 120-minute window',
-    [s0.enabled, s0.reminder_time, s0.timezone, s0.send_window_minutes], [true, '18:00', 'Asia/Kolkata', 120]);
-  await expectError('a customer cannot read the settings', () => settings(CUST), 'not authorized');
-  await db.query(`DELETE FROM public.admin_role_permissions WHERE role_id = $1 AND permission = 'notifications:send'`, [roleId]);
-  await expectError('an admin without notifications:send cannot read them', () => settings(ADMIN_CLAIMS), 'not authorized');
-  await expectError('…or change them', () => setSettings(ADMIN_CLAIMS, true, '19:00'), 'not authorized');
-  await db.query(`INSERT INTO public.admin_role_permissions (role_id, permission) VALUES ($1, 'notifications:send') ON CONFLICT DO NOTHING`, [roleId]);
-  eq('an admin with notifications:send can change the time', (await setSettings(ADMIN_CLAIMS, true, '19:30')).reminder_time, '19:30');
-  await expectError('time is required', () => setSettings(ADMIN_CLAIMS, true, null), 'Choose a reminder time');
+  const l1 = await listFor(ADMIN_CLAIMS);
+  const row = (u) => l1.find((x) => x.user_id === u);
+  eq('list: short customer with balance, required and shortfall',
+    row(MA) && [num(row(MA).balance), num(row(MA).required), num(row(MA).shortfall), row(MA).notice_status], [50, 100, 50, null]);
+  eq('list: two orders on the day are added up', row(ME) && [num(row(ME).required), num(row(ME).shortfall)], [200, 50]);
+  eq('list: covered, cash-on-delivery, skipped/held and already-charged customers are not listed',
+    [MB, MC, MDk, MF].map((u) => !!row(u)), [false, false, false, false]);
+  await expectError('a customer cannot read the list', () => listFor(CUST), 'not authorized');
+
+  eq('send: only the chosen customers who are still short are claimed',
+    (await claimManual(ADMIN_CLAIMS, [MA, MB, ME])).sort(), [MA, ME].sort());
+  eq('send again at once: nothing (no duplicate)', await claimManual(ADMIN_CLAIMS, [MA, ME]), []);
+  await mark(MA, true);
+  await mark(ME, false);
+  const l2 = await listFor(ADMIN_CLAIMS);
+  eq('list shows "sent" and "failed"', [l2.find((x) => x.user_id === MA)?.notice_status, l2.find((x) => x.user_id === ME)?.notice_status], ['sent', 'failed']);
+  eq('a sent customer is never claimed again for that date', await claimManual(ADMIN_CLAIMS, [MA]), []);
+  eq('a failed push can be sent again', await claimManual(ADMIN_CLAIMS, [ME]), [ME]);
+  await setBalance(MG, 1000);
+  eq('a customer who recharged after the list was shown is not sent', await claimManual(ADMIN_CLAIMS, [MG]), []);
+  await expectError('a customer cannot send', () => claimManual(CUST, [MA]), 'not authorized');
+  await expectError('a customer cannot mark a notice', () => asQuery(CUST,
+    `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [MA, MD]), 'not authorized');
   await expectOk('migration 039 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/039_wallet_simplification.sql`)));
-  eq('re-running the migration keeps the admin\'s 19:30', (await settings(SERVICE)).reminder_time, '19:30');
-  await setSettings(SERVICE, true, '18:00');
+  eq('re-running the migration keeps the notice log', (await listFor(ADMIN_CLAIMS)).find((x) => x.user_id === MA)?.notice_status, 'sent');
+  eq('no automatic reminder objects exist', num((await db.query(`
+    SELECT (SELECT count(*) FROM pg_proc WHERE proname IN ('claim_wallet_reminders', 'claim_low_balance_notices',
+              'get_wallet_reminder_settings', 'set_wallet_reminder_settings'))
+         + (SELECT count(*) FROM pg_tables WHERE tablename = 'wallet_reminder_settings') AS n`)).rows[0].n), 0);
 
-  // ── 13e. claim_wallet_reminders (W-08a) ───────────────────────────────────
-  const claimAt = async (date, time, claims = SERVICE) => (await asQuery(claims,
-    `SELECT user_id, delivery_date::text AS d, amount FROM public.claim_wallet_reminders($1::timestamptz)`,
-    [`${date}T${time}:00+05:30`])).rows;
-  const has = (rows, u) => rows.some((x) => x.user_id === u);
-  const reminderUser = async (balance, start) => { const u = await mkUser(balance); const s = await mkSub(u, { start }); return [u, s]; };
-
-  const F1 = '2098-10-01';
-  const [A1] = await reminderUser(0, F1);
-  eq('17:59 India time: nothing', has(await claimAt(F1, '17:59'), A1), false);
-  const at18 = await claimAt(F1, '18:00');
-  eq('18:00: the uncovered customer, for tomorrow, ₹100', at18.filter((x) => x.user_id === A1).map((x) => [x.d, num(x.amount)]), [[addDays(F1, 1), 100]]);
-  eq('a call a minute later: no duplicate', has(await claimAt(F1, '18:01'), A1), false);
-  const F2 = '2098-10-03'; const [A2] = await reminderUser(0, F2);
-  eq('19:59: still inside the window', has(await claimAt(F2, '19:59'), A2), true);
-  const F3 = '2098-10-05'; const [A3] = await reminderUser(0, F3);
-  eq('20:00: window passed', has(await claimAt(F3, '20:00'), A3), false);
-
-  await setSettings(SERVICE, true, '20:30');
-  const F4 = '2098-10-07'; const [A4] = await reminderUser(0, F4);
-  eq('time changed to 20:30: nothing at 18:10', has(await claimAt(F4, '18:10'), A4), false);
-  eq('…sent at 20:35', has(await claimAt(F4, '20:35'), A4), true);
-  await setSettings(SERVICE, false, '18:00');
-  const F5 = '2098-10-09'; const [A5] = await reminderUser(0, F5);
-  eq('turned off: nothing at 18:30', has(await claimAt(F5, '18:30'), A5), false);
-  await setSettings(SERVICE, true, '18:00');
-
-  const F6 = '2098-10-11'; const [B6] = await reminderUser(0, F6);
-  await setBalance(B6, 500);  // recharged before the reminder time
-  eq('recharged before the reminder: not reminded', has(await claimAt(F6, '18:00'), B6), false);
-
-  const F7 = '2098-10-13';
-  await mkArea('Alt 039 reminder', 2, addDays(F7, 2));
-  const C7 = await mkUser(0); await mkSub(C7, { area: 'Alt 039 reminder', start: F7 });
-  eq('alternate day: no delivery tomorrow → not reminded today', has(await claimAt(F7, '18:00'), C7), false);
-  eq('…reminded the next evening', has(await claimAt(addDays(F7, 1), '18:00'), C7), true);
-
-  const F8 = '2098-10-17'; const [D8, d8s] = await reminderUser(0, F8);
-  await pause(d8s, addDays(F8, 1));
-  eq('paused tomorrow: not reminded', has(await claimAt(F8, '18:00'), D8), false);
-
-  const F9 = '2098-10-19'; const [E9, e9s] = await reminderUser(0, F9);
-  await move(e9s, addDays(F9, 1), addDays(F9, 5), AREA_DAILY_039);
-  eq('delivery moved away from tomorrow: not reminded', has(await claimAt(F9, '18:00'), E9), false);
-
-  const F10 = '2098-10-21'; const [N10] = await reminderUser(0, F10);
-  await db.query(`INSERT INTO public.wallet_notice_log (user_id, delivery_date, source, balance, amount, status, sent_at)
-                  VALUES ($1, $2, 'finalize', 0, 100, 'sent', now())`, [N10, addDays(F10, 1)]);
-  eq('already told by the finalize notice: not reminded', has(await claimAt(F10, '18:00'), N10), false);
-
-  const F11 = '2098-10-23'; const [G11] = await reminderUser(0, F11);
-  const markG = (ok) => asQuery(SERVICE, `SELECT public.mark_wallet_notice_result($1, $2::date, $3, 'push failed')`, [G11, addDays(F11, 1), ok]);
-  eq('failed retry: attempt 1', has(await claimAt(F11, '18:00'), G11), true);
-  await markG(false);
-  eq('failed retry: attempt 2', has(await claimAt(F11, '18:10'), G11), true);
-  await markG(false);
-  eq('failed retry: attempt 3', has(await claimAt(F11, '18:20'), G11), true);
-  await markG(false);
-  eq('failed retry: no 4th attempt', has(await claimAt(F11, '18:30'), G11), false);
-  const F12 = '2098-10-25'; const [S12] = await reminderUser(0, F12);
-  await claimAt(F12, '18:00');
-  await asQuery(SERVICE, `SELECT public.mark_wallet_notice_result($1, $2::date, true)`, [S12, addDays(F12, 1)]);
-  eq('a sent reminder is never returned again', has(await claimAt(F12, '19:00'), S12), false);
-
-  await expectError('a customer cannot claim reminders', () => claimAt(F12, '18:00', CUST), 'not authorized');
-  await expectError('an admin cannot claim reminders (service role only)', () => claimAt(F12, '18:00', ADMIN_CLAIMS), 'not authorized');
-
-  // ── 13f. Grants ───────────────────────────────────────────────────────────
+  // ── 13d. Grants ───────────────────────────────────────────────────────────
   const g = (await db.query(`
     SELECT
-      has_function_privilege('authenticated', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE')          AS a1,
-      has_function_privilege('authenticated', 'public.get_wallet_reserve(uuid)', 'EXECUTE')                   AS a2,
-      has_function_privilege('authenticated', 'public.get_wallet_reminder_settings()', 'EXECUTE')              AS a3,
-      has_function_privilege('anon', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE')                   AS n1,
-      has_function_privilege('anon', 'public.claim_wallet_reminders(timestamptz)', 'EXECUTE')                  AS n2,
-      has_function_privilege('anon', 'public.set_wallet_reminder_settings(boolean, time)', 'EXECUTE')          AS n3,
-      has_function_privilege('authenticated', 'internal.wallet_forecast(uuid, integer, date)', 'EXECUTE')      AS i1,
-      has_function_privilege('authenticated', 'internal.wallet_reserve(uuid)', 'EXECUTE')                      AS i2,
-      has_table_privilege('authenticated', 'public.wallet_notice_log', 'SELECT')                               AS t1,
-      has_table_privilege('authenticated', 'public.wallet_reminder_settings', 'UPDATE')                        AS t2`)).rows[0];
-  if (g.a1 && g.a2 && g.a3 && !g.n1 && !g.n2 && !g.n3 && !g.i1 && !g.i2 && !g.t1 && !g.t2) {
-    ok('039 grants: RPCs for authenticated/service_role only; internals and the two tables closed');
+      has_function_privilege('authenticated', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE')               AS a1,
+      has_function_privilege('authenticated', 'public.get_wallet_reserve(uuid)', 'EXECUTE')                        AS a2,
+      has_function_privilege('authenticated', 'public.get_low_balance_customers(date)', 'EXECUTE')                 AS a3,
+      has_function_privilege('authenticated', 'public.claim_manual_low_balance_notices(date, uuid[])', 'EXECUTE')  AS a4,
+      has_function_privilege('anon', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE')                        AS n1,
+      has_function_privilege('anon', 'public.claim_manual_low_balance_notices(date, uuid[])', 'EXECUTE')           AS n2,
+      has_function_privilege('authenticated', 'internal.wallet_forecast(uuid, integer, date)', 'EXECUTE')           AS i1,
+      has_function_privilege('authenticated', 'internal.low_balance_customers(date)', 'EXECUTE')                    AS i2,
+      has_table_privilege('authenticated', 'public.wallet_notice_log', 'SELECT')                                    AS t1`)).rows[0];
+  if (g.a1 && g.a2 && g.a3 && g.a4 && !g.n1 && !g.n2 && !g.i1 && !g.i2 && !g.t1) {
+    ok('039 grants: RPCs for authenticated/service_role only; internals and the log closed');
   } else {
     bad('039 grants', JSON.stringify(g));
   }

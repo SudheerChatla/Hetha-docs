@@ -183,9 +183,12 @@ database; the apps read the number with `get_wallet_reserve`:
 - **Raising a day's order:** `wallet_balance ≥ reserve + that day's extra`.
 
 A wallet that cannot cover a delivery at finalize skips that delivery (nothing
-is charged, migration 037). Customers are kept topped up by a low-balance
-notice after finalize and a configurable evening reminder, both based on
-`get_wallet_forecast` (the real schedule, pauses and day edits).
+is charged, migration 037). Low-balance pushes are **manual only**: after
+Generate, staff open Daily Ops → Low wallet balance, which lists the customers
+whose wallet cannot cover that day's orders, and send the push to the ones
+they choose (at most once per customer and delivery date). The app's wallet
+page and the admin customer profile show `get_wallet_forecast` (the real
+schedule, pauses and day edits).
 
 Admin-placed orders skip the reserve deliberately, so ops can still fulfil edge
 cases.

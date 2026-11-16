@@ -1,4 +1,4 @@
--- Migration 039: wallet simplification and the evening low-balance reminder
+-- Migration 039: wallet simplification and manual low-balance notices
 --
 -- Run in: Supabase SQL Editor (the whole file; it is wrapped in one transaction)
 --
@@ -11,8 +11,9 @@
 --   2. "HOW LONG WILL MY WALLET LAST" was calculated five different ways
 --      (app wallet page, checkout, create-subscription, admin profile,
 --      low-balance push); none knew about area schedules, pauses or day edits.
---   3. LOW BALANCE. After finalize a push went out when the balance was below
---      3 × that day's debit, whether or not the next delivery was covered.
+--   3. LOW BALANCE. After Finalize a push went out automatically when the
+--      balance was below 3 × that day's debit, whether or not the next
+--      delivery was covered. Staff had no say in it.
 --
 -- ─── Fix ─────────────────────────────────────────────────────────────────────
 --   internal.wallet_reserve(user)       ONE upcoming delivery of each active
@@ -28,31 +29,29 @@
 --                                       pauses and overrides via
 --                                       internal.subscription_delivers_on from
 --                                       038), how far the balance reaches.
---   public.claim_low_balance_notices    after finalize: customers whose NEXT
---                                       actual delivery is not covered.
---   wallet_reminder_settings + get/set + claim_wallet_reminders
---                                       the evening reminder (D-3): on by
---                                       default, time stored in the database
---                                       (seed 18:00 India time, changed in
---                                       Admin → Settings), only for customers
---                                       whose wallet cannot cover TOMORROW's
---                                       actual delivery.
---   wallet_notice_log                   one row per customer and delivery date
---                                       for both notices: never two (S-4).
---
---   The scheduler is a Supabase Cron job (docs/ops/wallet_reminder_cron.sql,
---   run by the owner per environment) that calls the admin endpoint every
---   10 minutes; the database decides whether it is reminder time.
+--   Low-balance notices are MANUAL ONLY (owner decision 2026-11-16):
+--   public.get_low_balance_customers(date)
+--                                       Daily Ops list: customers whose wallet
+--                                       cannot cover their orders on that date,
+--                                       with balance, required, shortfall and
+--                                       whether they were already notified.
+--   public.claim_manual_low_balance_notices(date, users)
+--                                       Staff pressed Send: claims the chosen
+--                                       customers who are still short and not
+--                                       already notified; returns them.
+--   public.mark_wallet_notice_result    records sent / failed.
+--   wallet_notice_log                   one row per customer and delivery date:
+--                                       never two notices for one delivery.
+--   No scheduler, no cron job, no notice sent by Finalize.
 --
 -- ─── Rollout order ──────────────────────────────────────────────────────────
 --   1. Apply THIS migration. Old app builds keep working: they still ask for
 --      3 days, which is stricter than the database now is, so they only
 --      refuse more often than needed, never allow too little.
---   2. Deploy the admin panel (forecast on the customer profile, finalize
---      notice, settings card, scheduler endpoint). Set CRON_SECRET first.
---   3. Run docs/ops/wallet_reminder_cron.sql (O-07).
---   4. Release the app (wallet page forecast, checkout and create-subscription
---      use get_wallet_reserve).
+--   2. Deploy the admin panel (forecast on the customer profile, the Daily
+--      Ops low-balance list; Finalize no longer sends a low-balance push).
+--   3. Release the app (wallet page forecast; checkout and
+--      create-subscription use get_wallet_reserve).
 
 BEGIN;
 
@@ -775,7 +774,7 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------------
--- 3. The wallet forecast — one answer for every screen and notice
+-- 3. The wallet forecast — one answer for every screen
 -- ---------------------------------------------------------------------------
 -- For each day from p_today + 1 to p_today + p_days, what the customer's live
 -- subscriptions will be charged:
@@ -787,7 +786,7 @@ $function$;
 --                  internal.subscription_delivers_on (schedule, alternate-day
 --                  areas, pauses, move/swap overrides)
 -- Then walks the days with a running total against the live balance.
--- p_today exists so the reminder (and tests) can evaluate a given India day.
+-- p_today lets tests (and future callers) evaluate from a given India day.
 CREATE OR REPLACE FUNCTION internal.wallet_forecast(
   p_user_id uuid,
   p_days    integer,
@@ -912,18 +911,22 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------------
--- 4. Low-balance notices: one log, at most one notice per customer and
---    delivery date, from finalize or from the evening reminder (S-4)
+-- 4. Manual low-balance notices (sent by staff from Daily Ops)
 -- ---------------------------------------------------------------------------
+-- Nothing here sends anything on its own: there is no scheduler and no notice
+-- after Finalize. Staff open the list for a delivery date, choose customers
+-- and press Send. The log keeps one row per customer and delivery date, so a
+-- customer is told at most once about a given delivery.
 CREATE TABLE IF NOT EXISTS public.wallet_notice_log (
   user_id       uuid NOT NULL REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE CASCADE,
   delivery_date date NOT NULL,
-  source        text NOT NULL CHECK (source IN ('finalize', 'evening_reminder')),
+  source        text NOT NULL DEFAULT 'manual' CHECK (source IN ('manual')),
   balance       numeric NOT NULL,
   amount        numeric NOT NULL,
   status        text NOT NULL DEFAULT 'claimed' CHECK (status IN ('claimed', 'sent', 'failed')),
   attempts      integer NOT NULL DEFAULT 1,
   claimed_at    timestamptz NOT NULL DEFAULT now(),
+  claimed_by    uuid,
   sent_at       timestamptz,
   error         text,
   CONSTRAINT wallet_notice_log_pkey PRIMARY KEY (user_id, delivery_date)
@@ -931,38 +934,101 @@ CREATE TABLE IF NOT EXISTS public.wallet_notice_log (
 ALTER TABLE public.wallet_notice_log ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON public.wallet_notice_log FROM anon, authenticated;
 
--- After finalize: customers (charged that day) whose NEXT actual delivery the
--- wallet cannot cover. Returns only rows newly claimed, so a customer already
--- told about that delivery date is not told again.
-CREATE OR REPLACE FUNCTION public.claim_low_balance_notices(p_user_ids uuid[])
-  RETURNS TABLE (user_id uuid, delivery_date date, balance numeric, amount numeric)
+-- Per customer: what their wallet orders on p_delivery_date still need to be
+-- charged (Σ total_value − paid_amount of pending orders that are not on
+-- payment hold), against the live balance. Cash-on-delivery subscriptions are
+-- left out. Skipped, cancelled and delivered orders need nothing.
+CREATE OR REPLACE FUNCTION internal.low_balance_customers(p_delivery_date date)
+  RETURNS TABLE (user_id uuid, name text, phone text, balance numeric,
+                 required numeric, shortfall numeric, notice_status text)
+  LANGUAGE sql
+  STABLE
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+  WITH owed AS (
+    SELECT o.user_id, round(SUM(GREATEST(o.total_value - o.paid_amount, 0)), 2) AS required
+    FROM public.subscription_daily_orders o
+    JOIN public.subscriptions s ON s.id = o.subscription_id
+    WHERE o.delivery_date = p_delivery_date
+      AND o.status = 'pending'
+      AND o.settlement_hold_reason IS NULL
+      AND COALESCE(s.payment_method, 'wallet') = 'wallet'
+    GROUP BY o.user_id
+  )
+  SELECT u.id,
+         NULLIF(trim(concat_ws(' ', u.first_name, u.last_name)), ''),
+         u.phone,
+         round(COALESCE(u.wallet_balance, 0), 2),
+         w.required,
+         round(w.required - COALESCE(u.wallet_balance, 0), 2),
+         l.status
+  FROM owed w
+  JOIN public.users u ON u.id = w.user_id
+  LEFT JOIN public.wallet_notice_log l ON l.user_id = u.id AND l.delivery_date = p_delivery_date
+  WHERE w.required > COALESCE(u.wallet_balance, 0)
+  ORDER BY (w.required - COALESCE(u.wallet_balance, 0)) DESC, u.id;
+$function$;
+REVOKE ALL ON FUNCTION internal.low_balance_customers(date) FROM PUBLIC, anon, authenticated;
+
+-- The list for Daily Ops. notice_status: NULL (not told yet), 'sent'
+-- (already notified), 'failed' (last push failed; may be sent again) or
+-- 'claimed' (a send is in progress).
+CREATE OR REPLACE FUNCTION public.get_low_balance_customers(p_delivery_date date)
+  RETURNS TABLE (user_id uuid, name text, phone text, balance numeric,
+                 required numeric, shortfall numeric, notice_status text)
+  LANGUAGE plpgsql
+  STABLE
+  SECURITY DEFINER
+  SET search_path TO 'public', 'internal'
+AS $function$
+BEGIN
+  IF NOT internal.is_admin_actor('daily_ops:view') THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+  IF p_delivery_date IS NULL THEN
+    RAISE EXCEPTION 'A delivery date is required';
+  END IF;
+  RETURN QUERY SELECT * FROM internal.low_balance_customers(p_delivery_date);
+END;
+$function$;
+
+-- Staff pressed Send for these customers. Claims a log row for each one that
+-- is STILL short now and not already notified (or whose last push failed),
+-- and returns exactly those. Anyone already sent, or who has recharged since
+-- the list was shown, is not returned, so cannot be sent twice.
+CREATE OR REPLACE FUNCTION public.claim_manual_low_balance_notices(p_delivery_date date, p_user_ids uuid[])
+  RETURNS TABLE (user_id uuid, balance numeric, required numeric)
   LANGUAGE plpgsql
   SECURITY DEFINER
   SET search_path TO 'public', 'internal'
 AS $function$
-DECLARE
-  v_id uuid;
-  v_f  jsonb;
 BEGIN
   IF NOT internal.is_admin_actor('daily_ops:edit') THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
+  IF p_delivery_date IS NULL THEN
+    RAISE EXCEPTION 'A delivery date is required';
+  END IF;
 
-  FOR v_id IN SELECT DISTINCT u FROM unnest(COALESCE(p_user_ids, '{}')) AS u WHERE u IS NOT NULL LOOP
-    CONTINUE WHEN NOT EXISTS (SELECT 1 FROM public.users WHERE id = v_id);
-    v_f := internal.wallet_forecast(v_id, 14);
-    CONTINUE WHEN v_f->>'next_delivery_date' IS NULL OR (v_f->>'next_delivery_covered')::boolean;
-
-    RETURN QUERY
-    WITH ins AS (
-      INSERT INTO public.wallet_notice_log AS l (user_id, delivery_date, source, balance, amount, status)
-      VALUES (v_id, (v_f->>'next_delivery_date')::date, 'finalize',
-              (v_f->>'balance')::numeric, (v_f->>'next_delivery_amount')::numeric, 'claimed')
-      ON CONFLICT ON CONSTRAINT wallet_notice_log_pkey DO NOTHING
-      RETURNING l.user_id, l.delivery_date, l.balance, l.amount
-    )
-    SELECT * FROM ins;
-  END LOOP;
+  RETURN QUERY
+  WITH chosen AS (
+    SELECT c.user_id, c.balance, c.required
+    FROM internal.low_balance_customers(p_delivery_date) c
+    WHERE c.user_id = ANY (COALESCE(p_user_ids, '{}'))
+  ), ins AS (
+    INSERT INTO public.wallet_notice_log AS l
+      (user_id, delivery_date, source, balance, amount, status, attempts, claimed_at, claimed_by)
+    SELECT c.user_id, p_delivery_date, 'manual', c.balance, c.required, 'claimed', 1, now(), auth.uid()
+    FROM chosen c
+    ON CONFLICT ON CONSTRAINT wallet_notice_log_pkey DO UPDATE
+      SET status = 'claimed', attempts = l.attempts + 1, claimed_at = now(), claimed_by = EXCLUDED.claimed_by,
+          balance = EXCLUDED.balance, amount = EXCLUDED.amount, error = NULL
+      WHERE l.status = 'failed'
+         OR (l.status = 'claimed' AND l.claimed_at < now() - interval '15 minutes')
+    RETURNING l.user_id, l.balance, l.amount
+  )
+  SELECT * FROM ins;
 END;
 $function$;
 
@@ -974,7 +1040,7 @@ CREATE OR REPLACE FUNCTION public.mark_wallet_notice_result(
   SET search_path TO 'public', 'internal'
 AS $function$
 BEGIN
-  IF NOT (internal.is_service_actor() OR internal.is_admin_actor('daily_ops:edit')) THEN
+  IF NOT internal.is_admin_actor('daily_ops:edit') THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
   UPDATE public.wallet_notice_log
@@ -986,216 +1052,42 @@ END;
 $function$;
 
 -- ---------------------------------------------------------------------------
--- 5. The evening low-balance reminder (D-3)
--- ---------------------------------------------------------------------------
--- One row. DEFAULT '18:00' is the seed for a new installation only; admins
--- change it in Admin → Settings. Re-running this migration keeps their value.
-CREATE TABLE IF NOT EXISTS public.wallet_reminder_settings (
-  id                  boolean NOT NULL DEFAULT true,
-  enabled             boolean NOT NULL DEFAULT true,
-  reminder_time       time    NOT NULL DEFAULT '18:00',
-  timezone            text    NOT NULL DEFAULT 'Asia/Kolkata',
-  send_window_minutes integer NOT NULL DEFAULT 120,
-  updated_at          timestamptz NOT NULL DEFAULT now(),
-  updated_by          uuid,
-  CONSTRAINT wallet_reminder_settings_pkey PRIMARY KEY (id),
-  CONSTRAINT wallet_reminder_settings_singleton CHECK (id),
-  CONSTRAINT wallet_reminder_settings_tz CHECK (timezone = 'Asia/Kolkata'),
-  CONSTRAINT wallet_reminder_settings_window CHECK (send_window_minutes BETWEEN 15 AND 360)
-);
-ALTER TABLE public.wallet_reminder_settings ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON public.wallet_reminder_settings FROM anon, authenticated;
-INSERT INTO public.wallet_reminder_settings (id) VALUES (true) ON CONFLICT (id) DO NOTHING;
-
--- Who may read or change it: super admin, or notifications:send (S-1).
-CREATE OR REPLACE FUNCTION internal.can_manage_wallet_reminder()
-  RETURNS boolean
-  LANGUAGE sql
-  STABLE
-  SECURITY DEFINER
-  SET search_path TO 'public', 'internal'
-AS $function$
-  SELECT internal.is_admin_actor('notifications:send');
-$function$;
-REVOKE ALL ON FUNCTION internal.can_manage_wallet_reminder() FROM PUBLIC, anon, authenticated;
-
-CREATE OR REPLACE FUNCTION public.get_wallet_reminder_settings()
-  RETURNS jsonb
-  LANGUAGE plpgsql
-  STABLE
-  SECURITY DEFINER
-  SET search_path TO 'public', 'internal'
-AS $function$
-DECLARE
-  v_s    public.wallet_reminder_settings;
-  v_last date;
-  v_run  jsonb;
-BEGIN
-  IF NOT internal.can_manage_wallet_reminder() THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
-  SELECT * INTO v_s FROM public.wallet_reminder_settings WHERE id;
-
-  SELECT max(delivery_date) INTO v_last FROM public.wallet_notice_log WHERE source = 'evening_reminder';
-  IF v_last IS NOT NULL THEN
-    SELECT jsonb_build_object(
-             'delivery_date', to_char(v_last, 'YYYY-MM-DD'),
-             'sent',    count(*) FILTER (WHERE status = 'sent'),
-             'failed',  count(*) FILTER (WHERE status = 'failed'),
-             'pending', count(*) FILTER (WHERE status = 'claimed'))
-    INTO v_run
-    FROM public.wallet_notice_log
-    WHERE source = 'evening_reminder' AND delivery_date = v_last;
-  END IF;
-
-  RETURN jsonb_build_object(
-    'enabled',             v_s.enabled,
-    'reminder_time',       to_char(v_s.reminder_time, 'HH24:MI'),
-    'timezone',            v_s.timezone,
-    'send_window_minutes', v_s.send_window_minutes,
-    'updated_at',          v_s.updated_at,
-    'updated_by',          v_s.updated_by,
-    'last_run',            v_run);
-END;
-$function$;
-
-CREATE OR REPLACE FUNCTION public.set_wallet_reminder_settings(p_enabled boolean, p_reminder_time time)
-  RETURNS jsonb
-  LANGUAGE plpgsql
-  SECURITY DEFINER
-  SET search_path TO 'public', 'internal'
-AS $function$
-BEGIN
-  IF NOT internal.can_manage_wallet_reminder() THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
-  IF p_reminder_time IS NULL THEN
-    RAISE EXCEPTION 'Choose a reminder time';
-  END IF;
-  IF p_enabled IS NULL THEN
-    RAISE EXCEPTION 'Choose whether the reminder is on or off';
-  END IF;
-  UPDATE public.wallet_reminder_settings
-  SET enabled = p_enabled, reminder_time = p_reminder_time, updated_at = now(), updated_by = auth.uid()
-  WHERE id;
-  RETURN public.get_wallet_reminder_settings();
-END;
-$function$;
-
--- Called by the scheduler endpoint every ~10 minutes (service role only).
--- The database decides whether it is reminder time; the tick does not.
--- Returns the customers newly claimed for a reminder about TOMORROW's
--- delivery: their wallet cannot cover it right now. A row already sent (by
--- this reminder or the finalize notice) is never returned; a failed row, or
--- one stuck in 'claimed' for 15 minutes, is retried up to 3 attempts.
-CREATE OR REPLACE FUNCTION public.claim_wallet_reminders(p_now timestamptz DEFAULT now())
-  RETURNS TABLE (user_id uuid, delivery_date date, balance numeric, amount numeric)
-  LANGUAGE plpgsql
-  SECURITY DEFINER
-  SET search_path TO 'public', 'internal'
-AS $function$
-DECLARE
-  v_s        public.wallet_reminder_settings;
-  v_local    timestamp;
-  v_today    date;
-  v_minutes  numeric;
-  v_start    numeric;
-  v_end      numeric;
-  v_delivery date;
-  v_id       uuid;
-  v_f        jsonb;
-BEGIN
-  IF NOT internal.is_service_actor() THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
-
-  SELECT * INTO v_s FROM public.wallet_reminder_settings WHERE id;
-  IF NOT FOUND OR NOT v_s.enabled THEN
-    RETURN;
-  END IF;
-
-  v_local   := COALESCE(p_now, now()) AT TIME ZONE 'Asia/Kolkata';
-  v_today   := v_local::date;
-  v_minutes := extract(epoch FROM v_local::time) / 60;
-  v_start   := extract(epoch FROM v_s.reminder_time) / 60;
-  -- The window never crosses midnight: after midnight "tomorrow" is a new day.
-  v_end     := LEAST(v_start + v_s.send_window_minutes, 24 * 60 - 1);
-  IF v_minutes < v_start OR v_minutes >= v_end THEN
-    RETURN;
-  END IF;
-
-  v_delivery := v_today + 1;
-
-  FOR v_id IN
-    SELECT DISTINCT s.user_id FROM public.subscriptions s
-    WHERE s.status IN ('active', 'pending_cancellation')
-    ORDER BY s.user_id
-  LOOP
-    CONTINUE WHEN NOT EXISTS (SELECT 1 FROM public.users WHERE id = v_id);
-    v_f := internal.wallet_forecast(v_id, 1, v_today);
-    CONTINUE WHEN (v_f->>'next_delivery_date') IS DISTINCT FROM to_char(v_delivery, 'YYYY-MM-DD')
-               OR (v_f->>'next_delivery_covered')::boolean;
-
-    RETURN QUERY
-    WITH ins AS (
-      INSERT INTO public.wallet_notice_log AS l
-        (user_id, delivery_date, source, balance, amount, status, attempts, claimed_at)
-      VALUES (v_id, v_delivery, 'evening_reminder',
-              (v_f->>'balance')::numeric, (v_f->>'next_delivery_amount')::numeric, 'claimed', 1, now())
-      ON CONFLICT ON CONSTRAINT wallet_notice_log_pkey DO UPDATE
-        SET status = 'claimed', attempts = l.attempts + 1, claimed_at = now(),
-            balance = EXCLUDED.balance, amount = EXCLUDED.amount
-        WHERE l.source = 'evening_reminder'
-          AND l.attempts < 3
-          AND (l.status = 'failed'
-               OR (l.status = 'claimed' AND l.claimed_at < now() - interval '15 minutes'))
-      RETURNING l.user_id, l.delivery_date, l.balance, l.amount
-    )
-    SELECT * FROM ins;
-  END LOOP;
-END;
-$function$;
-
--- ---------------------------------------------------------------------------
--- 6. Grants
+-- 5. Grants
 -- ---------------------------------------------------------------------------
 REVOKE ALL ON FUNCTION public.get_wallet_reserve(uuid)                              FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.get_wallet_forecast(uuid, integer)                    FROM PUBLIC, anon;
-REVOKE ALL ON FUNCTION public.claim_low_balance_notices(uuid[])                     FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.get_low_balance_customers(date)                       FROM PUBLIC, anon;
+REVOKE ALL ON FUNCTION public.claim_manual_low_balance_notices(date, uuid[])        FROM PUBLIC, anon;
 REVOKE ALL ON FUNCTION public.mark_wallet_notice_result(uuid, date, boolean, text)  FROM PUBLIC, anon;
-REVOKE ALL ON FUNCTION public.get_wallet_reminder_settings()                        FROM PUBLIC, anon;
-REVOKE ALL ON FUNCTION public.set_wallet_reminder_settings(boolean, time)           FROM PUBLIC, anon;
-REVOKE ALL ON FUNCTION public.claim_wallet_reminders(timestamptz)                   FROM PUBLIC, anon;
 
 GRANT EXECUTE ON FUNCTION public.get_wallet_reserve(uuid)                             TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.get_wallet_forecast(uuid, integer)                   TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.claim_low_balance_notices(uuid[])                    TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.get_low_balance_customers(date)                      TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.claim_manual_low_balance_notices(date, uuid[])       TO authenticated, service_role;
 GRANT EXECUTE ON FUNCTION public.mark_wallet_notice_result(uuid, date, boolean, text) TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.get_wallet_reminder_settings()                       TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.set_wallet_reminder_settings(boolean, time)          TO authenticated, service_role;
-GRANT EXECUTE ON FUNCTION public.claim_wallet_reminders(timestamptz)                  TO authenticated, service_role;
 
 COMMIT;
 
 -- ---------------------------------------------------------------------------
 -- Verification
 -- ---------------------------------------------------------------------------
--- 1. Reminder settings (expect enabled, 18:00 on a fresh install, Asia/Kolkata):
---      SELECT enabled, reminder_time, timezone, send_window_minutes FROM public.wallet_reminder_settings;
---
--- 2. The old 3-day rule is gone from the four functions (expect 0 rows):
+-- 1. The old 3-day rule is gone from the four functions (expect 0 rows):
 --      SELECT p.oid::regprocedure FROM pg_proc p
 --      WHERE p.proname IN ('create_subscription_core', 'place_order_core',
 --                          'modify_daily_order_core', 'modify_daily_orders_bulk_core')
 --        AND (p.prosrc LIKE '%* 3%' OR p.prosrc LIKE '%3 days%');
 --
--- 3. A customer's reserve and forecast (replace the id):
+-- 2. A customer's reserve and forecast (replace the id):
 --      SELECT internal.wallet_reserve('<user id>'),
 --             internal.wallet_forecast('<user id>', 14);
 --
--- 4. Grants — expect t, t, f, f:
+-- 3. The Daily Ops list for a date (replace the date):
+--      SELECT * FROM internal.low_balance_customers(DATE '<YYYY-MM-DD>');
+--
+-- 4. Grants — expect t, t, t, f, f:
 --      SELECT
 --        has_function_privilege('authenticated', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE'),
---        has_function_privilege('authenticated', 'public.get_wallet_reserve(uuid)', 'EXECUTE'),
+--        has_function_privilege('authenticated', 'public.get_low_balance_customers(date)', 'EXECUTE'),
+--        has_function_privilege('authenticated', 'public.claim_manual_low_balance_notices(date, uuid[])', 'EXECUTE'),
 --        has_function_privilege('anon', 'public.get_wallet_forecast(uuid, integer)', 'EXECUTE'),
 --        has_function_privilege('authenticated', 'internal.wallet_forecast(uuid, integer, date)', 'EXECUTE');

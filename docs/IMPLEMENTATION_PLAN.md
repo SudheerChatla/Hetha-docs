@@ -121,7 +121,7 @@ the decision here wins; report the conflict.
 |---|---|---|---|
 | D-1 | **Wallet reserve = 1 upcoming delivery per active subscription.** When a customer creates a subscription, buys with the wallet, or increases a day's order, the wallet check considers one upcoming delivery of each active subscription and nothing more. One central database function produces the reserve. The earlier multi-delivery requirement is removed everywhere. | CONFIRMED | W-01, W-04, W-05, A-18 |
 | D-2 | **Bulk "Mark Delivered" stays.** When staff use it, the selected orders are treated as fully delivered; no quantities need to be typed. Recording an individual delivery still takes the actual delivered quantity per item. | CONFIRMED | Phase 1 (`set_daily_order_status`); protected by P2-05; restated in P1-01 |
-| D-3 | **Evening low-balance reminder, on by default, at 6:00 PM IST by default, configurable.** An authorized admin can turn it on or off and change the time in Admin → Settings → Wallet & Notifications. The setting is stored in the database, timezone `Asia/Kolkata`. Sent only when the wallet cannot cover the customer's actual next scheduled delivery (tomorrow's). Not sent if the customer recharged before the configured time. Never twice for the same customer and delivery date. Respects schedules, alternate-day areas, pauses and moved delivery dates. The scheduler reads the time from the database; no fixed time in `vercel.json`. | CONFIRMED | W-08 (W-08a … W-08f), O-07 |
+| D-3 | **Low-balance notices are MANUAL ONLY** (revised by the owner on 2026-11-16; the earlier automatic evening reminder is withdrawn). Nothing sends a low-balance push automatically: no scheduler, no cron job, no `CRON_SECRET`, no notice after Finalize. After Generate, Daily Ops lists every customer whose wallet cannot cover their orders on the selected date (wallet, required, shortfall); all not-yet-notified customers are selected; staff can deselect; Send pushes only to the selected ones and shows sent / failed counts. A customer is notified at most once per delivery date ("Already notified"). The wallet forecast stays. Automatic reminders may be requested later as a separate task. | CONFIRMED (revised) | W-07M |
 | D-4 | **Customers cannot add items to an existing subscription from the app.** Out of scope for this plan. | CONFIRMED | No task. Do not build it. |
 | D-5 | **Do not raise the Supabase Data API "Max rows" (1000).** Page every read that needs all rows. | CONFIRMED | P2-09; O-05 note |
 | D-6 | **Separate staging Supabase project plus a Vercel preview pointing at it.** Migrations and app changes are tested there before production. Must be complete before onboarding real customers. | CONFIRMED | O-04; rule §1.3 |
@@ -136,10 +136,7 @@ questions; they are recorded so the owner can overrule one if wanted.
 
 | ID | Assumption | Why |
 |---|---|---|
-| S-1 | Who may change the reminder setting: a super admin, or an admin with the existing permission `notifications:send`. | It is the permission that already guards sending notifications. No new permission key is introduced. |
-| S-2 | The reminder is sent within 120 minutes after the configured time, not later. | A scheduler tick can be late; a bounded window lets it catch up without sending reminders at night. Stored as a setting (`send_window_minutes`), not shown in the UI. |
-| S-3 | The scheduler is a Supabase Cron job that calls an admin API route every 10 minutes. | The reminder time lives in the database and can change, so the tick must be frequent and the database must decide. Supabase Cron is already installed in the project; Vercel cron frequency depends on the plan. |
-| S-4 | The low-balance notice sent right after finalize (W-07) and the evening reminder (W-08) share one log, so a customer gets at most one low-balance notification per delivery date from either. | D-3: no duplicate for the same customer and delivery date. |
+| S-5 | The manual list counts only wallet subscriptions' pending orders on the selected date that are not on payment hold (cash on delivery, skipped, cancelled, delivered and already-paid orders need nothing). A push that failed may be sent again. | These are exactly the orders Finalize will try to charge. |
 
 ---
 
@@ -155,7 +152,7 @@ Part A0  P1-01 → P1-02 → P1-03                         Phase 1 follow-ups (a
 Part A   P2-01 → P2-02 → P2-03 → P2-04 → P2-05 → P2-06 → P2-07 → P2-08 → P2-09 → P2-10
    │        migration 038 — Daily Ops structure (also holds get_earliest_change_date for M-01)
    ▼
-Part B   W-01 → W-02 → W-03 → W-04 → W-05 → W-06 → W-07 → W-08a … W-08f
+Part B   W-01 → W-02 → W-03 → W-04 → W-05 → W-06 → W-07M (manual low-balance notices)
    │        migration 039 — wallet simplification + configurable reminder
    ▼
 Part C   A-01 … A-18      independent of each other unless stated; A-06 is migration 040 (indexes)
@@ -168,12 +165,11 @@ Part F   O-01 … O-08      owner-only
 |---|---|---|
 | 037 | Phase 1: `paid_amount`, `settle_daily_order`, finalize / record delivery / status / retry / unlock / reconcile, settlement holds | 036 |
 | 038 | Phase 2: `subscription_delivers_on`, `generate_daily_run`, item functions, finalized-day lock, `get_earliest_change_date` | 037 |
-| 039 | Wallet: `wallet_reserve`, `wallet_forecast`, low-balance notices, reminder settings table, reminder log table, reminder functions | 038 (uses `subscription_delivers_on`) |
+| 039 | Wallet: `wallet_reserve`, `wallet_forecast`, manual low-balance list and send, notice log | 038 (uses `subscription_delivers_on`) |
 | 040 | Indexes only | none (can be applied any time after 037) |
 
 Each of Part A and Part B ships as **one migration**. Build the SQL tasks of
-a part into the same migration file, in task order. The reminder scheduler
-itself (O-07) is an environment-specific Supabase Cron job, not a migration.
+a part into the same migration file, in task order.
 
 Staging (O-04, D-6) should exist before migration 038 is applied anywhere,
 and must exist before real customers are onboarded.
@@ -841,17 +837,17 @@ pattern):
 2. There is **no multi-delivery reserve** as a hard gate.
 3. Wallets are kept full by **reminders**, not by locking money.
 
-Hetha's model after this part (D-1, D-3):
+Hetha's model after this part (D-1, D-3 as revised):
 
 | Area | Before (historical; being removed) | After Part B |
 |---|---|---|
 | Reserve | A multi-delivery reserve written as a literal multiplier in four SQL functions and three screens (the exact strings are listed in Appendix H). It could not be explained to customers with subscriptions in areas on different schedules. | **1 upcoming delivery of each active subscription**, from one function, `internal.wallet_reserve`. |
 | "How long will my wallet last" | Five separate calculations (wallet page simulation, checkout, create-subscription, admin "Wallet covers", low-balance push) that disagreed and ignored area schedules, pauses and day edits. | One function, `wallet_forecast`, used by all of them. |
-| Low balance | A push when the balance was below a multiple of that day's debit. | A notice when the **next actual delivery** is not covered, plus a configurable evening reminder. |
+| Low balance | An automatic push after Finalize when the balance was below a multiple of that day's debit. | **Manual only.** Staff open the list for a delivery date in Daily Ops and send the push to the customers they choose. |
 | Wallet short at delivery | (Already changed by migration 037.) | The order is skipped at finalize, nothing is taken, the customer is notified, and staff can retry after a recharge. |
 
-**Schema changes in this part:** two small tables for the reminder
-(`wallet_reminder_settings`, `wallet_notice_log`). No change to `users`,
+**Schema changes in this part:** one small table, `wallet_notice_log`
+(manual low-balance notices sent, one per customer and delivery date). No change to `users`,
 `wallet_transactions`, `subscriptions` or `subscription_daily_orders`.
 
 **What "1 upcoming delivery per active subscription" means exactly:** the
@@ -894,11 +890,9 @@ migration 037. Client code must never set `status`, `payment_status` or
 |---|---|---|
 | RPC | `get_wallet_reserve(p_user_id)` | App (checkout, create subscription), admin |
 | RPC | `get_wallet_forecast(p_user_id, p_days)` | App (wallet page), admin (customer profile) |
-| RPC | `claim_low_balance_notices(p_user_ids)` | Admin API after finalize |
-| RPC | `get_wallet_reminder_settings()` / `set_wallet_reminder_settings(p_enabled, p_reminder_time)` | Admin API (settings screen) |
-| RPC | `claim_wallet_reminders(p_now)` / `mark_wallet_notice_result(...)` | Admin API (scheduler route), service role only |
-| HTTP | `GET` / `PUT /api/admin/settings/wallet-reminder` | Admin Settings screen |
-| HTTP | `POST /api/cron/wallet-reminder` | Supabase Cron (O-07) |
+| RPC | `get_low_balance_customers(p_delivery_date)` | Admin API (Daily Ops list) |
+| RPC | `claim_manual_low_balance_notices(p_delivery_date, p_user_ids)` / `mark_wallet_notice_result(...)` | Admin API (Daily Ops Send) |
+| HTTP | `GET /api/admin/daily-ops?action=low-balance&date=` / `POST action=send-low-balance` | Daily Ops screen |
 
 Migration file for all SQL tasks in this part:
 `docs/db/migrations/039_wallet_simplification.sql`. It requires migration 038.
@@ -1205,451 +1199,50 @@ appears on its start date; today is never included.
 
 ---
 
-### W-07 — Low-balance notice after finalize, based on the next actual delivery
+### W-07M — Manual low-balance notices from Daily Ops (D-3, revised 2026-11-16)
 
 **Target Area:** Database + Admin Panel
 
-**Objective:** After finalize, tell customers whose **next actual delivery** is not covered, using the forecast, and never notify the same customer twice for the same delivery date (S-4).
+**Objective:** Let staff, after Generate, see every customer whose wallet cannot cover their orders on the selected delivery date and send them a low-balance push, choosing exactly who receives it. Nothing is sent automatically.
 
-**Exact Implementation Steps:**
+**Replaces** the earlier W-07 (automatic notice after Finalize) and W-08a–W-08f (configurable evening reminder, scheduler endpoint, `CRON_SECRET`, settings screen, Supabase Cron job). None of those exist in the code; do not build them unless the owner asks for automatic reminders again.
 
-1. Migration 039: create the shared log table (also used by W-08):
-   ```sql
-   CREATE TABLE IF NOT EXISTS public.wallet_notice_log (
-     user_id       uuid NOT NULL REFERENCES public.users(id) ON UPDATE CASCADE ON DELETE CASCADE,
-     delivery_date date NOT NULL,
-     source        text NOT NULL CHECK (source IN ('finalize', 'evening_reminder')),
-     balance       numeric NOT NULL,
-     amount        numeric NOT NULL,
-     status        text NOT NULL DEFAULT 'claimed' CHECK (status IN ('claimed', 'sent', 'failed')),
-     attempts      integer NOT NULL DEFAULT 1,
-     claimed_at    timestamptz NOT NULL DEFAULT now(),
-     sent_at       timestamptz,
-     error         text,
-     CONSTRAINT wallet_notice_log_pkey PRIMARY KEY (user_id, delivery_date)
-   );
-   ALTER TABLE public.wallet_notice_log ENABLE ROW LEVEL SECURITY;
-   ```
-   No policies: only the functions below touch it. The primary key
-   `(user_id, delivery_date)` is the idempotency mechanism.
-2. Create
-   `public.claim_low_balance_notices(p_user_ids uuid[]) RETURNS TABLE (user_id uuid, delivery_date date, balance numeric, amount numeric)`:
-   1. Raise `'Not authorized'` unless `internal.is_admin_actor('daily_ops:edit')`.
-   2. For each distinct id in `p_user_ids`: `f := internal.wallet_forecast(id, 14)`.
-      Skip unless `f->>'next_delivery_date'` is not null and
-      `(f->>'next_delivery_covered')::boolean = false`.
-   3. Insert
-      `(user_id, delivery_date, source, balance, amount, status)` =
-      `(id, next_delivery_date, 'finalize', balance, next_delivery_amount, 'claimed')`
-      `ON CONFLICT (user_id, delivery_date) DO NOTHING RETURNING …`.
-   4. Return only the rows actually inserted (a customer already notified for
-      that delivery date is not returned).
-3. Create
-   `public.mark_wallet_notice_result(p_user_id uuid, p_delivery_date date, p_ok boolean, p_error text DEFAULT NULL) RETURNS void`:
-   allowed for `internal.is_service_actor()` or
-   `internal.is_admin_actor('daily_ops:edit')`; sets `status = 'sent', sent_at = now()`
-   when `p_ok`, else `status = 'failed', error = left(p_error, 500)`.
-4. `Hetha_admin/services/notificationService.ts`:
-   - Change `sendNotification` to return `Promise<boolean>`: `true` when the
-     push call completed without an error, `false` when any `catch` or `error`
-     branch ran. Existing callers ignore the result; do not change them.
-   - Change `notifyLowBalance` to
-     `notifyLowBalance(userId: string, balance: number, nextDate: string, nextAmount: number): Promise<boolean>`
-     with title `'Low Wallet Balance'` and body
-     `` `₹${balance.toFixed(0)} left, but your delivery on ${formatShortDay(nextDate)} needs ₹${nextAmount.toFixed(0)}. Recharge to avoid a skipped delivery.` ``
-     (`formatShortDay` from `@/lib/deliverySchedule`), `data: { route: 'wallet' }`.
-     Update every caller.
-5. `Hetha_admin/app/api/admin/daily-ops/route.ts`, `action === 'finalize'`:
-   replace the block that reads `users` and compares the balance with a
-   multiple of the day's debit (Appendix H-21) with:
-   ```ts
-   const { data: low, error: lowError } = await supabase
-     .rpc('claim_low_balance_notices', { p_user_ids: chargedUserIds });
-   if (lowError) console.error('finalize: low-balance lookup failed:', lowError.message);
-   for (const row of low ?? []) {
-     after(async () => {
-       const ok = await notifyLowBalance(row.user_id, Number(row.balance), row.delivery_date, Number(row.amount));
-       await createAdminClient().rpc('mark_wallet_notice_result', {
-         p_user_id: row.user_id, p_delivery_date: row.delivery_date, p_ok: ok, p_error: ok ? null : 'push failed',
-       });
-     });
-   }
-   ```
-   (`createAdminClient` from `@/lib/admin-client`.) After A-03 these closures
-   go through `sendNotificationsInBatches`.
-6. Customers skipped at finalize already receive the "Delivery Skipped" push;
-   they are excluded from `chargedUserIds` (Phase 1 code) and get no second
-   message here.
+**Exact Implementation Steps (as built):**
 
-**Acceptance Criteria:**
-- DB tests: a user whose balance covers the next delivery is not returned; one whose balance is ₹1 short is returned with the right date and amount; calling the function a second time returns nothing for that user and date; an alternate-day customer is evaluated against their real next delivery date, not tomorrow; a paused next day is skipped in favour of the following delivery; a customer caller is refused.
-- `tsc`, lint, build pass; Appendix H-21 does not occur in `app/api/admin/daily-ops/route.ts`.
+1. Migration 039:
+   - `public.wallet_notice_log` — one row per `(user_id, delivery_date)`;
+     `source` is always `'manual'`; `status` `claimed` → `sent` / `failed`;
+     `attempts`, `claimed_by`, `sent_at`, `error`. RLS on, no policies, no grants.
+   - `internal.low_balance_customers(p_delivery_date)` — per customer, Σ
+     (`total_value − paid_amount`) of their pending, not-held orders on that
+     date from wallet subscriptions, against `users.wallet_balance`; only
+     customers with required > balance; with `notice_status` from the log.
+   - `public.get_low_balance_customers(p_delivery_date)` — `daily_ops:view`.
+   - `public.claim_manual_low_balance_notices(p_delivery_date, p_user_ids)` —
+     `daily_ops:edit`; claims a log row only for chosen customers who are still
+     short now and not already notified (a `failed` row may be claimed again;
+     a `claimed` row older than 15 minutes too); returns those rows.
+   - `public.mark_wallet_notice_result(...)` — `daily_ops:edit`; `sent` / `failed`.
+2. Admin API (`app/api/admin/daily-ops/route.ts`): GET `action=low-balance`;
+   POST `action=send-low-balance` `{ date, userIds }` → claim → send
+   `notifyLowBalance(user, balance, date, required)` in batches of 20 inside
+   the request → mark each → `{ selected, sent, failed, skipped }`.
+3. Daily Ops: **Low wallet balance** button (when the day has orders) →
+   `LowBalanceModal`: customer, phone, wallet, needed, short by, notified;
+   all not-yet-notified rows selected; "Already notified" rows greyed and not
+   selectable; **Send to N customers**; result line with sent / failed counts.
+4. Finalize sends no low-balance push (the "Delivery skipped: low balance"
+   push for orders it skipped is unchanged).
 
----
-
-### W-08 — Configurable evening low-balance reminder (D-3)
-
-Six subtasks, in order. Together they deliver: a reminder that is **on by
-default at 6:00 PM IST**, whose on/off state and time an authorized admin can
-change in Admin → Settings → Wallet & Notifications, stored in the database,
-evaluated in `Asia/Kolkata`, sent only to customers whose wallet cannot cover
-**tomorrow's actual delivery**, never twice for the same customer and delivery
-date, and driven by a scheduler that reads the time from the database.
-
-**How it works, end to end:**
-
-```
-Supabase Cron (every 10 min)  ──POST──▶  /api/cron/wallet-reminder   (admin panel, service role)
-                                              │
-                                              ▼
-                              claim_wallet_reminders(now)             (database decides)
-                                 1. setting enabled?            no → nothing
-                                 2. India time inside [reminder_time, reminder_time + window)?  no → nothing
-                                 3. for each customer: is TOMORROW a delivery day
-                                    (schedule, pauses, moves, day edits) and is
-                                    balance < tomorrow's amount?  no → skip
-                                 4. insert (customer, tomorrow) into wallet_notice_log
-                                    — already there → skip (no duplicate)
-                                              │ rows claimed
-                                              ▼
-                              send push to each, then mark_wallet_notice_result
-```
-
-The scheduler tick is fixed and frequent; the **time of the reminder is never
-in the scheduler**. Changing the time in the admin changes only a database row.
-
----
-
-#### W-08a — Database: settings, claim function
-
-**Target Area:** Database
-
-**Objective:** Store the reminder setting and let the database decide, atomically and idempotently, who is due a reminder right now.
-
-**Exact Implementation Steps:**
-
-1. Migration 039: settings table, one row only.
-   ```sql
-   CREATE TABLE IF NOT EXISTS public.wallet_reminder_settings (
-     id                  boolean NOT NULL DEFAULT true,
-     enabled             boolean NOT NULL DEFAULT true,
-     reminder_time       time    NOT NULL DEFAULT '18:00',   -- initial default only (6:00 PM IST); admins change it
-     timezone            text    NOT NULL DEFAULT 'Asia/Kolkata',
-     send_window_minutes integer NOT NULL DEFAULT 120,
-     updated_at          timestamptz NOT NULL DEFAULT now(),
-     updated_by          uuid,
-     CONSTRAINT wallet_reminder_settings_pkey PRIMARY KEY (id),
-     CONSTRAINT wallet_reminder_settings_singleton CHECK (id),
-     CONSTRAINT wallet_reminder_settings_tz CHECK (timezone = 'Asia/Kolkata'),
-     CONSTRAINT wallet_reminder_settings_window CHECK (send_window_minutes BETWEEN 15 AND 360)
-   );
-   ALTER TABLE public.wallet_reminder_settings ENABLE ROW LEVEL SECURITY;
-   INSERT INTO public.wallet_reminder_settings (id) VALUES (true) ON CONFLICT (id) DO NOTHING;
-   ```
-   The `DEFAULT '18:00'` is the seed value for a new installation. It is the
-   only place that time is written, and it is data, not logic: nothing else in
-   SQL, TypeScript, Dart or configuration may contain the reminder time.
-   Re-running the migration must not reset a time an admin has changed
-   (`ON CONFLICT DO NOTHING`).
-2. `internal.can_manage_wallet_reminder() RETURNS boolean`:
-   `internal.is_admin_actor('notifications:send')` (true for a super admin and
-   for the service role; S-1).
-3. `public.get_wallet_reminder_settings() RETURNS jsonb`: raise
-   `'Not authorized'` unless `internal.can_manage_wallet_reminder()`. Return
-   ```json
-   { "enabled": true, "reminder_time": "18:00", "timezone": "Asia/Kolkata",
-     "send_window_minutes": 120, "updated_at": "…", "updated_by": "…",
-     "last_run": { "delivery_date": "2026-11-14", "sent": 12, "failed": 0, "pending": 0 } }
-   ```
-   `reminder_time` formatted `to_char(reminder_time, 'HH24:MI')`. `last_run` is
-   computed from `wallet_notice_log` rows with `source = 'evening_reminder'`
-   for the most recent `delivery_date` (`null` when there are none).
-4. `public.set_wallet_reminder_settings(p_enabled boolean, p_reminder_time time) RETURNS jsonb`:
-   raise `'Not authorized'` unless `internal.can_manage_wallet_reminder()`;
-   raise `'Choose a reminder time'` if `p_reminder_time IS NULL`; raise
-   `'Choose whether the reminder is on or off'` if `p_enabled IS NULL`;
-   `UPDATE … SET enabled = p_enabled, reminder_time = p_reminder_time, updated_at = now(), updated_by = auth.uid() WHERE id`;
-   return `public.get_wallet_reminder_settings()`.
-5. `public.claim_wallet_reminders(p_now timestamptz DEFAULT now()) RETURNS TABLE (user_id uuid, delivery_date date, balance numeric, amount numeric)`:
-   1. Raise `'Not authorized'` unless `internal.is_service_actor()`.
-   2. Read the settings row. If `NOT enabled` → return no rows.
-   3. `v_local := p_now AT TIME ZONE 'Asia/Kolkata'`;
-      `v_today := v_local::date`; `v_time := v_local::time`.
-   4. **Window:** let `v_start := reminder_time` and
-      `v_end_minutes := LEAST(extract(epoch FROM reminder_time)/60 + send_window_minutes, 24*60 - 1)`.
-      If `v_time < v_start` or the minutes-since-midnight of `v_time` is
-      `>= v_end_minutes` → return no rows. (The window never crosses midnight:
-      a reminder for tomorrow sent after midnight would be for the wrong day.)
-   5. `v_delivery := v_today + 1`.
-   6. **Candidates:** every `users.id` that has at least one subscription with
-      status `active` or `pending_cancellation`. For each,
-      `f := internal.wallet_forecast(id, 1)` (one day ahead = tomorrow only).
-      Keep the user only when
-      `(f->>'next_delivery_date')::date = v_delivery AND (f->>'next_delivery_covered')::boolean = false`.
-      Because the forecast reads the live `wallet_balance`, a customer who
-      recharged before this moment is covered and is not kept. Because it uses
-      `subscription_delivers_on` and existing daily orders, alternate-day
-      areas, pauses, moved delivery dates and customer day edits are respected.
-   7. **Claim (idempotent):**
-      ```sql
-      INSERT INTO public.wallet_notice_log AS l
-        (user_id, delivery_date, source, balance, amount, status, attempts, claimed_at)
-      VALUES (id, v_delivery, 'evening_reminder', balance, amount, 'claimed', 1, now())
-      ON CONFLICT (user_id, delivery_date) DO UPDATE
-        SET status = 'claimed', attempts = l.attempts + 1, claimed_at = now(),
-            balance = EXCLUDED.balance, amount = EXCLUDED.amount
-        WHERE l.source = 'evening_reminder'
-          AND l.attempts < 3
-          AND (l.status = 'failed'
-               OR (l.status = 'claimed' AND l.claimed_at < now() - interval '15 minutes'))
-      RETURNING l.user_id, l.delivery_date, l.balance, l.amount;
-      ```
-      Meaning: a new row is claimed; a row already `sent` (by this reminder or
-      by the finalize notice, S-4) is never returned; a `failed` row, or one
-      stuck in `claimed` for 15 minutes (the sender crashed), is retried up to
-      3 attempts in total.
-   8. Return the claimed rows.
-6. `p_now` exists so tests can fix the clock. Only the service role can call
-   the function, so a client cannot abuse it.
-7. Grants: `get_` / `set_wallet_reminder_settings` to `authenticated, service_role`;
-   `claim_wallet_reminders` and `mark_wallet_notice_result` to `service_role`
-   and `authenticated` (they check the actor inside); revoke all from
-   `PUBLIC, anon`.
-
-**Acceptance Criteria (tests, new section 13):**
-- Fresh database: settings are enabled, time `18:00`, timezone `Asia/Kolkata`.
-- Re-running the migration after an admin set `19:30` keeps `19:30`.
-- A customer and an admin without `notifications:send` cannot read or change the settings; a super admin and an admin with that permission can.
-- `claim_wallet_reminders` at `17:59` India time returns nothing; at `18:00` returns the uncovered customer; at `19:59` still does; at `20:00` (window passed) returns nothing.
-- After the time is changed to `20:30`, a call at `18:10` returns nothing and a call at `20:35` returns the customer.
-- With `enabled = false` it returns nothing at any time.
-- A second call a minute later returns nothing (no duplicate).
-- A customer who is uncovered at `17:00` and recharges at `17:30` is not returned at `18:00`.
-- A customer whose next delivery is the day after tomorrow (alternate-day area) is not returned today and is returned the next evening.
-- A customer who paused tomorrow is not returned.
-- A customer whose delivery was moved from tomorrow to another date by a move override is not returned today.
-- A customer already notified for that delivery date by `claim_low_balance_notices` (W-07) is not returned.
-- A row marked `failed` is returned again on the next call, at most 3 attempts in total; a row marked `sent` never.
-- A customer caller and an admin caller are refused by `claim_wallet_reminders`.
-
----
-
-#### W-08b — Notification text
-
-**Target Area:** Admin Panel
-
-**Objective:** Add the reminder push, returning whether it was sent.
-
-**Exact Implementation Steps:**
-
-1. `Hetha_admin/services/notificationService.ts`: add
-   ```ts
-   export async function notifyUncoveredTomorrow(
-     userId: string, balance: number, amount: number, deliveryDate: string,
-   ): Promise<boolean> {
-     return sendNotification({
-       userId,
-       title: "Recharge for tomorrow's delivery",
-       body: `Your wallet has ₹${balance.toFixed(0)}, but your delivery on ${formatShortDay(deliveryDate)} needs ₹${amount.toFixed(0)}. Recharge today or it will be skipped.`,
-       data: { route: 'wallet' },
-     });
-   }
-   ```
-2. Requires the `Promise<boolean>` return of `sendNotification` from W-07 step 4.
-3. `sendNotification` already drops the push (and keeps the inbox row) for
-   customers who turned notifications off; do not add another check.
-
-**Acceptance Criteria:** `tsc`, lint, build pass. The body contains no time of day and no fixed date.
-
----
-
-#### W-08c — Scheduler endpoint
-
-**Target Area:** Admin Panel
-
-**Objective:** Provide the endpoint the scheduler calls; it asks the database who is due and sends the pushes.
-
-**Exact Implementation Steps:**
-
-1. Create `Hetha_admin/app/api/cron/wallet-reminder/route.ts` exporting `POST`
-   (and `GET` delegating to the same handler, for manual checks).
-2. **Auth:** read `process.env.CRON_SECRET`. If it is unset or shorter than 32
-   characters return `500 { error: 'CRON_SECRET is not configured' }`. Return
-   `401` unless the request header `Authorization` equals
-   `` `Bearer ${process.env.CRON_SECRET}` ``. Compare with a constant-time
-   comparison (`crypto.timingSafeEqual` on equal-length buffers).
-   Do **not** use `requireAdmin`: there is no user session.
-3. Create the service-role client with `createAdminClient()` from
-   `@/lib/admin-client`.
-4. `const { data, error } = await supabase.rpc('claim_wallet_reminders');`
-   On `error` return `500 { error: error.message }`.
-5. For the claimed rows, in sequential groups of 20
-   (`Promise.allSettled` per group; reuse `sendNotificationsInBatches` if A-03
-   is done): call
-   `notifyUncoveredTomorrow(row.user_id, Number(row.balance), Number(row.amount), row.delivery_date)`,
-   then `rpc('mark_wallet_notice_result', { p_user_id, p_delivery_date, p_ok, p_error })`.
-   Do the sending **inside** the request (not in `after`), so the response
-   reports the real result and the scheduler's log is meaningful.
-6. Respond `200 { claimed: n, sent: s, failed: f }`. When nothing was due,
-   `{ claimed: 0, sent: 0, failed: 0 }`.
-7. Export `maxDuration = 60` (confirm the option name in the Next.js docs
-   bundled in `node_modules/next/dist/docs/`). If more customers are claimed
-   than can be sent in time, the unsent rows stay `claimed` and are picked up
-   by a later tick (W-08a step 5.7), so nothing is lost and nothing is sent twice.
-8. The route file must not contain a time of day, a cron expression, or any
-   reference to when it is called.
-9. `Hetha_admin/vercel.json`: leave it without a `crons` entry. Do not add one.
-10. Make sure `proxy.ts` / the auth middleware does not redirect
-    `/api/cron/*` to the login page: read `Hetha_admin/proxy.ts` and its
-    matcher; if `/api/cron` is matched, exclude it.
-11. Document `CRON_SECRET` in `Hetha_admin/README.md` (env section): "long
-    random string; the same value is stored in Supabase Vault for the cron job
-    (see `docs/ops/wallet_reminder_cron.sql`)".
-
-**Acceptance Criteria:**
-- No header → 401. Wrong secret → 401. `CRON_SECRET` unset → 500.
-- Correct secret outside the reminder window → `200 { claimed: 0, sent: 0, failed: 0 }`.
-- Inside the window with one uncovered customer → `claimed: 1, sent: 1`; an immediate second call → `claimed: 0`.
-- `grep -n "18:00\|cron" Hetha_admin/vercel.json` returns nothing.
-- `tsc`, lint, build pass.
-
----
-
-#### W-08d — Admin UI: Settings → Wallet & Notifications
-
-**Target Area:** Admin Panel
-
-**Objective:** Let an authorized admin turn the reminder on or off and change its time.
-
-**Exact Implementation Steps:**
-
-1. API route `Hetha_admin/app/api/admin/settings/wallet-reminder/route.ts`:
-   - `GET`: `requireAdmin('notifications:send')`; return
-     `supabase.rpc('get_wallet_reminder_settings')`.
-   - `PUT`: `requireAdmin('notifications:send')`; body
-     `{ enabled: boolean, reminder_time: string }`. Validate:
-     `typeof enabled === 'boolean'`; `reminder_time` matches
-     `/^([01]\d|2[0-3]):[0-5]\d$/`. Otherwise `400` with a sentence naming the
-     field. Call `rpc('set_wallet_reminder_settings', { p_enabled: enabled, p_reminder_time: reminder_time })`.
-     Return the function's result. Map a database `Not authorized` to `403`.
-2. Component `Hetha_admin/app/admin/settings/_components/WalletNotificationsCard.tsx`
-   (client component), rendered by `app/admin/settings/page.tsx` below the
-   existing password section, under the heading **Wallet & Notifications**:
-   - Load with `useQuery({ queryKey: ['wallet-reminder-settings'], queryFn })`.
-     If the GET returns 403, render nothing (the admin is not authorized).
-   - Title: `Low-balance reminder`.
-   - Description: `Sends a push to customers the evening before a delivery their wallet cannot cover. Customers who have already recharged, or who have no delivery the next day, are not notified.`
-   - Toggle `Send the reminder` bound to `enabled`.
-   - `<input type="time">` labelled `Reminder time`, bound to `reminder_time`,
-     disabled when the toggle is off.
-   - Caption under the time: `India time (Asia/Kolkata).`
-   - If `last_run` exists: `Last reminder: for deliveries on ${formatDate(last_run.delivery_date)}: ${sent} sent, ${failed} failed.`
-   - `Save` button, disabled when nothing changed or while saving. On success
-     toast `Reminder settings saved` and update the query cache; on error show
-     the server's message.
-   - Do not put a default time in the component. The value shown is whatever
-     the API returned.
-3. Use the existing form and card components and styles of the Settings page;
-   follow `Hetha_admin/docs/UI_GUIDELINES.md`.
-4. Add the types `WalletReminderSettings` to `Hetha_admin/lib/types.ts`.
-
-**Acceptance Criteria:**
-- A super admin sees the card with the reminder on and the time the database holds (the seeded value on a fresh install).
-- Changing the time to another value and saving persists after a page reload and is what `SELECT reminder_time FROM wallet_reminder_settings` returns.
-- Turning it off persists; the time field is disabled.
-- An admin without `notifications:send` does not see the card, and a direct PUT returns 403.
-- `PUT` with `reminder_time: "25:00"` or `"6pm"` returns 400.
-- `grep -rn "18:00" Hetha_admin/app Hetha_admin/services Hetha_admin/lib` returns nothing.
-
----
-
-#### W-08e — Scheduler job definition
-
-**Target Area:** Backend (ops script; applied by the owner, O-07)
-
-**Objective:** Define the Supabase Cron job that calls the endpoint every 10 minutes, without putting the reminder time in it.
-
-**Exact Implementation Steps:**
-
-1. Create `docs/ops/wallet_reminder_cron.sql` (this is **not** a numbered
-   migration: it contains an environment-specific URL and secret, and staging
-   and production each need their own). Header comment: purpose, that it must
-   be run once per environment in the SQL Editor, and how to change or remove it.
-2. Contents, with placeholders the owner fills in:
-   ```sql
-   -- 1. Store the endpoint and the shared secret in Supabase Vault (once).
-   --    <ADMIN_BASE_URL>  e.g. https://admin.example.com   (no trailing slash)
-   --    <CRON_SECRET>     the same value as the CRON_SECRET env var in Vercel
-   SELECT vault.create_secret('<ADMIN_BASE_URL>', 'wallet_reminder_base_url');
-   SELECT vault.create_secret('<CRON_SECRET>',    'wallet_reminder_cron_secret');
-
-   -- 2. Schedule the tick. Every 10 minutes, all day. The database decides
-   --    whether it is time to send (wallet_reminder_settings); the schedule
-   --    below is NOT the reminder time and must not be changed to one.
-   SELECT cron.schedule(
-     'wallet-reminder-tick',
-     '*/10 * * * *',
-     $$
-     SELECT net.http_post(
-       url     := (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'wallet_reminder_base_url')
-                  || '/api/cron/wallet-reminder',
-       headers := jsonb_build_object(
-                    'Content-Type', 'application/json',
-                    'Authorization', 'Bearer ' ||
-                      (SELECT decrypted_secret FROM vault.decrypted_secrets WHERE name = 'wallet_reminder_cron_secret')),
-       body    := '{}'::jsonb,
-       timeout_milliseconds := 55000
-     );
-     $$
-   );
-
-   -- To check:   SELECT * FROM cron.job WHERE jobname = 'wallet-reminder-tick';
-   --             SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 20;
-   -- To remove:  SELECT cron.unschedule('wallet-reminder-tick');
-   ```
-3. Before finalising the file, confirm against the current Supabase docs that
-   `pg_cron`, `pg_net` (`net.http_post`) and Vault (`vault.create_secret`,
-   `vault.decrypted_secrets`) are available with these names on the project's
-   plan, and adjust the calls if the documented signatures differ. Record what
-   was checked in the file header.
-4. Add a short section to `Hetha_admin/docs/daily_ops.md` §7: how the reminder
-   works, where to change the time (Admin → Settings), and that the cron job
-   only provides the tick.
-5. Why not a Vercel cron: its schedule is fixed in `vercel.json` at deploy
-   time and its minimum frequency depends on the plan; the reminder time is a
-   database setting that staff change at will (S-3).
-
-**Acceptance Criteria:** the file exists, contains no real URL or secret, and its only time expression is the 10-minute tick. `grep -n "18\|12:30\|30 12" docs/ops/wallet_reminder_cron.sql` returns nothing.
-
----
-
-#### W-08f — End-to-end test of the reminder
-
-**Target Area:** Backend + Admin Panel (staging)
-
-**Objective:** Prove the whole chain works in staging before production.
-
-**Exact Implementation Steps:**
-
-1. Staging (O-04) with migrations 037–039 applied, the admin preview deployed
-   with `CRON_SECRET` set, and `docs/ops/wallet_reminder_cron.sql` run with the
-   staging URL and secret.
-2. Test customer A: one daily subscription, wallet below tomorrow's amount.
-   Test customer B: same, wallet above. Test customer C: alternate-day
-   subscription with no delivery tomorrow, wallet at 0. Test customer D:
-   delivery tomorrow, wallet short, tomorrow paused.
-3. In Admin → Settings set the reminder time to about 15 minutes from now.
-4. Wait for the next ticks. Expected: only A receives one push; the settings
-   card shows `1 sent`; `SELECT * FROM wallet_notice_log` has one row
-   (`A`, tomorrow, `evening_reminder`, `sent`).
-5. Leave it running for the rest of the window: A receives no second push.
-6. Recharge-before-time check: reset by deleting A's log row in staging, set
-   the time 20 minutes ahead, top up A's wallet above tomorrow's amount before
-   that time → no push, no log row.
-7. Turn the reminder off, lower A's wallet again, set the time ahead → no push.
-8. Record the results in the day's `CHANGES_*.md`.
-
-**Acceptance Criteria:** all expectations in steps 4–7 observed and recorded; `cron.job_run_details` shows the tick succeeding with HTTP 200.
+**Acceptance Criteria (tests, section 13 of `verify_money_integrity.mjs`):** a
+short customer is listed with balance, required and shortfall; two orders on
+the day are added up; covered, cash-on-delivery, skipped, held and
+already-charged customers are not listed; a customer cannot read the list or
+send; Send claims only chosen customers who are still short; a second Send
+claims nothing; a sent customer is never claimed again for that date; a failed
+push can be sent again; a customer who recharged after the list was shown is
+not sent; no reminder objects exist (`claim_wallet_reminders`,
+`wallet_reminder_settings`, …).
 
 ---
 
@@ -2059,7 +1652,7 @@ exists before editing.
 2. Add a sentence to the order cut-off hint when set:
    `' Finalize the run sheet after this time.'`
 3. Under the section, add one line of help text:
-   `'The low-balance reminder time is set separately in Settings → Wallet & Notifications. Set it before this cut-off so customers can recharge in time.'`
+   *(Withdrawn with the automatic reminder, 2026-11-16: no reminder-time help text.)*
 4. No logic change.
 
 **Acceptance Criteria:** the hint renders both sentences when a time is set and the "Not set" text otherwise; the help line links or points to Settings.
@@ -2123,7 +1716,7 @@ exists before editing.
 
 **Target Area:** Admin Panel + docs
 
-**Objective:** Make the documentation match the confirmed rules: a wallet reserve of one upcoming delivery per active subscription (D-1), strict reconciliation (D-7), the configurable reminder (D-3), and paging instead of a raised row limit (D-5).
+**Objective:** Make the documentation match the confirmed rules: a wallet reserve of one upcoming delivery per active subscription (D-1), strict reconciliation (D-7), manual low-balance notices (D-3), and paging instead of a raised row limit (D-5).
 
 **Exact Implementation Steps:**
 
@@ -2138,7 +1731,7 @@ exists before editing.
    - The section headed with the old reserve name (Appendix H-23) and the row
      in the enforcement table (Appendix H-24): retitle to
      "The wallet reserve" and rewrite to the sentence in step 1, adding that
-     the customer is warned by the low-balance notice and the evening reminder
+     staff can warn the customer with a manual low-balance notice from Daily Ops
      and that an uncovered order is skipped at finalize.
    - The lines saying the 1000-row cap is handled by a large client limit
      (≈ lines 345–347): replace with "the Data API caps responses at 1000
@@ -2162,7 +1755,7 @@ exists before editing.
    blocked until quantities are entered (D-7), that Mark Delivered records
    orders as delivered in full (D-2), that cancelled orders are hidden on
    Deliveries but kept in Reconciliation (D-8), and that held orders are never
-   charged automatically (D-9). Add the reminder section from W-08e step 4.
+   charged automatically (D-9). Describe the manual low-balance notices (W-07M).
 6. Do not edit `CHANGES_*.md` files or migration headers: they are the
    historical record and correctly describe the rule as it was at the time.
 
@@ -2299,7 +1892,7 @@ See **W-03**. Listed here so the app task list is complete.
 
 **Target Area:** App
 
-**Objective:** Make the wallet balance and forecast update when a wallet push arrives while the app is open (debit, refund, low-balance notice, evening reminder, skipped delivery).
+**Objective:** Make the wallet balance and forecast update when a wallet push arrives while the app is open (debit, refund, low-balance notice, skipped delivery).
 
 **Exact Implementation Steps:**
 
@@ -2313,9 +1906,9 @@ See **W-03**. Listed here so the app task list is complete.
    `walletpage.dart` listen to it and call `_fetchWalletData()`.
 3. Do not navigate on a foreground message. Tapping any of these pushes opens
    the Wallet tab through the existing `route: 'wallet'` handling; confirm the
-   evening reminder (W-08b) and the skipped-delivery push open it.
+   low-balance push (W-07M) and the skipped-delivery push open it.
 
-**Acceptance Criteria:** with the wallet page open, recording a short delivery in the admin updates the balance within a few seconds without pull-to-refresh; tapping the evening reminder with the app closed opens the Wallet tab.
+**Acceptance Criteria:** with the wallet page open, recording a short delivery in the admin updates the balance within a few seconds without pull-to-refresh; tapping a low-balance push with the app closed opens the Wallet tab.
 
 ---
 
@@ -2338,8 +1931,8 @@ See **W-03**. Listed here so the app task list is complete.
    picker's first day changes), pause tomorrow before and after.
 4. Wallet tests (after 039): the create-subscription and checkout screens
    require one upcoming delivery of each subscription (W-04, W-05 acceptance
-   numbers); the wallet page shows the forecast (W-03); the evening reminder
-   arrives once (W-08f).
+   numbers); the wallet page shows the forecast (W-03); a low-balance push sent from
+   Daily Ops arrives once (W-07M).
 5. Record results in the day's `CHANGES_*.md`.
 
 **Acceptance Criteria:** all listed tests recorded as pass, or each failure written down with what was seen.
@@ -2427,12 +2020,12 @@ Only the owner can do these. Coding agents must not attempt them.
 | ID | Step | When |
 |---|---|---|
 | O-01 | Review and approve Phase 1. Reconcile any day still `finalized` on the deployed panel. Commit. Apply migration 037. Run its verification queries (query 1 lists held orders). Deploy the admin panel. | Now (in progress) |
-| O-04 | **Staging (D-6).** (1) Create a second Supabase project. (2) Load the production schema into it (schema-only dump; no customer data) and apply every migration not included in the dump. (3) Deploy the Edge Functions and set their secrets with **test** Razorpay keys. (4) Create a Vercel preview environment for `Hetha_admin` whose `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` and `CRON_SECRET` point at staging. (5) Add a staging `.env` for the app and build a staging APK. (6) Create test customers, areas, routes. From then on rule §1.3 applies: staging first. | Before applying 038 anywhere; mandatory before onboarding real customers |
+| O-04 | **Staging (D-6).** (1) Create a second Supabase project. (2) Load the production schema into it (schema-only dump; no customer data) and apply every migration not included in the dump. (3) Deploy the Edge Functions and set their secrets with **test** Razorpay keys. (4) Create a Vercel preview environment for `Hetha_admin` whose `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` point at staging. (5) Add a staging `.env` for the app and build a staging APK. (6) Create test customers, areas, routes. From then on rule §1.3 applies: staging first. | Before applying 038 anywhere; mandatory before onboarding real customers |
 | O-02 | Apply migration 038 in staging, test, then production; run its verification queries; deploy the admin panel. | After Parts A0 and A |
 | O-03 | Apply migration 039 in staging, test, then production; deploy admin; release the app (W-03 … W-05 need both). | After Part B |
-| O-07 | **Reminder scheduler.** Set `CRON_SECRET` in Vercel (preview and production, different values). Run `docs/ops/wallet_reminder_cron.sql` in each Supabase project with that environment's admin URL and secret. Confirm the tick in `cron.job_run_details`. Then set the reminder time and on/off state in Admin → Settings → Wallet & Notifications (it starts on, at the seeded default). | After O-03 |
+| O-07 | *(Withdrawn 2026-11-16: no reminder scheduler, no `CRON_SECRET`.)* | — |
 | O-05 | Supabase → Data API: turn **off** "Automatically expose new tables" after confirming every table the apps use is on the exposed list. Leave "Max rows" at 1000 (D-5). | Any time |
-| O-06 | Set an order cut-off time on one delivery area and test before/after it. Choose a reminder time earlier than that cut-off. | After O-02 / O-07 |
+| O-06 | Set an order cut-off time on one delivery area and test before/after it. | After O-02 / O-07 |
 | O-08 | **Held orders (D-9).** Review each order on payment hold (verification query 1 of migration 037, or the hold list from A-17) against the customer's wallet history. Decide per order whether to leave it, write it off, or collect by agreement with the customer. Releasing a hold is the commented SQL in migration 037; run it only after that review. Nothing is collected automatically. | After O-01, at the owner's pace |
 
 ---
@@ -2499,11 +2092,10 @@ the wallet rule; each remaining hit must be one of those and be explainable.)
 | Daily Ops API | `Hetha_admin/app/api/admin/daily-ops/route.ts` (+ `export/`, `sheets/`) |
 | Daily Ops UI | `Hetha_admin/app/admin/daily-ops/` (`hooks/useDailyOps.ts`, `components/*.tsx`) |
 | Deliveries | `Hetha_admin/services/deliveriesService.ts`, `app/api/admin/deliveries/route.ts`, `app/admin/deliveries/page.tsx` |
-| Settings screen | `Hetha_admin/app/admin/settings/page.tsx` (today: password only; W-08d adds Wallet & Notifications) |
+| Settings screen | `Hetha_admin/app/admin/settings/page.tsx` (password only) |
 | Notifications | `Hetha_admin/services/notificationService.ts`; service-role client `Hetha_admin/lib/admin-client.ts` |
 | Date helpers | `Hetha_admin/lib/deliverySchedule.ts` |
 | App wallet | `Hetha_app/lib/screens/wallet/walletpage.dart`, `lib/providers/address_provider.dart` |
 | App subscriptions | `Hetha_app/lib/screens/subscription/*.dart`, `lib/services/subscription_service.dart`, `lib/services/pause_service.dart` |
 | DB tests | `Hetha/docs/db/tests/verify_money_integrity.mjs` (sections 1–11 exist; 12 = Phase 2, 13 = wallet and reminder) |
-| Ops scripts | `Hetha/docs/ops/` (created by W-08e) |
 | Change logs | `Hetha/CHANGES_YYYY-MM-DD.md` |
