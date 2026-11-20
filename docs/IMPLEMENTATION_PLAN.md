@@ -1052,7 +1052,7 @@ alternate-day area appears only on its delivery days; a paused day is absent;
 a delivery moved by a move override appears on its new date and not the old
 one; a customer-edited day shows the edited total; an order already paid for
 tomorrow contributes 0; a subscription that starts in several days first
-appears on its start date; today is never included.
+appears on its start date; today is never included (revised by migration 044, 2026-11-20: today counts until it is paid, so a run finalized during the day is still in the forecast; a run finalized the evening before is paid and adds 0. New field `covers_beyond_horizon`).
 
 **Acceptance Criteria (tests):** one assertion per edge case above, plus: a mixed customer (daily area ₹50, alternate area ₹100 on odd days, alternate area ₹60 on even days) with balance ₹300 gets day amounts 150, 110, 150 …, `covered_until` = day 2, `first_uncovered_date` = day 3, and `reserve` = 210 (one delivery of each subscription); another user's id is refused for a customer caller and allowed for an admin with `customers:view`.
 

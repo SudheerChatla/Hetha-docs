@@ -237,7 +237,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '040_indexes.sql',
                  '041_dashboard_stats.sql',
                  '042_dashboard_overview.sql',
-                 '043_india_dates.sql']) {
+                 '043_india_dates.sql',
+                 '044_forecast_today.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -3353,6 +3354,9 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   await setBalance(CUSTOMER, 5000);
 
   // ── 13b. The forecast (W-02) ──────────────────────────────────────────────
+  // Section 11 re-ran 039, which brings back the 039 forecast; apply 044 again.
+  await expectOk('migration 044 applies cleanly', () => db.exec(read(`${ROOT}/migrations/044_forecast_today.sql`)));
+  // These subscriptions start tomorrow, so today (counted since 044) adds nothing here; see 13c.
   const T = '2098-08-01';
   const NOSUB = await mkUser(500);
   const f0 = await forecast(NOSUB, 14, T);
@@ -3362,9 +3366,9 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   await mkArea('Alt odd 039', 2, addDays(T, 1));
   await mkArea('Alt even 039', 2, addDays(T, 2));
   const M = await mkUser(300);
-  await mkSub(M, { start: T, variant: V50 });
-  await mkSub(M, { area: 'Alt odd 039', start: T, variant: VAR });
-  await mkSub(M, { area: 'Alt even 039', start: T, variant: V60 });
+  await mkSub(M, { start: addDays(T, 1), variant: V50 });
+  await mkSub(M, { area: 'Alt odd 039', start: addDays(T, 1), variant: VAR });
+  await mkSub(M, { area: 'Alt even 039', start: addDays(T, 1), variant: V60 });
   const fm = await forecast(M, 3, T);
   eq('mixed customer: day amounts 150, 110, 150', fm.days.map((d) => d.amount), [150, 110, 150]);
   eq('mixed customer: covered until day 2, first uncovered day 3, 2 deliveries',
@@ -3372,20 +3376,19 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   eq('mixed customer: reserve 210 (one delivery of each), available 90',
     { reserve: num(fm.reserve), available: num(fm.available) }, { reserve: 210, available: 90 });
   eq('alternate-day subscription only on its days', fm.days.map((d) => d.subscriptions.length), [2, 2, 2]);
-  eq('today is never included', fm.days.some((d) => d.date === T), false);
 
   const P = await mkUser(1000);
-  const ps = await mkSub(P, { start: T });
+  const ps = await mkSub(P, { start: addDays(T, 1) });
   await pause(ps, addDays(T, 2));
   eq('a paused day is absent', (await forecast(P, 3, T)).days.map((d) => d.date), [addDays(T, 1), addDays(T, 3)]);
 
   const MV = await mkUser(1000);
-  const mvs = await mkSub(MV, { area: 'Alt even 039', start: T });
+  const mvs = await mkSub(MV, { area: 'Alt even 039', start: addDays(T, 1) });
   await move(mvs, addDays(T, 2), addDays(T, 3), AREA_DAILY_039);
   eq('moved delivery: on its new date, not the old one', (await forecast(MV, 4, T)).days.map((d) => d.date), [addDays(T, 3), addDays(T, 4)]);
 
   const E = await mkUser(1000);
-  const es = await mkSub(E, { start: T });
+  const es = await mkSub(E, { start: addDays(T, 1) });
   const editOrder = async (sub, user, date, qty, extra = '') => {
     const id = randomUUID();
     await db.exec(`BEGIN;
@@ -3404,6 +3407,49 @@ console.log('\n--- 13. Migration 039: wallet simplification and reminder ---');
   const L8 = await mkUser(1000);
   await mkSub(L8, { start: addDays(T, 4) });
   eq('a subscription starting later first appears on its start date', (await forecast(L8, 6, T)).days[0].date, addDays(T, 4));
+
+  // ── 13c. Today counts until it is paid (migration 044) ───────────────────
+  // Works for runs finalized the evening before (today already paid → 0)
+  // and runs finalized during the day (today still owed → counted).
+  const TN = await mkUser(1000);
+  await mkSub(TN, { start: T });
+  eq('today, run not generated: the expected delivery is counted',
+    (await forecast(TN, 1, T)).days.map((d) => [d.date, num(d.amount)]), [[T, 100], [addDays(T, 1), 100]]);
+
+  const TG = await mkUser(1000);
+  const tgs = await mkSub(TG, { start: T });
+  await editOrder(tgs, TG, T, 3);
+  eq('today, generated and not yet paid: the unpaid total is counted',
+    (await forecast(TG, 1, T)).days.map((d) => [d.date, num(d.amount)]), [[T, 300], [addDays(T, 1), 100]]);
+
+  const TP = await mkUser(1000);
+  const tps = await mkSub(TP, { start: T });
+  await editOrder(tps, TP, T, 2, 'paid');
+  eq('today, already paid (finalized the evening before): counts 0, as before 044',
+    (await forecast(TP, 1, T)).days.map((d) => d.date), [addDays(T, 1)]);
+
+  const TH = await mkUser(1000);
+  const ths = await mkSub(TH, { start: addDays(T, 1) });
+  const thId = randomUUID();
+  await db.exec(`BEGIN;
+    INSERT INTO public.subscription_daily_orders (id, delivery_date, subscription_id, user_id, status, total_value, payment_status, paid_amount, settlement_hold_reason)
+    VALUES ('${thId}', '${addDays(T, 1)}', '${ths}', '${TH}', 'pending', 500, 'failed', 0, 'test 044 hold');
+    INSERT INTO public.subscription_daily_order_items (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+    VALUES ('${thId}', '${VAR}', 'Milk', '1 L', 100, 5, 500);
+    COMMIT;`);
+  eq('an order on settlement hold counts 0 (D-9: never charged automatically)',
+    (await forecast(TH, 2, T)).days.map((d) => d.date), [addDays(T, 2)]);
+
+  const TB = await mkUser(1000);
+  await mkSub(TB, { start: T });
+  const fb = await forecast(TB, 3, T);
+  eq('wallet lasting past the window: covers_beyond_horizon true, covered until the last day',
+    { beyond: fb.covers_beyond_horizon, until: fb.covered_until, first: fb.first_uncovered_date }, { beyond: true, until: addDays(T, 3), first: null });
+  await setBalance(TB, 250);
+  const fs = await forecast(TB, 3, T);
+  eq('wallet running out inside the window: covers_beyond_horizon false',
+    { beyond: fs.covers_beyond_horizon, until: fs.covered_until, first: fs.first_uncovered_date }, { beyond: false, until: addDays(T, 1), first: addDays(T, 2) });
+  eq('no subscriptions: covers_beyond_horizon false', (await forecast(NOSUB, 3, T)).covers_beyond_horizon, false);
 
   await expectError('get_wallet_forecast: another customer is refused',
     () => json(CUST, `SELECT public.get_wallet_forecast($1, 14) AS r`, [M]), 'not authorized');
