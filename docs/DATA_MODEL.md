@@ -18,6 +18,17 @@ of it. To re-sync after a backend change, follow
   the change logs. Pull and confirm them via `REFRESH.md` (the table export
   used for the sync above does not include them).
 
+**Dates and times are India time.** Postgres on Supabase runs in UTC.
+- "Today" in SQL is always `internal.today_ist()`, never `CURRENT_DATE` or `now()::date`. Migration 043 removed the last four uses; the DB suite fails if one comes back.
+- `date` columns (`delivery_date`, `start_date`, …) are India calendar days.
+- Most `*_at` columns are `timestamp without time zone` holding **UTC** wall-clock time (`orders.placed_at`, `users.created_at`, …).
+- The admin panel shows every date through `lib/format.ts` (`formatDate`, `formatDateTime`, `formatTime`), which reads those as UTC and displays them in Asia/Kolkata.
+- The app uses `lib/utils/date_utils.dart`:
+  - `nowInIndia()` / `todayInIndia()` for "today" and pickers, never `DateTime.now()`.
+  - `parseServerTimestampToIndia()` for reading timestamps.
+  - `nowForServer()` (UTC with `Z`) for writing a timestamp.
+  - These match `DateTime.now()` on a phone set to India time, and keep India dates on a phone set to any other timezone.
+
 **Repo SQL mirrors** (should match `docs/db/`):
 
 - `Hetha_app/doc-schema/schema.sql` — table definitions (mirror)

@@ -236,7 +236,8 @@ for (const f of ['007_money_integrity.sql', '008_payment_intents.sql', '009_priv
                  '039_wallet_simplification.sql',
                  '040_indexes.sql',
                  '041_dashboard_stats.sql',
-                 '042_dashboard_overview.sql']) {
+                 '042_dashboard_overview.sql',
+                 '043_india_dates.sql']) {
   try {
     await db.exec(read(`${ROOT}/migrations/${f}`));
     console.log(`\napplied ${f}`);
@@ -3586,6 +3587,52 @@ console.log('\n--- 16. Migration 042: dashboard overview ---');
   if (ghee && ghee.quantity === 8) ok('top products count the delivered quantity (8 of 9 ordered)');
   else bad('top products', JSON.stringify(o2.top_products));
   await expectError('a customer cannot read the overview', () => overview({ sub: CUSTOMER, role: 'authenticated' }), 'not authorized');
+}
+
+// ---------------------------------------------------------------------------
+// 17. Migration 043: India dates instead of the server (UTC) date
+// ---------------------------------------------------------------------------
+console.log('\n--- 17. Migration 043: India dates ---');
+{
+  // Earlier sections re-run 039, which brings back the old bodies; apply 043 again.
+  await expectOk('migration 043 re-runs cleanly', () => db.exec(read(`${ROOT}/migrations/043_india_dates.sql`)));
+  const fns = (await db.query(`SELECT n.nspname || '.' || p.proname AS f, p.prosrc FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname IN ('public', 'internal')`)).rows;
+  const onServerDate = fns
+    .filter((r) => r.prosrc.split('\n').some((l) => /current_date/i.test(l.replace(/--.*$/, ''))))
+    .map((r) => r.f);
+  if (onServerDate.length === 0) ok('no function in public/internal uses CURRENT_DATE');
+  else bad('functions still on the server date', JSON.stringify(onServerDate));
+
+  // An immediate cancel keeps today's delivery and removes later ones. The
+  // session timezone is moved 12 h behind UTC so CURRENT_DATE is usually
+  // yesterday in India, the way it is between 00:00 and 05:30 IST on Supabase.
+  const today = (await db.query(`SELECT internal.today_ist()::text AS d`)).rows[0].d;
+  const tomorrow = (await db.query(`SELECT (internal.today_ist() + 1)::text AS d`)).rows[0].d;
+  const U = '0a430000-0000-4000-8000-000000000001';
+  const S = '0a430000-0000-4000-8000-000000000002';
+  const O0 = '0a430000-0000-4000-8000-000000000003';
+  const O1 = '0a430000-0000-4000-8000-000000000004';
+  await db.query(`INSERT INTO public.users (id, email, phone, first_name, wallet_balance) VALUES ($1, 'd043@example.com', '9043000001', 'D', 0)`, [U]);
+  await db.query(`INSERT INTO public.subscriptions (id, user_id, status, payment_method, start_date) VALUES ($1, $2, 'active', 'wallet', $3)`, [S, U, today]);
+  await db.exec(`BEGIN;
+    INSERT INTO public.subscription_daily_orders (id, delivery_date, subscription_id, user_id, status, total_value, payment_status)
+    VALUES ('${O0}', '${today}', '${S}', '${U}', 'pending', 100, 'pending'),
+           ('${O1}', '${tomorrow}', '${S}', '${U}', 'pending', 100, 'pending');
+    INSERT INTO public.subscription_daily_order_items (daily_order_id, variant_id, product_name_snapshot, variant_label_snapshot, unit_price, quantity, total_price)
+    VALUES ('${O0}', '${VAR}', 'Cancel 043', '1 L', 100, 1, 100),
+           ('${O1}', '${VAR}', 'Cancel 043', '1 L', 100, 1, 100);
+    COMMIT;`);
+  await db.exec(`SET TIME ZONE 'Etc/GMT+12'`);
+  try {
+    await asQuery({ role: 'service_role' },
+      `SELECT public.cancel_subscription($1, $2, now(), true, 'admin', 'test 043')`, [S, U]);
+  } finally {
+    await db.exec(`SET TIME ZONE 'UTC'`);
+  }
+  const left = (await db.query(`SELECT delivery_date::text AS d FROM public.subscription_daily_orders WHERE subscription_id = $1 ORDER BY 1`, [S])).rows.map((r) => r.d);
+  if (left.length === 1 && left[0] === today) ok("immediate cancel keeps today's (India) delivery and removes tomorrow's");
+  else bad('immediate cancel cutoff', JSON.stringify({ left, today, tomorrow }));
 }
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
